@@ -55,12 +55,12 @@ A `Config` field set without its feature gate fails at **compile time**, not at 
 
 ## hash-chain
 
-`hash-chain` (`Config.hash_enabled`) appends a tamper-evident hash chain over the log so that any after-the-fact mutation of a sealed segment is detectable on read. It uses BLAKE3 in **keyed mode**: the chain is seeded with a secret `hash_init` and each record's hash chains the previous hash with the record body, so a modified byte anywhere in the chain breaks verification of every subsequent record.
+`hash-chain` (`Config.hash_enabled`) appends a tamper-evident hash chain over the log so that any after-the-fact mutation of a sealed segment is detectable on read. It uses BLAKE3 in **keyed mode**: the chain is seeded with a per-database `hash_init` (a 32-byte BLAKE3 key) and each record's hash chains the previous hash with the record body, so a modified byte anywhere in the chain breaks verification of every subsequent record.
 
-**`hash_init` is generated from entropy and never written to disk.** It is produced by `generate_hash_init` (`src/lib.rs:685-699`) at `open` time when a fresh database is created, and held only in memory for the Sealer thread. Consequences:
+**`hash_init` is generated once per database from entropy and persisted.** When a fresh database is created, `generate_hash_init` (`src/lib.rs:685-699`) produces a 32-byte key from entropy at `open` time (`src/lib.rs:99-124`). That key is then written into every segment header as the `hash_init` field of `SegmentHeader` (`src/storage/format.rs:92-104`) — stamped into each new segment at creation and at every rollover (`src/storage/mod.rs:526` and `:585`). On restart, recovery reads `hash_init` back from the first valid segment header (`src/recovery.rs:165`); it is **not** regenerated. Consequences:
 
-- The chain is **verifiable on read** without the key — readers recompute the chain to detect tampering.
-- The key is **not a recoverable secret**. Losing the in-memory `hash_init` across a process restart does not break verification (the key is only used to initialize the first chain link); the chain remains self-checking as long as the on-disk hashes are intact. The point of keeping it off disk is that an attacker who reads the file cannot forge a consistent chain without also re-running BLAKE3 keyed with the original key.
+- The chain is **re-verifiable on read after a crash or restart** — readers recover `hash_init` from the segment header and recompute the chain to detect tampering. This is exactly why the key must be persisted: because it is generated from entropy, the chain could not be re-verified after a restart unless the key is recoverable from disk.
+- Tamper-evidence comes from the **chain structure, not from the secrecy of the key.** `hash_init` lives in every segment header in plaintext; an attacker who reads the file can read it. What the chain detects is corruption or in-place tampering that does **not** also recompute the chained hashes from that key — any byte changed anywhere in a sealed segment breaks verification of every subsequent record, because reproducing a consistent chain requires rewriting every hash forward from the point of change. (An attacker who can both rewrite the bytes and re-run BLAKE3 keyed with `hash_init` to rebuild a consistent chain would defeat the chain; that is out of scope for a tamper-evidence seal, which is why this is **not** a security boundary in the sense encryption is.)
 - The hash chain is built by the **Sealer** background thread, which runs only when `hash_enabled` and `shards == 1`.
 
 **Single-shard constraint.** The Sealer seals one shard at a time, and a global hash chain across shards requires a global merge ordering that v1.1 does not provide. With `hash-chain` enabled and `shards > 1`, `LogDb::open` returns this exact error (`src/lib.rs:176-181`):
@@ -103,7 +103,7 @@ let config = Config {
 
 `remote-push` is a **flag-only** feature: it gates the `pusher` module and the `LogDb::replicate` API but pulls in **no** extra dependencies. The remote story in v1.1 is intentionally split into two halves:
 
-**Public API — `LogDb::replicate(sequence, timestamp_ns, content)`.** This is the **only** remote-related method on `LogDb`. It is the standby write-in path used by `logdbd` standby nodes to ingest records received from the primary at the primary's own sequence, preserving the global offset space so consumers can fail over primary → standby without re-mapping offsets. The standby contract (`src/lib.rs:305-391`):
+**Public API — `LogDb::replicate(sequence, timestamp_ns, content)`.** This is the **only** remote-related method on `LogDb`. It is the standby write-in path used by `logdbd` standby nodes to ingest records received from the primary at the primary's own sequence, preserving the global offset space so consumers can fail over primary → standby without re-mapping offsets. The standby contract (`src/lib.rs:326-391`):
 
 - **Single-shard.** Replication is a linear stream onto shard 0, so `shards` must be `1`.
 - **In-order.** `sequence` must equal the current producer cursor; gaps return an error so the caller retries.

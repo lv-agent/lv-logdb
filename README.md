@@ -2,6 +2,12 @@
 
 Embedded, append-only, crash-recoverable, optionally tamper-proof local log database. Built in Rust.
 
+## Documentation
+
+Full documentation lives under [`docs/`](docs/). See the [Usage Guide](docs/en/README.md) and the [Development Guide](docs/en/dev/README.md).
+
+API reference: run `cargo doc --open` (also available on docs.rs once published).
+
 ## Quick Start
 
 ```rust

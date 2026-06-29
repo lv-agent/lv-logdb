@@ -2,6 +2,12 @@
 
 嵌入式、追加写、可崩溃恢复、可选防篡改的本地日志数据库。Rust 实现。
 
+## 文档
+
+完整文档位于 [`docs/`](docs/) 目录下。参见[使用指南](docs/zh/README.md)与[二次开发指南](docs/zh/dev/README.md)。
+
+API 参考：运行 `cargo doc --open`（发布后亦可在 docs.rs 查看）。
+
 ## 快速开始
 
 ```rust

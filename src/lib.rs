@@ -1,0 +1,841 @@
+//! # logdb — Embedded Append-Only Log Database
+//!
+//! logdb is an **embedded, append-only, crash-recoverable, optionally tamper-proof,
+//! optionally remotely-pushable** local log database.
+//!
+//! ## Features
+//!
+//! - **High-throughput append**: lock-free fast path with CAS-based ring buffer
+//! - **Crash recovery**: automatic torn-write detection and truncation on restart
+//! - **Optional hash chain**: SHA-256 forward-linking for tamper detection (`hash-chain` feature)
+//! - **Segment management**: automatic rolling, configurable retention
+//! - **Segment pre-allocation**: next segment is pre-created at 80% capacity,
+//!   reducing roll-time blocking to a single `fdatasync` call
+//!
+//! ## Performance: Inline vs Spill
+//!
+//! Records ≤ [`INLINE_CAP`](ring::slot::INLINE_CAP) bytes (256) take the **inline
+//! fast path**: zero heap allocation, zero extra memcpy. p50 is typically <100ns.
+//!
+//! Records > 256 bytes take the **spill path**: a heap allocation in the append
+//! thread. The spill path is ~4x slower in throughput with ~80x higher p99.9
+//! tail latency due to allocator jitter. Keep latency-sensitive records ≤ 256B.
+
+pub mod config;
+pub mod error;
+pub mod health;
+pub mod platform;
+pub mod record;
+pub mod ring;
+pub mod pipeline;
+pub mod storage;
+pub mod reader;
+pub mod shard;
+
+pub mod recovery;
+pub mod tailer;
+mod pusher;
+
+pub use config::Config;
+pub use error::{AppendError, FlushError, ReadError, ShutdownError, ShutdownReport};
+pub use record::Record;
+
+/// Recovery report returned by [`LogDb::recovery_report`].
+#[derive(Debug, Clone)]
+pub struct RecoveryReport {
+    /// First sequence to replay (the last checkpoint).
+    pub from_sequence: u64,
+    /// Last durable sequence.
+    pub to_sequence: u64,
+    /// Number of records to replay.
+    pub count: u64,
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use health::HealthState;
+use pipeline::signal::{FlushSignal, ShutdownState};
+use pipeline::trigger::{CommitTrigger, WaitStrategy};
+use ring::Ring;
+use shard::ShardMap;
+use storage::SegmentManager;
+
+/// The main log database handle.
+pub struct LogDb {
+    inner: Arc<LogDbInner>,
+}
+
+struct LogDbInner {
+    config: config::Config,
+    shards: ShardMap,
+    health: Arc<HealthState>,
+    flush: Arc<FlushSignal>,
+    shutdown: Arc<ShutdownState>,
+    committer_handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "hash-chain")]
+    sealer_handle: Option<std::thread::JoinHandle<()>>,
+    data_dir: std::path::PathBuf,
+    hash_init: [u8; 32],
+    /// WAL checkpoint: records with sequence < this are safe to truncate.
+    checkpoint_sequence: Arc<AtomicU64>,
+    /// Cached segment directory listing shared by all readers (P2-1: avoids
+    /// re-readdir + re-reading every segment header on each read/scan).
+    manifest: Arc<Mutex<reader::SegmentManifest>>,
+    #[cfg(feature = "remote-push")]
+    pusher_handle: Option<crate::pusher::PusherHandle>,
+}
+
+impl LogDb {
+    /// Open or create a logdb instance.
+    pub fn open(config: Config) -> Result<Self, String> {
+        config.validate()?;
+
+        let data_dir = config.data_dir.clone();
+        let hash_enabled = config.hash_enabled;
+
+        // Recover or create fresh
+        let (mut seg_mgr, initial_seq, last_hash, hash_init) = if data_dir.exists()
+            && data_dir.join("segment-00000001.log").exists()
+        {
+            let state = recovery::recover(
+                &data_dir,
+                config.segment_size,
+                config.retention.clone(),
+                config.encryption_key,
+            )?;
+            let initial = state.last_sequence.wrapping_add(1);
+            (state.segment_manager, initial, state.last_hash, state.hash_init)
+        } else {
+            let hi = generate_hash_init();
+            let sm = SegmentManager::create(
+                data_dir.clone(),
+                config.segment_size,
+                hash_enabled,
+                config.compression_enabled,  // compressed
+                config.encryption_key,        // encryption
+                hi,
+                config.retention.clone(),
+                0,
+            )
+            .map_err(|e| format!("create segment manager: {}", e))?;
+            (sm, 0, [0u8; 32], hi)
+        };
+
+        // Apply the configured sparse-index stride before the Committer starts
+        // appending (active index is still empty here).
+        seg_mgr.set_index_stride(config.index_stride);
+
+        // Create shared state
+        let shards = ShardMap::new(
+            config.shards,
+            config.ring_size,
+            hash_enabled,
+            initial_seq,
+        );
+        let health = Arc::new(HealthState::new());
+        let flush = Arc::new(FlushSignal::new());
+        let shutdown = Arc::new(ShutdownState::new());
+
+        let trigger = CommitTrigger {
+            bytes: 256 * 1024,
+            records: 1024,
+            interval: Duration::from_millis(10),
+            durability: config.durability_mode,
+        };
+        let wait = config.wait_strategy;
+
+        // Spawn Committer — passes all rings for multi-shard polling
+        let committer_rings = shards.all_rings().to_vec();
+        let committer_flush = Arc::clone(&flush);
+        let committer_shutdown = Arc::clone(&shutdown);
+        let committer_health = Arc::clone(&health);
+        let checkpoint = Arc::new(AtomicU64::new(Self::load_checkpoint(&data_dir)));
+        let committer_checkpoint = Arc::clone(&checkpoint);
+        let committer_handle = std::thread::Builder::new()
+            .name("logdb-committer".into())
+            .spawn(move || {
+                pipeline::committer::run_committer(
+                    committer_rings,
+                    seg_mgr,
+                    trigger,
+                    committer_flush,
+                    committer_shutdown,
+                    committer_health,
+                    committer_checkpoint,
+                    wait,
+                );
+            })
+            .map_err(|e| format!("spawn committer: {}", e))?;
+
+        // Spawn Sealer (if hash enabled, single-shard only in v1.1)
+        // Multi-shard hash chain requires global merge ordering — deferred to v1.2.
+        #[cfg(feature = "hash-chain")]
+        let sealer_handle = if hash_enabled {
+            if config.shards > 1 {
+                return Err(
+                    "hash-chain is not supported with shards > 1 in v1.1. \
+                     Use shards=1 with hash-chain, or shards>1 without hash."
+                        .to_string(),
+                );
+            }
+            let sealer_ring = Arc::clone(shards.ring(0));
+            let sealer_shutdown = Arc::clone(&shutdown);
+            Some(
+                std::thread::Builder::new()
+                    .name("logdb-sealer".into())
+                    .spawn(move || {
+                        pipeline::sealer::run_sealer(
+                            sealer_ring,
+                            hash_init,
+                            last_hash,
+                            initial_seq,
+                            sealer_shutdown,
+                            wait,
+                        );
+                    })
+                    .map_err(|e| format!("spawn sealer: {}", e))?,
+            )
+        } else {
+            None
+        };
+
+        let manifest = Arc::new(Mutex::new(reader::SegmentManifest::new(data_dir.clone())));
+
+        Ok(Self {
+            inner: Arc::new(LogDbInner {
+                config,
+                shards,
+                health,
+                flush,
+                shutdown,
+                committer_handle: Some(committer_handle),
+                #[cfg(feature = "hash-chain")]
+                sealer_handle,
+                data_dir,
+                hash_init,
+                checkpoint_sequence: checkpoint,
+                manifest,
+                #[cfg(feature = "remote-push")]
+                pusher_handle: None,
+            }),
+        })
+    }
+
+    /// Append multiple records atomically. All records in the batch are
+    /// committed together — either all visible after crash, or none.
+    /// Returns the sequence number of the first record in the batch.
+    ///
+    /// All `contents.len()` sequences are reserved in one atomic
+    /// [`claim_batch`](crate::ring::Ring::claim_batch) (no partial reservation),
+    /// so consecutive batches never overwrite each other's slots.
+    pub fn append_batch(&self, contents: &[&[u8]]) -> Result<u64, AppendError> {
+        if contents.is_empty() { return Err(AppendError::ContentTooLarge { size: 0, max: 0 }); }
+        let inner = &self.inner;
+        if let Some(code) = inner.health.check() {
+            return Err(match code { health::HEALTH_DISK_FULL => AppendError::DiskFull, _ => AppendError::Io("unhealthy".into()) });
+        }
+        // Validate ALL contents BEFORE reserving sequences. A too-large record
+        // found after a partial claim_batch would leave reserved-but-unwritten
+        // slots (a gap the Committer can't cross).
+        for content in contents {
+            if content.len() > inner.config.max_content_size {
+                return Err(AppendError::ContentTooLarge { size: content.len(), max: inner.config.max_content_size });
+            }
+        }
+        if !inner.shutdown.enter() { return Err(AppendError::ShuttingDown); }
+        let _guard = scopeguard::guard((), |_| inner.shutdown.leave());
+
+        // Reserve the whole batch atomically (producer_cursor += n).
+        let n = contents.len() as u64;
+        let (first_id, shard_id, _) = inner.shards.claim_batch(n, inner.config.queue_full_policy)?;
+        let ts = platform::clock_realtime_coarse_ns();
+        let ring = inner.shards.ring(shard_id);
+        for (i, content) in contents.iter().enumerate() {
+            let seq = first_id + i as u64;
+            // Safety: claim_batch reserved [first_id, first_id+n) exclusively.
+            unsafe { ring.slot(seq).producer_write(seq, ts, content); }
+            ring.slot(seq).publish(seq);
+        }
+        Ok(first_id)
+    }
+
+    /// Append a record to the log. Returns the global record_id.
+    pub fn append(&self, content: &[u8]) -> Result<u64, AppendError> {
+        let inner = &self.inner;
+
+        // Health check (self-healing)
+        if let Some(code) = inner.health.check() {
+            return Err(match code {
+                health::HEALTH_DISK_FULL => AppendError::DiskFull,
+                _ => AppendError::Io("health check failed".into()),
+            });
+        }
+
+        // Content size check
+        if content.len() > inner.config.max_content_size {
+            return Err(AppendError::ContentTooLarge {
+                size: content.len(),
+                max: inner.config.max_content_size,
+            });
+        }
+
+        // Shutdown guard
+        if !inner.shutdown.enter() {
+            return Err(AppendError::ShuttingDown);
+        }
+        let _guard = scopeguard::guard((), |_| inner.shutdown.leave());
+
+        // CAS claim via shard map (v1.1 multi-shard)
+        let (global_id, shard_id, local_seq) =
+            inner.shards.claim(inner.config.queue_full_policy)?;
+
+        // Write slot (safety: claim guarantees exclusive access)
+        let ts = platform::clock_realtime_coarse_ns();
+        let ring = inner.shards.ring(shard_id);
+        unsafe { ring.slot(local_seq).producer_write(local_seq, ts, content); }
+
+        // Publish
+        ring.slot(local_seq).publish(local_seq);
+
+        Ok(global_id)
+    }
+
+    /// Replicate a record at an EXACT sequence number.
+    ///
+    /// Used by logdbd standby nodes to write records received from the primary
+    /// at the primary's own sequence, preserving the global offset space so
+    /// that consumers can fail over primary → standby without re-mapping
+    /// offsets. Unlike [`append`](LogDb::append), this does NOT claim a fresh
+    /// sequence; it writes directly to the slot for `sequence`.
+    ///
+    /// Constraints (standby contract):
+    /// - **Single-shard only.** Replication maps the primary's linear sequence
+    ///   1:1 onto shard 0, so `shards` must be 1.
+    /// - **In-order.** `sequence` must equal the current producer cursor (the
+    ///   next expected sequence). Gaps return an error so the caller retries.
+    /// - **Idempotent.** A `sequence` already replicated (below the cursor) is
+    ///   a no-op, so duplicate/replayed Sync RPCs are safe.
+    /// - **Backpressured.** Refuses to overwrite a live (uncommitted) slot via
+    ///   the same consume-watermark gate as `claim`, returning `QueueFull`.
+    ///
+    /// The record is published for the Committer to serialize and fsync like
+    /// any other; `producer_cursor` is advanced so `flush`/`shutdown` compute
+    /// the correct durability target.
+    pub fn replicate(
+        &self,
+        sequence: u64,
+        timestamp_ns: u64,
+        content: &[u8],
+    ) -> Result<(), AppendError> {
+        let inner = &self.inner;
+
+        // Replication is a linear stream onto shard 0.
+        if inner.shards.num_shards() != 1 {
+            return Err(AppendError::Io("replicate requires shards=1".into()));
+        }
+        if content.len() > inner.config.max_content_size {
+            return Err(AppendError::ContentTooLarge {
+                size: content.len(),
+                max: inner.config.max_content_size,
+            });
+        }
+        if let Some(code) = inner.health.check() {
+            return Err(match code {
+                health::HEALTH_DISK_FULL => AppendError::DiskFull,
+                _ => AppendError::Io("health check failed".into()),
+            });
+        }
+        if !inner.shutdown.enter() {
+            return Err(AppendError::ShuttingDown);
+        }
+        let _guard = scopeguard::guard((), |_| inner.shutdown.leave());
+
+        let ring = inner.shards.ring(0);
+        let ring_size = ring.ring_size() as u64;
+
+        // Idempotency: already replicated past this sequence.
+        let cur = ring.producer_cursor.inner.load(Ordering::Acquire);
+        if sequence < cur {
+            return Ok(());
+        }
+        // In-order: sequence must be exactly the next expected slot.
+        if sequence != cur {
+            return Err(AppendError::Io(format!(
+                "replicate out of order: expected {}, got {}",
+                cur, sequence
+            )));
+        }
+        // Backpressure: do not overwrite a slot the Committer has not drained.
+        // Same invariant as Ring::claim (seq - watermark < ring_size).
+        let wm = ring.consume_watermark();
+        if sequence.wrapping_sub(wm) >= ring_size {
+            return Err(AppendError::QueueFull);
+        }
+
+        // Safety: the standby serializes Sync RPCs externally (and local writes
+        // are rejected on a standby), so this slot is not being written by any
+        // other producer. `sequence` was validated to equal the monotonic
+        // cursor, so the slot has not yet been consumed (it is below committed
+        // only by the watermark gate above). Mirrors append()'s proof.
+        unsafe { ring.slot(sequence).producer_write(sequence, timestamp_ns, content); }
+        ring.slot(sequence).publish(sequence);
+
+        // Advance the cursor so flush/shutdown target these records for fsync.
+        // Single-writer on the standby (no local appends); a plain Release
+        // store is correct and races are prevented by the caller's lock.
+        ring.producer_cursor.inner.store(sequence + 1, Ordering::Release);
+
+        Ok(())
+    }
+
+    /// Force all previously appended records to durable storage.
+    ///
+    /// Waits for `durable_cursor` (NOT committed_cursor — fix C4).
+    pub fn flush(&self) -> Result<(), FlushError> {
+        let inner = &self.inner;
+
+        let target = inner.shards.max_producer_cursor();
+        if target == 0 {
+            return Ok(());
+        }
+
+        // If hash enabled, wait for Sealer first
+        #[cfg(feature = "hash-chain")]
+        if inner.config.hash_enabled {
+            wait_until(
+                &inner.shutdown,
+                || inner.shards.ring(0).sealed_cursor.load(Ordering::Acquire) >= target,
+                inner.config.flush_timeout,
+            )?;
+        }
+
+        inner.flush.request(target);
+        wait_until(
+            &inner.shutdown,
+            || inner.flush.is_done(target),
+            inner.config.flush_timeout,
+        )?;
+
+        Ok(())
+    }
+
+    /// Read a single record by `record_id`.
+    pub fn read(&self, record_id: u64) -> Result<Option<Record>, ReadError> {
+        let durable = self.inner.shards.min_durable_cursor();
+        if record_id >= durable {
+            return Ok(None);
+        }
+        let reader = reader::Reader::new(
+            Arc::clone(&self.inner.manifest),
+            self.inner.config.encryption_key,
+        );
+        reader.read(record_id)
+    }
+
+    // ── Internal state accessors (for diagnostics/benchmarking) ─────────
+
+    /// Get the maximum producer cursor across all shards.
+    pub fn producer_cursor(&self) -> u64 {
+        self.inner.shards.max_producer_cursor()
+    }
+
+    /// Get the minimum committed cursor across all shards.
+    pub fn committed_cursor(&self) -> u64 {
+        self.inner.shards.min_committed_cursor()
+    }
+
+    /// Get the minimum durable cursor across all shards.
+    pub fn durable_cursor(&self) -> u64 {
+        self.inner.shards.min_durable_cursor()
+    }
+
+    /// Get the total ring capacity across all shards.
+    pub fn ring_size(&self) -> usize {
+        self.inner.shards.num_shards() * self.inner.shards.ring(0).ring_size()
+    }
+
+    /// Create a named tailer (consumer) with independent read progress.
+    /// Progress is persisted to `tailer_<name>.dat` via `commit()`.
+    pub fn new_tailer(&self, name: &str) -> crate::tailer::Tailer {
+        crate::tailer::Tailer::open(
+            Arc::clone(&self.inner.manifest),
+            Arc::clone(self.inner.shards.ring(0)),
+            name,
+            self.inner.config.encryption_key,
+        )
+    }
+
+    /// Internal: get the ring for tailer access.
+    #[doc(hidden)]
+    pub fn inner_ring(&self) -> Arc<Ring> {
+        Arc::clone(self.inner.shards.ring(0))
+    }
+
+    /// Scan records in range `[from_id, to_id)`.
+    pub fn scan(
+        &self,
+        from_id: u64,
+        to_id: u64,
+    ) -> Result<reader::iter::RecordIter, ReadError> {
+        let reader = reader::Reader::new(
+            Arc::clone(&self.inner.manifest),
+            self.inner.config.encryption_key,
+        );
+        reader.scan(from_id, to_id)
+    }
+
+    /// Mark `sequence` as the WAL checkpoint.
+    ///
+    /// Records with sequence < checkpoint are safe to delete. Old segments
+    /// fully covered by the checkpoint will be truncated on the next roll.
+    pub fn checkpoint(&self, sequence: u64) {
+        let mut cur = self.inner.checkpoint_sequence.load(Ordering::Acquire);
+        while sequence > cur {
+            match self.inner.checkpoint_sequence.compare_exchange_weak(
+                cur, sequence, Ordering::Release, Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+        // Persist to disk so crash recovery can read it
+        let _ = save_checkpoint(&self.inner.data_dir, sequence);
+    }
+
+    /// Get the current checkpoint sequence.
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.inner.checkpoint_sequence.load(Ordering::Acquire)
+    }
+
+    /// Recover the checkpoint from disk (called during startup).
+    pub(crate) fn load_checkpoint(data_dir: &std::path::Path) -> u64 {
+        let path = data_dir.join("checkpoint.dat");
+        match std::fs::read(&path) {
+            Ok(data) if data.len() == 12 => {
+                let seq = u64::from_le_bytes([data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]]);
+                let crc = u32::from_le_bytes([data[8],data[9],data[10],data[11]]);
+                if crc32c::crc32c(&data[..8]) == crc { seq } else { 0 }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Get WAL space usage: (used_bytes, total_bytes_configured).
+    /// used_bytes = sum of all segment file sizes.
+    pub fn wal_usage(&self) -> (u64, u64) {
+        let mut total = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&self.inner.data_dir) {
+            for e in entries.flatten() {
+                if let Ok(meta) = e.metadata() {
+                    if e.file_name().to_str().map_or(false, |n| n.ends_with(".log")) {
+                        total += meta.len();
+                    }
+                }
+            }
+        }
+        (total, self.inner.config.segment_size)
+    }
+
+    /// Recovery report for database WAL replay.
+    pub fn recovery_report(&self) -> RecoveryReport {
+        let cp = self.checkpoint_sequence();
+        let durable = self.durable_cursor();
+        RecoveryReport {
+            from_sequence: cp,
+            to_sequence: durable,
+            count: if durable > cp { durable - cp } else { 0 },
+        }
+    }
+
+    /// Replay records from `sequence` (inclusive) to the end of the log.
+    pub fn replay_from(
+        &self,
+        sequence: u64,
+    ) -> Result<reader::iter::RecordIter, ReadError> {
+        self.scan(sequence, u64::MAX)
+    }
+
+    /// Drain in-flight appends and flush all published records to durable
+    /// storage — WITHOUT consuming the handle or joining background threads.
+    ///
+    /// This is the shared-safe drain path: unlike [`shutdown`](LogDb::shutdown)
+    /// it takes `&self`, so it works when the `LogDb` is shared via `Arc`
+    /// (e.g. inside a long-running service like logdbd). It enters the drain
+    /// phase (rejecting new appends with `ShuttingDown`), waits for in-flight
+    /// appends to publish, then waits for the Committer to fsync everything up
+    /// to the producer cursor.
+    ///
+    /// After this returns `Ok(Clean)`, every record appended before the call is
+    /// durable. The background threads keep running; the process may then exit
+    /// (threads are aborted on drop, harmlessly, since data is already durable),
+    /// or [`shutdown`] may be called to join them.
+    pub fn drain(&self, timeout: Duration) -> Result<ShutdownReport, FlushError> {
+        let inner = &self.inner;
+        let deadline = Instant::now() + timeout;
+
+        // Phase 1: Drain — reject new appends.
+        inner.shutdown.start_drain();
+
+        // Wait for all in-flight appends to publish.
+        loop {
+            if inner.shutdown.in_flight.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                inner.shutdown.abort();
+                return Err(FlushError::Timeout);
+            }
+            std::hint::spin_loop();
+        }
+
+        // Phase 2: flush everything published up to the producer cursor.
+        let target = inner.shards.max_producer_cursor();
+        inner.shutdown.drain_target.store(target, Ordering::Release);
+        inner.flush.request(target);
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let durable_ok = wait_until(
+            &inner.shutdown,
+            || inner.flush.is_done(target),
+            remaining,
+        )
+        .is_ok();
+
+        Ok(if durable_ok {
+            ShutdownReport::Clean
+        } else {
+            ShutdownReport::PartialDurable
+        })
+    }
+
+    /// Shut down gracefully with timeout: drain (flush all to durable) then
+    /// join the background threads. Consumes the handle and requires it be the
+    /// only strong reference (so the Committer/Sealer can be joined). For
+    /// shared handles (e.g. inside a service), use [`drain`](LogDb::drain).
+    pub fn shutdown(mut self, timeout: Duration) -> Result<ShutdownReport, ShutdownError> {
+        // Drain first (shared-safe path).
+        let report = self.drain(timeout).map_err(|_| ShutdownError::Timeout)?;
+
+        // Join threads — requires exclusive access.
+        let inner = match Arc::get_mut(&mut self.inner) {
+            Some(i) => i,
+            None => return Err(ShutdownError::JoinError("LogDb still referenced".into())),
+        };
+        if let Some(h) = inner.committer_handle.take() {
+            let _ = h.join();
+        }
+        #[cfg(feature = "hash-chain")]
+        if let Some(h) = inner.sealer_handle.take() {
+            let _ = h.join();
+        }
+
+        Ok(report)
+    }
+}
+
+/// Unified wait with timeout and abort checking.
+fn wait_until(
+    shutdown: &ShutdownState,
+    cond: impl Fn() -> bool,
+    timeout: Duration,
+) -> Result<(), FlushError> {
+    let deadline = Instant::now() + timeout;
+    let mut spins: u32 = 0;
+    loop {
+        if cond() {
+            return Ok(());
+        }
+        if shutdown.aborted() {
+            return Err(FlushError::Aborted);
+        }
+        if Instant::now() >= deadline {
+            return Err(FlushError::Timeout);
+        }
+        spins = spins.saturating_add(1);
+        if spins <= 64 {
+            std::hint::spin_loop();
+        } else if spins <= 256 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_micros(100));
+            spins = 128;
+        }
+    }
+}
+
+fn save_checkpoint(dir: &std::path::Path, seq: u64) -> std::io::Result<()> {
+    let path = dir.join("checkpoint.dat");
+    let tmp = dir.join("checkpoint.tmp");
+    let mut buf = [0u8; 12];
+    buf[0..8].copy_from_slice(&seq.to_le_bytes());
+    let crc = crc32c::crc32c(&buf[..8]);
+    buf[8..12].copy_from_slice(&crc.to_le_bytes());
+    let mut f = std::fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut f, &buf)?;
+    platform::fdatasync(&f)?;
+    drop(f);
+    std::fs::rename(&tmp, &path)?;
+    let d = std::fs::File::open(dir)?;
+    platform::sync_dir(&d)?;
+    Ok(())
+}
+
+fn generate_hash_init() -> [u8; 32] {
+    #[cfg(feature = "hash-chain")]
+    {
+        // BLAKE3 keyed mode uses hash_init as the key.
+        // Generate it from CSPRNG-quality entropy.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&platform::clock_realtime_coarse_ns().to_le_bytes());
+        hasher.update(b"logdb-hash-init-v0.2.0");
+        *hasher.finalize().as_bytes()
+    }
+    #[cfg(not(feature = "hash-chain"))]
+    {
+        [0u8; 32]
+    }
+}
+
+impl Drop for LogDb {
+    fn drop(&mut self) {
+        self.inner.shutdown.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::DurabilityMode;
+
+    #[test]
+    fn open_and_append_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        let db = LogDb::open(config).unwrap();
+        let id = db.append(b"hello logdb").unwrap();
+        db.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let record = db.read(id).unwrap().unwrap();
+        assert_eq!(record.id.sequence, id);
+        assert_eq!(record.content, b"hello logdb");
+    }
+
+    #[test]
+    fn append_rejected_content_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.max_content_size = 100;
+
+        let db = LogDb::open(config).unwrap();
+        let err = db.append(&vec![0u8; 200]).unwrap_err();
+        assert!(matches!(err, AppendError::ContentTooLarge { .. }));
+    }
+
+    #[test]
+    fn shutdown_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        let db = LogDb::open(config).unwrap();
+        for i in 0..10 {
+            db.append(format!("r-{}", i).as_bytes()).unwrap();
+        }
+        let report = db.shutdown(Duration::from_secs(5)).unwrap();
+        assert!(matches!(report, ShutdownReport::Clean));
+    }
+
+    #[test]
+    fn drain_flushes_to_durable_and_rejects_appends_after() {
+        // drain() is the shared-safe path logdbd uses on graceful shutdown:
+        // it must flush all in-flight records to durable without consuming the
+        // handle, and reject further appends once draining.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        let db = LogDb::open(config).unwrap();
+        for i in 0..20 {
+            db.append(format!("r-{}", i).as_bytes()).unwrap();
+        }
+
+        let report = db.drain(Duration::from_secs(5)).unwrap();
+        assert!(matches!(report, ShutdownReport::Clean), "drain must complete clean");
+        assert!(db.durable_cursor() >= 20, "all appended records must be durable after drain");
+        for i in 0..20 {
+            assert!(db.read(i).unwrap().is_some(), "record {} readable after drain", i);
+        }
+
+        // Drain phase rejects new appends.
+        let err = db.append(b"after-drain").unwrap_err();
+        assert!(matches!(err, AppendError::ShuttingDown), "append after drain must be rejected");
+    }
+
+    #[test]
+    fn replicate_preserves_sequence_and_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        let db = LogDb::open(config).unwrap();
+        // Replicate 5 records at exact sequences 0..5 with arbitrary timestamps.
+        for i in 0..5u64 {
+            db.replicate(i, 1_000_000 + i, format!("replica-{}", i).as_bytes()).unwrap();
+        }
+        assert_eq!(db.producer_cursor(), 5, "producer cursor must advance");
+        db.flush().unwrap();
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(25));
+            if db.durable_cursor() >= 5 { break; }
+        }
+        assert!(db.durable_cursor() >= 5);
+
+        // Sequences must be EXACTLY preserved (offset semantics).
+        for i in 0..5u64 {
+            let rec = db.read(i).unwrap().unwrap();
+            assert_eq!(rec.id.sequence, i);
+            assert_eq!(rec.timestamp_ns, 1_000_000 + i);
+            assert_eq!(rec.content, format!("replica-{}", i).as_bytes());
+        }
+    }
+
+    #[test]
+    fn replicate_rejects_out_of_order_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        let db = LogDb::open(config).unwrap();
+        db.replicate(0, 0, b"a").unwrap();
+        // Skipping ahead to 2 (gap at 1) must error — caller retries in order.
+        let err = db.replicate(2, 0, b"c").unwrap_err();
+        assert!(matches!(err, AppendError::Io(_)), "expected out-of-order error");
+        // Filling the gap succeeds.
+        db.replicate(1, 0, b"b").unwrap();
+        // Re-replicating an already-applied sequence is a no-op (idempotent).
+        db.replicate(0, 0, b"REPLAY").unwrap();
+        // Only seq 0 and 1 were applied (seq 2 was rejected) → cursor at 2,
+        // unchanged by the idempotent replay.
+        assert_eq!(db.producer_cursor(), 2);
+    }
+}

@@ -27,7 +27,7 @@ assert_eq!(record.content, b"hello");
   - `Sync`：每次提交后 fdatasync
   - `Batch`：达到字节数/条数/时间阈值后 fdatasync
   - `Async`：仅显式 `flush()` 时 fdatasync，吞吐最高
-- **哈希链**（`hash-chain` feature）：BLAKE3 keyed 模式，防篡改。hash_init 作为密钥不写入磁盘
+- **哈希链**（`hash-chain` feature）：BLAKE3 keyed 模式，防篡改。每个数据库生成一次 hash_init，并持久化到段头中，重启时恢复以重新校验哈希链
 - **流式压缩**（`compression` feature）：每批 zstd 压缩为一个帧，读写透明
 - **加密**（`encryption` feature）：AES-256-GCM 逐帧加密，随机 nonce
 - **WAL checkpoint**：持久化到 `checkpoint.dat`，崩溃后自动恢复

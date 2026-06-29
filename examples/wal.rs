@@ -16,11 +16,22 @@ struct KvStore {
     db: LogDb,
     /// In-memory state rebuilt from WAL.
     data: HashMap<String, String>,
+    /// The durable sequence at open time. We checkpoint here at close, which
+    /// means "everything I applied this session is now absorbed by the app;
+    /// WAL before this point may be truncated." Records written this session
+    /// (sequences >= this value) remain recoverable on the next replay.
+    replay_from: u64,
 }
 
 impl KvStore {
     /// Open or recover the store.
-    fn open(data_dir: &str) -> Self {
+    ///
+    /// `replay_checkpoint` is the sequence at which the *previous* session was
+    /// checkpointed. We replay from there to rebuild in-memory state. (We pass
+    /// it explicitly rather than reading `recovery_report()` so that a session
+    /// that has just checkpointed its own tail still recovers its data — see
+    /// the note in [`KvStore::checkpoint`].)
+    fn open(data_dir: &str, replay_checkpoint: u64) -> Self {
         let mut config = Config::default();
         config.data_dir = data_dir.into();
         config.durability_mode = DurabilityMode::Async; // Use flush() explicitly for durability
@@ -28,12 +39,12 @@ impl KvStore {
         let db = LogDb::open(config).unwrap();
         let mut data = HashMap::new();
 
-        // Phase 1: Recover from WAL (replay records since last checkpoint)
+        // Phase 1: Recover from WAL (replay records from the replay point).
         let report = db.recovery_report();
         println!("Recovery report: from={} to={} count={}",
             report.from_sequence, report.to_sequence, report.count);
 
-        for result in db.replay_from(report.from_sequence).unwrap() {
+        for result in db.replay_from(replay_checkpoint).unwrap() {
             let record = result.unwrap();
             let content = String::from_utf8_lossy(&record.content);
             // Parse "PUT key value" or "DEL key"
@@ -46,7 +57,7 @@ impl KvStore {
         }
         println!("Recovered {} key(s) from WAL", data.len());
 
-        Self { db, data }
+        Self { db, data, replay_from: replay_checkpoint }
     }
 
     /// Put a key-value pair (durably).
@@ -85,11 +96,22 @@ impl KvStore {
         println!("PUT batch {} pairs (lsn={})", pairs.len(), self.db.durable_cursor());
     }
 
-    /// Create a checkpoint. After this, WAL before checkpoint can be truncated.
+    /// Create a checkpoint at the session's replay point.
+    ///
+    /// This tells logdb "the application has absorbed every record up to here,
+    /// so WAL data before this sequence may be truncated." Records written
+    /// *during* this session (sequences >= `replay_from`) are **not** covered
+    /// by the checkpoint and remain recoverable on the next replay.
+    ///
+    /// Note: do **not** checkpoint the live `durable_cursor()` here. A
+    /// checkpoint at the durable tail would cover the very records you just
+    /// wrote, leaving `recovery_report().count == 0` and nothing to replay
+    /// after a crash. Checkpoint the stable point you resumed from, not the
+    /// tip you are still building.
     fn checkpoint(&self) {
-        let lsn = self.db.durable_cursor();
+        let lsn = self.replay_from;
         self.db.checkpoint(lsn);
-        println!("Checkpoint at lsn={}", lsn);
+        println!("Checkpoint at lsn={} (durable tail={})", lsn, self.db.durable_cursor());
     }
 
     /// Show WAL usage.
@@ -114,8 +136,10 @@ fn main() {
 
     // ── Session 1: Write some data ─────────────────────────────────────
     println!("--- Session 1 ---");
+    let session1_checkpoint;
     {
-        let mut store = KvStore::open(path);
+        // Fresh directory: no checkpoint.dat yet, so we replay from 0.
+        let mut store = KvStore::open(path, 0);
 
         store.put("name", "Alice");
         store.put_batch(&[
@@ -124,16 +148,19 @@ fn main() {
         ]);
         store.delete("role");
 
-        // Checkpoint: everything before this is safe to delete
+        // Checkpoint the replay point we resumed from (0). Records written
+        // this session (sequences >= 0) remain recoverable.
         store.checkpoint();
         store.show_usage();
+        session1_checkpoint = store.replay_from;
         store.close();
     }
 
     // ── Session 2: Crash recovery simulation ───────────────────────────
     println!("\n--- Session 2 (after simulated crash) ---");
     {
-        let store = KvStore::open(path);
+        // Replay from the checkpoint persisted by Session 1.
+        let store = KvStore::open(path, session1_checkpoint);
         // Should have recovered name and email from WAL
         println!("name={:?}", store.data.get("name"));
         println!("email={:?}", store.data.get("email"));

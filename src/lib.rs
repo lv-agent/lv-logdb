@@ -533,20 +533,29 @@ impl LogDb {
     }
 
     /// Create a named tailer (consumer) with independent read progress.
-    /// Progress is persisted to `tailer_<name>.dat` via `commit()`.
+    ///
+    /// Progress is tracked per shard and persisted to `tailer_<name>.dat` via
+    /// `commit()`. See [`tailer`](crate::tailer) for the sharding semantics
+    /// (per-shard progress, merged-batch delivery, best-effort cross-batch
+    /// ordering when a shard stalls).
     pub fn new_tailer(&self, name: &str) -> crate::tailer::Tailer {
+        let rings: Vec<Arc<Ring>> = self
+            .inner
+            .shards
+            .all_rings()
+            .iter()
+            .map(Arc::clone)
+            .collect();
+        let manifests: Vec<Arc<std::sync::Mutex<reader::SegmentManifest>>> =
+            self.inner.manifests.iter().map(Arc::clone).collect();
         crate::tailer::Tailer::open(
-            Arc::clone(&self.inner.manifests[0]),
-            Arc::clone(self.inner.shards.ring(0)),
+            manifests,
+            rings,
+            self.inner.shards.shard_bits(),
             name,
             self.inner.config.encryption_key,
+            self.inner.data_dir.clone(),
         )
-    }
-
-    /// Internal: get the ring for tailer access.
-    #[doc(hidden)]
-    pub fn inner_ring(&self) -> Arc<Ring> {
-        Arc::clone(self.inner.shards.ring(0))
     }
 
     /// Scan records in range `[from_id, to_id)` across ALL shards, ordered by

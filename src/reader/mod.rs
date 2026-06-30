@@ -122,11 +122,6 @@ impl SegmentManifest {
         Self { data_dir, entries: Vec::new(), dir_mtime: None }
     }
 
-    /// The data directory this manifest covers.
-    pub(crate) fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
     /// Re-scan the directory into `entries` iff its mtime changed (or on first
     /// call). On filesystems where mtime is unavailable, falls back to
     /// refreshing every call (correct, just slower).

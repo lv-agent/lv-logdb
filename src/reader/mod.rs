@@ -93,6 +93,13 @@ pub(crate) struct ManifestEntry {
     flags: u8,
 }
 
+impl ManifestEntry {
+    /// First global record_id in this segment (monotonic per shard).
+    pub(crate) fn base_sequence(&self) -> u64 {
+        self.base_sequence
+    }
+}
+
 /// Cached, sorted segment listing for fast `record_id → segment` lookup.
 ///
 /// Without it, every `read()` does a full `readdir` and reads every segment
@@ -159,6 +166,18 @@ impl SegmentManifest {
         let idx = self.entries.partition_point(|e| e.base_sequence <= seq);
         Ok(if idx == 0 { None } else { Some(self.entries[idx - 1].clone()) })
     }
+
+    /// All segment entries from the one containing `seq` onward, in ascending
+    /// `segment_id` order. Used by cross-segment scans: the caller iterates
+    /// these and stops once `base_sequence >= to_id`. Refreshes the cache first.
+    pub(crate) fn segments_from(&mut self, seq: u64) -> Result<Vec<ManifestEntry>, ReadError> {
+        self.refresh_if_needed()?;
+        let start = self
+            .entries
+            .partition_point(|e| e.base_sequence <= seq)
+            .saturating_sub(1);
+        Ok(self.entries[start..].to_vec())
+    }
 }
 
 /// Read just `(base_sequence, flags)` from a segment header (for the manifest).
@@ -168,6 +187,55 @@ fn read_header_for_manifest(path: &Path) -> Option<(u64, u8)> {
     file.read_exact(&mut buf).ok()?;
     let header = SegmentHeader::deserialize(&buf).ok()?;
     Some((header.base_sequence, header.flags))
+}
+
+/// Build a single-segment `RecordIter` over `entry`, anchored for `from_id`.
+/// Shared by `Reader::scan` (a point entry) and `ShardScanner` (cross-segment):
+/// both construct a per-segment iterator identically from a manifest entry.
+pub(crate) fn iter_for_segment(
+    entry: &ManifestEntry,
+    from_id: u64,
+    to_id: u64,
+    key: Option<[u8; 32]>,
+) -> Result<iter::RecordIter, ReadError> {
+    let path = entry.path.clone();
+    let is_compressed = entry.flags & crate::storage::format::FLAG_COMPRESSED_ZSTD != 0;
+    let is_encrypted = entry.flags & crate::storage::format::FLAG_ENCRYPTED_AES256GCM != 0;
+
+    let file_size = fs::metadata(&path)
+        .map_err(|e| ReadError::Io(format!("metadata: {}", e)))?
+        .len();
+
+    // Frame-based segments need frame-aligned anchors -> start at the header
+    // and let RecordIter skip records below `from_id`. Raw segments can use
+    // the sparse-index anchor.
+    let start_offset = if is_compressed || is_encrypted {
+        SEGMENT_HEADER_SIZE as u64
+    } else {
+        let idx_path = SparseIndex::index_path(&path);
+        if idx_path.exists() {
+            match SparseIndex::load(&idx_path) {
+                Ok(idx) => match idx.find_anchor(from_id) {
+                    Some((e, _)) => e.file_offset,
+                    None => SEGMENT_HEADER_SIZE as u64,
+                },
+                Err(_) => SEGMENT_HEADER_SIZE as u64,
+            }
+        } else {
+            SEGMENT_HEADER_SIZE as u64
+        }
+    };
+
+    iter::RecordIter::new(
+        path,
+        start_offset,
+        file_size,
+        from_id,
+        to_id,
+        is_compressed,
+        is_encrypted,
+        key,
+    )
 }
 
 /// A reader that queries records from segment files.
@@ -299,51 +367,17 @@ impl Reader {
         Ok(None)
     }
 
-    /// Scan records in the range `[from_id, to_id)`.
+    /// Scan records in the range `[from_id, to_id)` within the single segment
+    /// containing `from_id`. (Cross-segment / cross-shard scans live on
+    /// `LogDb::scan` -> `ScanIter`; this single-segment iterator is used
+    /// directly by tailer/pusher.)
     pub fn scan(&self, from_id: u64, to_id: u64) -> Result<RecordIter, ReadError> {
         // Locate the starting segment via the cached manifest (O(log N)).
         let entry = match self.manifest.lock().unwrap().find(from_id)? {
             Some(e) => e,
             None => return Err(ReadError::NotFound(from_id)),
         };
-        let path = entry.path;
-        let is_compressed = entry.flags & crate::storage::format::FLAG_COMPRESSED_ZSTD != 0;
-        let is_encrypted = entry.flags & crate::storage::format::FLAG_ENCRYPTED_AES256GCM != 0;
-
-        let file_size = fs::metadata(&path)
-            .map_err(|e| ReadError::Io(format!("metadata: {}", e)))?
-            .len();
-
-        // Frame-based segments need frame-aligned anchors → start at the header
-        // and let RecordIter skip records below `from_id`. Raw segments can use
-        // the sparse-index anchor.
-        let start_offset = if is_compressed || is_encrypted {
-            SEGMENT_HEADER_SIZE as u64
-        } else {
-            let idx_path = SparseIndex::index_path(&path);
-            if idx_path.exists() {
-                match SparseIndex::load(&idx_path) {
-                    Ok(idx) => match idx.find_anchor(from_id) {
-                        Some((e, _)) => e.file_offset,
-                        None => SEGMENT_HEADER_SIZE as u64,
-                    },
-                    Err(_) => SEGMENT_HEADER_SIZE as u64,
-                }
-            } else {
-                SEGMENT_HEADER_SIZE as u64
-            }
-        };
-
-        RecordIter::new(
-            path,
-            start_offset,
-            file_size,
-            from_id,
-            to_id,
-            is_compressed,
-            is_encrypted,
-            self.encryption_key,
-        )
+        iter_for_segment(&entry, from_id, to_id, self.encryption_key)
     }
 }
 

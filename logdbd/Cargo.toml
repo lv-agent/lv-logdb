@@ -1,0 +1,23 @@
+[package]
+name = "logdbd"
+version = "0.1.0"
+edition = "2021"
+description = "Clustered log service built on logdb"
+
+[dependencies]
+logdb = { path = "../logdb", features = ["compression", "encryption"] }
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic-health = "0.12"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+rcgen = { version = "0.13", features = ["pem"] }

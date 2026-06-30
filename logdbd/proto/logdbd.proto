@@ -1,0 +1,73 @@
+syntax = "proto3";
+package logdbd;
+
+service LogDbService {
+  rpc Append(AppendRequest) returns (AppendResponse);
+  rpc BatchAppend(BatchAppendRequest) returns (AppendResponse);
+  rpc Read(ReadRequest) returns (Record);
+  rpc Scan(ScanRequest) returns (stream Record);
+  rpc Tail(TailRequest) returns (stream Record);
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message Record {
+  uint64 sequence = 1;
+  uint64 timestamp_ns = 2;
+  bytes content = 3;
+}
+
+message AppendRequest {
+  bytes content = 1;
+}
+
+message BatchAppendRequest {
+  repeated bytes contents = 1;
+}
+
+message AppendResponse {
+  uint64 sequence = 1;
+}
+
+message ReadRequest {
+  uint64 sequence = 1;
+}
+
+message ScanRequest {
+  uint64 from = 1;
+  uint64 to = 2;
+}
+
+message TailRequest {
+  string consumer_name = 1;
+  uint32 max_count = 2;
+}
+
+message CheckpointRequest {
+  uint64 sequence = 1;
+}
+
+message CheckpointResponse {}
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64 durable_sequence = 1;
+  uint64 checkpoint = 2;
+  uint64 wal_bytes_used = 3;
+  uint64 wal_bytes_total = 4;
+  string node_id = 5;
+}
+
+// Internal replication service (primary → standby).
+service ReplicationService {
+  rpc Sync(ReplicationRequest) returns (ReplicationResponse);
+}
+
+message ReplicationRequest {
+  repeated Record records = 1;
+}
+
+message ReplicationResponse {
+  uint64 last_sequence = 1;
+}

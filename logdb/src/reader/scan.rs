@@ -173,7 +173,11 @@ impl Iterator for MergeIter {
 /// yielded in ascending global-id order. An empty range produces an empty
 /// iterator (no error). Construction is crate-internal via [`ScanIter::build`].
 pub struct ScanIter {
-    inner: Box<dyn Iterator<Item = Result<Record, ReadError>>>,
+    // `+ Send` so the iterator can be moved across threads / held across an
+    // `.await` in a spawned task (e.g. by async consumers like a gRPC server).
+    // The concrete scanners (ShardScanner / MergeIter / RecordIter) are already
+    // Send; this bound just preserves it through the trait object.
+    inner: Box<dyn Iterator<Item = Result<Record, ReadError>> + Send>,
 }
 
 impl ScanIter {

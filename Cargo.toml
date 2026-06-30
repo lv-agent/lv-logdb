@@ -1,34 +1,13 @@
-[package]
-name = "logdb"
-version = "0.2.0"
-edition = "2021"
-description = "Embedded, append-only, crash-recoverable, optionally tamper-proof local log database"
-license = "MIT OR Apache-2.0"
+# lv-logdb — a cargo workspace
+#
+# Members:
+#   logdb   — the embedded append-only log database (the library crate)
+#   logdbd  — a clustered gRPC service built on logdb
+#
+# The fuzz targets (logdb/fuzz) are excluded from the workspace; they are
+# driven by `cargo +nightly fuzz` directly.
 
-[dependencies]
-thiserror = "2"
-crc32c = "0.6"
-sha2 = { version = "0.10", optional = true }
-blake3 = { version = "1", optional = true }
-libc = "0.2"
-scopeguard = "1"
-zstd = { version = "0.13", optional = true, default-features = false }
-aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "alloc"] }
-getrandom = { version = "0.2", optional = true }
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-tempfile = "3"
-proptest = "1"
-rand = "0.8"
-
-[features]
-default = []
-hash-chain = ["sha2", "blake3"]
-compression = ["zstd"]
-encryption = ["aes-gcm", "getrandom"]
-remote-push = []
-
-[[bench]]
-name = "append_bench"
-harness = false
+[workspace]
+resolver = "2"
+members = ["logdb", "logdbd"]
+exclude = ["logdb/fuzz"]

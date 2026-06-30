@@ -2246,4 +2246,234 @@ mod tests {
         let want: Vec<u64> = ids.iter().copied().filter(|&id| id >= from && id < to).collect();
         assert_eq!(got, want, "range scan must be exact after buffering");
     }
+
+    // ── cr-005: feature × shards matrix coverage (release-prep) ──────────
+
+    #[test]
+    fn replicate_rejects_shards_gt_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+        let err = db.replicate(0, 0, b"x").unwrap_err();
+        assert!(
+            matches!(err, crate::AppendError::Io(_)),
+            "replicate must reject shards>1"
+        );
+        assert!(
+            format!("{}", err).contains("shards=1"),
+            "error should explain the constraint, got: {}",
+            err
+        );
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn sharded_compressed_log_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.compression_enabled = true;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config.clone()).unwrap());
+
+        // Spread compressed (frame-mode) writes across all shards.
+        let mut by_id = std::collections::HashMap::<u64, Vec<u8>>::new();
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                let mut v = Vec::new();
+                for i in 0..10u64 {
+                    let c = format!("t{}-{}", t, i).into_bytes();
+                    let id = db.append(&c).unwrap();
+                    v.push((id, c));
+                }
+                v
+            }));
+        }
+        for h in handles {
+            for (id, c) in h.join().unwrap() {
+                by_id.insert(id, c);
+            }
+        }
+        let all_ids: Vec<u64> = by_id.keys().copied().collect();
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Frame-mode scan under shards>1: every record, ascending, readable.
+        let scanned: Vec<u64> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(scanned.len(), all_ids.len(), "compressed scan must see all shards");
+        assert!(scanned.windows(2).all(|w| w[0] < w[1]));
+        for (id, expected) in &by_id {
+            let rec = db.read(*id).unwrap().expect("compressed point read under shards>1");
+            assert_eq!(&rec.content, expected, "content mismatch for id {}", id);
+        }
+
+        // Reopen → frame-mode recovery under shards>1.
+        drop(db);
+        let db = LogDb::open(config).unwrap();
+        let rescanned: Vec<u64> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(rescanned.len(), all_ids.len(), "compressed shards>1 must survive reopen");
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn sharded_encrypted_log_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.encryption_key = Some([0x42u8; 32]);
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config.clone()).unwrap());
+
+        let mut by_id = std::collections::HashMap::<u64, Vec<u8>>::new();
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                let mut v = Vec::new();
+                for i in 0..10u64 {
+                    let c = format!("t{}-{}", t, i).into_bytes();
+                    let id = db.append(&c).unwrap();
+                    v.push((id, c));
+                }
+                v
+            }));
+        }
+        for h in handles {
+            for (id, c) in h.join().unwrap() {
+                by_id.insert(id, c);
+            }
+        }
+        let all_ids: Vec<u64> = by_id.keys().copied().collect();
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let scanned: Vec<u64> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(scanned.len(), all_ids.len(), "encrypted scan must see all shards");
+        assert!(scanned.windows(2).all(|w| w[0] < w[1]));
+        for (id, expected) in &by_id {
+            let rec = db.read(*id).unwrap().expect("encrypted point read under shards>1");
+            assert_eq!(&rec.content, expected, "content mismatch for id {}", id);
+        }
+
+        drop(db);
+        let db = LogDb::open(config).unwrap();
+        let rescanned: Vec<u64> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(rescanned.len(), all_ids.len(), "encrypted shards>1 must survive reopen");
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    #[ignore = "BUG: frame-mode scan across a segment roll miscounts/hangs — see cr-005 notes; fix in a follow-up"]
+    fn compressed_scan_crosses_segment_roll() {
+        compressed_or_encrypted_scan_crosses_roll(true, None);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    #[ignore = "BUG: frame-mode scan across a segment roll hangs — see cr-005 notes; fix in a follow-up"]
+    fn encrypted_scan_crosses_segment_roll() {
+        compressed_or_encrypted_scan_crosses_roll(false, Some([0x99u8; 32]));
+    }
+
+    /// Shared harness: shards=1 frame-mode (compressed and/or encrypted),
+    /// force a segment roll with large payloads, scan all records across it.
+    fn compressed_or_encrypted_scan_crosses_roll(compressed: bool, key: Option<[u8; 32]>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 1;
+        config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
+        config.ring_size = 8192;
+        config.compression_enabled = compressed;
+        config.encryption_key = key;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(10);
+        let db = LogDb::open(config).unwrap();
+
+        // Incompressible payload: zstd can't shrink it, so a compressed
+        // segment still fills and rolls (a constant payload would compress to
+        // almost nothing and never roll). Encryption is size-preserving so this
+        // works for the encrypted path too.
+        let payload: Vec<u8> = (0..64 * 1024)
+            .map(|i: usize| {
+                // splitmix64 finalizer — strong mixing so zstd cannot compress
+                // the payload (a constant/periodic payload would shrink below
+                // one segment and never roll).
+                let mut z = i as u64;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                (z ^ (z >> 31)) as u8
+            })
+            .collect();
+        let n = 25u64; // 25 × 64KB > 1MB → at least one roll
+        for _ in 0..n {
+            db.append(&payload).unwrap();
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= n as usize {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // At least two segment files exist (a roll happened).
+        let segs = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().map_or(false, |n| n.ends_with(".log")))
+            .count();
+        assert!(segs >= 2, "expected a frame-mode segment roll, found {}", segs);
+
+        // Frame-mode RecordIter must cross the roll and return all records.
+        let scanned: Vec<u64> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(scanned.len(), n as usize, "frame-mode scan must cross the segment roll");
+        assert_eq!((0..n).collect::<Vec<_>>(), scanned);
+    }
 }

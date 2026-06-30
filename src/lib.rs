@@ -1184,4 +1184,49 @@ mod tests {
         let want: Vec<u64> = all_ids.iter().copied().filter(|&id| id >= pivot).collect();
         assert_eq!(tail, want, "replay_from must return the ordered tail across shards");
     }
+
+    // ── cr-003 Phase 4: per-shard crash recovery ──────────────────────────
+
+    #[test]
+    fn reopen_under_sharding_preserves_all_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        // Session 1: spread appends across all 4 shards (thread-affine routing).
+        let mut all_ids = Vec::new();
+        {
+            let db = Arc::new(LogDb::open(config.clone()).unwrap());
+            let mut handles = Vec::new();
+            for t in 0..4u64 {
+                let db = Arc::clone(&db);
+                handles.push(std::thread::spawn(move || {
+                    (0..10u64)
+                        .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                        .collect::<Vec<_>>()
+                }));
+            }
+            for h in handles {
+                all_ids.extend(h.join().unwrap());
+            }
+            db.flush().unwrap();
+            let db = Arc::try_unwrap(db).ok().unwrap();
+            db.shutdown(Duration::from_secs(5)).unwrap();
+        }
+
+        // Session 2: reopen — recovery must run per shard and preserve every record.
+        let db = LogDb::open(config).unwrap();
+        let scanned: Vec<u64> = db
+            .scan(0, u64::MAX).unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(scanned.len(), all_ids.len(), "reopen must preserve every record across shards");
+        assert!(all_ids.iter().all(|id| scanned.contains(id)), "reopen lost some ids");
+        assert!(scanned.windows(2).all(|w| w[0] < w[1]), "scanned ids must be strictly ascending");
+    }
 }

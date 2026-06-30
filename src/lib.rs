@@ -1739,4 +1739,46 @@ mod tests {
             "tailer must cross segment boundaries within each shard"
         );
     }
+
+    // ── cr-003 Phase 6: hardening + production-ready docs ─────────────────
+
+    #[test]
+    fn wal_usage_under_sharding_sums_all_shard_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..10u64 {
+                    db.append(format!("t{}-{}", t, i).as_bytes()).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.durable_cursor() >= 10 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let (used, total) = db.wal_usage();
+        assert!(total > 0, "segment_size total should be reported");
+        assert!(
+            used > 0,
+            "wal_usage must sum segment files across ALL shard subdirs (got {})",
+            used
+        );
+    }
 }

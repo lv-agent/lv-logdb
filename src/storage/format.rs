@@ -7,7 +7,7 @@
 //! | 0      | 4    | magic            | 0x4C474442 ("LGDB")                      |
 //! | 4      | 2    | format_version   | 0x0001                                   |
 //! | 6      | 1    | flags            | bit0=not-first, bit1=hash_enabled        |
-//! | 7      | 1    | hash_algo        | 0=SHA256, 1=BLAKE3                       |
+//! | 7      | 1    | hash_algo        | 0=None, 1=SHA256, 2=BLAKE3               |
 //! | 8      | 32   | hash_init        | CSPRNG, globally unique (hash enabled)   |
 //! | 40     | 8    | base_sequence    | First sequence in this segment           |
 //! | 48     | 4    | partition_id     | Logical partition identifier             |

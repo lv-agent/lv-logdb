@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use format::{
-    record_size, write_frame_header, SegmentHeader, ENCRYPTION_NONCE_SIZE, FLAG_COMPRESSED_ZSTD,
-    FLAG_HASH_ENABLED, FRAME_HEADER_SIZE, HEADER_CRC_END, SEGMENT_HEADER_SIZE,
+    record_size, write_frame_header, SegmentHeader, FLAG_COMPRESSED_ZSTD, FLAG_HASH_ENABLED,
+    FRAME_HEADER_SIZE, HEADER_CRC_END, SEGMENT_HEADER_SIZE,
 };
 
 use crate::config::RetentionPolicy;
@@ -282,11 +282,12 @@ pub struct SegmentManager {
 
 /// Encrypt data with AES-256-GCM if key is provided, otherwise pass through.
 /// Returns `{nonce:12B | ciphertext}` when encrypted, or plaintext when no key.
-fn encrypt_if_enabled(key: &Option<[u8; 32]>, plaintext: &[u8]) -> Result<Vec<u8>, SegmentError> {
+fn encrypt_if_enabled(_key: &Option<[u8; 32]>, plaintext: &[u8]) -> Result<Vec<u8>, SegmentError> {
     #[cfg(feature = "encryption")]
-    if let Some(k) = key {
+    if let Some(k) = _key {
         use aes_gcm::aead::{Aead, KeyInit};
         use aes_gcm::{Aes256Gcm, Key, Nonce};
+        use format::ENCRYPTION_NONCE_SIZE;
         let key = Key::<Aes256Gcm>::from_slice(k);
         let cipher = Aes256Gcm::new(key);
         let mut nonce_bytes = [0u8; ENCRYPTION_NONCE_SIZE];

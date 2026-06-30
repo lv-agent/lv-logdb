@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use logdb::config::{Config, DurabilityMode, QueueFullPolicy};
 use logdb::LogDb;
+use logdb::{Config, DurabilityMode, QueueFullPolicy};
 
 fn main() {
     // ── Clock calibration ───────────────────────────────────────────

@@ -6,8 +6,8 @@
 
 use std::time::{Duration, Instant};
 
-use logdb::config::{Config, DurabilityMode};
 use logdb::LogDb;
+use logdb::{Config, DurabilityMode};
 
 fn main() {
     let dir = tempfile::tempdir().unwrap();

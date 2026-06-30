@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
-use logdb::config::{Config, DurabilityMode};
 use logdb::{AppendError, LogDb, ShutdownReport};
+use logdb::{Config, DurabilityMode};
 
 #[test]
 fn full_lifecycle_append_flush_read() {
@@ -695,7 +695,6 @@ fn index_stride_is_configurable() {
     // A smaller index_stride yields more anchors per segment → shorter read
     // scans (P2-1c). With stride 64 over 500 records we expect ~8 anchors
     // (vs ~1 at the default stride 1024).
-    use logdb::storage::index::SparseIndex;
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().to_path_buf();
     {
@@ -720,12 +719,18 @@ fn index_stride_is_configurable() {
             assert!(db.read(i).unwrap().is_some(), "record {} readable", i);
         }
     }
-    let seg = data_dir.join("segment-00000001.log");
-    let idx = SparseIndex::load(&SparseIndex::index_path(&seg))
-        .expect("sparse index .idx must be written after flush");
-    assert!(
-        idx.len() >= 5,
-        "stride 64 over 500 records should yield several anchors, got {}",
-        idx.len()
-    );
+    // The anchor-count assertion pokes the internal sparse index (.idx). It only
+    // compiles under the `testing` feature, which re-exposes `storage::index`.
+    #[cfg(feature = "testing")]
+    {
+        use logdb::storage::index::SparseIndex;
+        let seg = data_dir.join("segment-00000001.log");
+        let idx = SparseIndex::load(&SparseIndex::index_path(&seg))
+            .expect("sparse index .idx must be written after flush");
+        assert!(
+            idx.len() >= 5,
+            "stride 64 over 500 records should yield several anchors, got {}",
+            idx.len()
+        );
+    }
 }

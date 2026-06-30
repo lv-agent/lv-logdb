@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use logdb::config::{Config, DurabilityMode};
 use logdb::LogDb;
+use logdb::{Config, DurabilityMode};
 
 /// A simulated key-value store backed by logdb WAL.
 struct KvStore {

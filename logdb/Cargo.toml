@@ -35,7 +35,21 @@ hash-chain = ["sha2", "blake3"]
 compression = ["zstd"]
 encryption = ["aes-gcm", "getrandom"]
 remote-push = []
+# Expose internal modules (`ring`, `storage`, `pipeline`, …) as `#[doc(hidden)] pub`
+# so the deployed test binary (`examples/testsuite.rs`) and the `tests/fuzz`
+# integration target can exercise internals. NOT a supported public API.
+testing = []
 
 [[bench]]
 name = "append_bench"
 harness = false
+
+# Exercises internal modules; only builds under the `testing` feature.
+[[example]]
+name = "testsuite"
+required-features = ["testing"]
+
+# Property test for the on-disk record format; reaches into `storage::format`.
+[[test]]
+name = "fuzz"
+required-features = ["testing"]

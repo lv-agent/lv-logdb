@@ -9,8 +9,9 @@ use std::hint;
 use std::thread;
 use std::time::Duration;
 
-// Re-export config types for convenience
-pub use crate::config::{CommitTrigger, DurabilityMode, WaitStrategy};
+// Re-export config types used in this module (CommitTrigger is imported by
+// lib.rs via this path).
+pub use crate::config::{CommitTrigger, WaitStrategy};
 
 /// Stateful backoff helper for a single thread.
 ///

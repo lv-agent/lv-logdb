@@ -14,33 +14,71 @@
 //!
 //! ## Performance: Inline vs Spill
 //!
-//! Records ≤ [`INLINE_CAP`](ring::slot::INLINE_CAP) bytes (256) take the **inline
+//! Records ≤ `INLINE_CAP` (256) bytes take the **inline
 //! fast path**: zero heap allocation, zero extra memcpy. p50 is typically <100ns.
 //!
 //! Records > 256 bytes take the **spill path**: a heap allocation in the append
 //! thread. The spill path is ~4x slower in throughput with ~80x higher p99.9
 //! tail latency due to allocator jitter. Keep latency-sensitive records ≤ 256B.
 
-pub mod config;
-pub mod error;
-pub mod health;
-pub mod pipeline;
-pub mod platform;
-pub mod reader;
-pub mod record;
-pub mod ring;
-pub mod shard;
-pub mod storage;
+// ── Public API surface ─────────────────────────────────────────────────────
+//
+// logdb exposes a narrow, intentional public API from the crate root (see the
+// `pub use` re-exports below). Implementation modules are `pub(crate)` so they
+// are NOT part of the supported public API / semver surface — internal
+// refactors do not break downstream callers.
+//
+// The off-by-default `testing` feature re-exposes those modules (as
+// `#[doc(hidden)] pub`) so the deployed test binary (`examples/testsuite.rs`)
+// and the `tests/fuzz` integration target can exercise internals. It is not a
+// supported public API.
+
+/// Declare an implementation module.
+///
+/// `pub(crate)` normally; `#[doc(hidden)] pub` under the `testing` feature.
+macro_rules! internal_mod {
+    ($name:ident) => {
+        // Crate-private in normal builds. The module's full API surface is
+        // exercised under the `testing` feature (deployed test binary +
+        // `tests/fuzz`), so silence dead_code for the whole subtree rather than
+        // cfg-gating every test-only helper individually. Under `testing` the
+        // module is `pub` (and doc-hidden) and its items are used, so no allow.
+        #[cfg(not(feature = "testing"))]
+        #[allow(dead_code)]
+        pub(crate) mod $name;
+        #[cfg(feature = "testing")]
+        #[doc(hidden)]
+        pub mod $name;
+    };
+}
+
+internal_mod!(config);
+internal_mod!(error);
+internal_mod!(health);
+internal_mod!(pipeline);
+internal_mod!(platform);
+internal_mod!(reader);
+internal_mod!(record);
+internal_mod!(ring);
+internal_mod!(shard);
+internal_mod!(storage);
 
 mod pusher;
-pub mod recovery;
-pub mod tailer;
+internal_mod!(recovery);
+internal_mod!(tailer);
 
-pub use config::Config;
+// The supported public surface, re-exported at the crate root. These are the
+// only paths callers should depend on.
+pub use config::{
+    Config, DurabilityMode, IoBackend, QueueFullPolicy, RetentionPolicy, WaitStrategy,
+};
 pub use error::{
     AppendError, ConfigError, FlushError, OpenError, ReadError, ShutdownError, ShutdownReport,
 };
-pub use record::Record;
+pub use reader::ScanIter;
+pub use record::{Record, RecordId};
+pub use shard::{decode_record_id, encode_record_id, shard_bits};
+pub use tailer::Tailer;
 
 /// Recovery report returned by [`LogDb::recovery_report`].
 #[derive(Debug, Clone)]
@@ -289,7 +327,7 @@ impl LogDb {
     /// Returns the sequence number of the first record in the batch.
     ///
     /// All `contents.len()` sequences are reserved in one atomic
-    /// [`claim_batch`](crate::ring::Ring::claim_batch) (no partial reservation),
+    /// `claim_batch` (no partial reservation),
     /// so consecutive batches never overwrite each other's slots.
     pub fn append_batch(&self, contents: &[&[u8]]) -> Result<u64, AppendError> {
         if contents.is_empty() {
@@ -560,10 +598,10 @@ impl LogDb {
     /// Create a named tailer (consumer) with independent read progress.
     ///
     /// Progress is tracked per shard and persisted to `tailer_<name>.dat` via
-    /// `commit()`. See [`tailer`](crate::tailer) for the sharding semantics
+    /// `commit()`. See [`Tailer`] for the sharding semantics
     /// (per-shard progress, merged-batch delivery, best-effort cross-batch
     /// ordering when a shard stalls).
-    pub fn new_tailer(&self, name: &str) -> crate::tailer::Tailer {
+    pub fn new_tailer(&self, name: &str) -> Tailer {
         let rings: Vec<Arc<Ring>> = self
             .inner
             .shards
@@ -587,7 +625,7 @@ impl LogDb {
     /// ascending global id. `shards=1` returns a single cross-segment stream;
     /// `shards>1` k-way-merges the per-shard streams. An empty range yields an
     /// empty iterator (no error).
-    pub fn scan(&self, from_id: u64, to_id: u64) -> Result<reader::ScanIter, ReadError> {
+    pub fn scan(&self, from_id: u64, to_id: u64) -> Result<ScanIter, ReadError> {
         let manifests = self.inner.manifests.iter().map(Arc::clone).collect();
         reader::ScanIter::build(manifests, self.inner.config.encryption_key, from_id, to_id)
     }
@@ -692,7 +730,7 @@ impl LogDb {
 
     /// Replay records from `sequence` (inclusive) to the end of the log, across
     /// all shards, ordered by ascending global id.
-    pub fn replay_from(&self, sequence: u64) -> Result<reader::ScanIter, ReadError> {
+    pub fn replay_from(&self, sequence: u64) -> Result<ScanIter, ReadError> {
         self.scan(sequence, u64::MAX)
     }
 
@@ -709,7 +747,7 @@ impl LogDb {
     /// After this returns `Ok(Clean)`, every record appended before the call is
     /// durable. The background threads keep running; the process may then exit
     /// (threads are aborted on drop, harmlessly, since data is already durable),
-    /// or [`shutdown`] may be called to join them.
+    /// or [`LogDb::shutdown`] may be called to join them.
     pub fn drain(&self, timeout: Duration) -> Result<ShutdownReport, FlushError> {
         let inner = &self.inner;
         let deadline = Instant::now() + timeout;

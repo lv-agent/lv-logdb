@@ -171,7 +171,7 @@ impl Iterator for MergeIter {
 /// `shards == 1` runs a single cross-segment stream (no merge heap); `shards >
 /// 1` k-way-merges the per-shard streams by ascending global id. Records are
 /// yielded in ascending global-id order. An empty range produces an empty
-/// iterator (no error). Construction is crate-internal via [`ScanIter::build`].
+/// iterator (no error). Construction is crate-internal (see `ScanIter::build`).
 pub struct ScanIter {
     // `+ Send` so the iterator can be moved across threads / held across an
     // `.await` in a spawned task (e.g. by async consumers like a gRPC server).

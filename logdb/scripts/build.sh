@@ -22,7 +22,9 @@ echo "target: $(rustc -vV | grep host | awk '{print $2}')"
 echo ""
 
 echo "Building release binaries..."
-cargo build --release --example perf --example soak --example crash_test --example testsuite
+# testsuite exercises internal modules, gated behind the `testing` feature.
+cargo build --release --features testing \
+    --example perf --example soak --example crash_test --example testsuite
 
 echo ""
 echo "Binaries:"

@@ -7,6 +7,15 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed (BREAKING)
 
+- **Narrowed public API surface.** Implementation modules (`config`, `error`,
+  `ring`, `storage`, `pipeline`, `health`, `platform`, `reader`, `record`,
+  `shard`, `recovery`, `tailer`) are now `pub(crate)` — they are no longer part
+  of the supported public API / semver surface. The stable types are re-exported
+  at the crate root: use `logdb::Config`, `logdb::Record`, `logdb::ScanIter`,
+  `logdb::Tailer`, `logdb::AppendError`, … instead of `logdb::config::Config`,
+  `logdb::ring::Ring`, etc. Migration: change `logdb::<module>::<Type>` imports
+  to the crate-root re-export. (Internal types like `Ring`, `SegmentManager`,
+  `ShardMap` are no longer reachable from downstream crates.)
 - `LogDb::open` now returns `Result<Self, OpenError>` instead of
   `Result<Self, String>`. `OpenError` is a structured enum
   (`InvalidConfig` / `Recovery` / `SegmentCreate` / `ThreadSpawn`) so callers
@@ -24,6 +33,12 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `OpenError`, `ConfigError`, and `AppendError::EmptyBatch` error types.
+- `testing` feature: an off-by-default feature that re-exposes the internal
+  modules as `#[doc(hidden)] pub`, for the deployed test binary
+  (`examples/testsuite`) and the `tests/fuzz` integration target. Not a
+  supported public API.
+- Crate-root re-exports: `RecordId`, `ScanIter`, `Tailer`, and the shard-id
+  helpers (`encode_record_id` / `decode_record_id` / `shard_bits`).
 - Cargo manifest metadata for crates.io publishing: `repository`, `homepage`,
   `documentation`, `readme`, `keywords`, `categories`, and `rust-version`
   (MSRV = 1.74, dictated by `thiserror` 2).

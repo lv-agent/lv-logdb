@@ -31,6 +31,7 @@ jobs:
         features:
           - ''
           - '--all-features'
+          - '--features testing'
           - '--features compression'
           - '--features encryption'
           - '--features hash-chain'

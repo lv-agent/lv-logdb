@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use logdb::config::Config;
+use logdb::Config;
 use logdb::LogDb;
 use tonic::transport::Server;
 use tonic::transport::{Identity, ServerTlsConfig};

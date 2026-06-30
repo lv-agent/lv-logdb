@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use logdb::config::Config as DbConfig;
+use logdb::Config as DbConfig;
 use logdb::LogDb;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -24,7 +24,7 @@ async fn start_test_server() -> (SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut db_config = DbConfig::default();
     db_config.data_dir = dir.path().to_path_buf();
-    db_config.durability_mode = logdb::config::DurabilityMode::Batch;
+    db_config.durability_mode = logdb::DurabilityMode::Batch;
     db_config.ring_size = 128;
     let db = LogDb::open(db_config).unwrap();
 
@@ -151,7 +151,7 @@ async fn standby_rejects_writes() {
     let dir = tempfile::tempdir().unwrap();
     let mut db_config = DbConfig::default();
     db_config.data_dir = dir.path().to_path_buf();
-    db_config.durability_mode = logdb::config::DurabilityMode::Batch;
+    db_config.durability_mode = logdb::DurabilityMode::Batch;
     db_config.ring_size = 128;
     let db = LogDb::open(db_config).unwrap();
 
@@ -191,7 +191,7 @@ async fn standby_rejects_writes() {
 /// Start a full node (LogDbService + ReplicationService). If `role` is primary
 /// and `standby_addrs` is non-empty, spawns the background replication task.
 async fn start_node(role: &str, standby_addrs: Vec<String>) -> (SocketAddr, tempfile::TempDir) {
-    use logdb::config::DurabilityMode;
+    use logdb::DurabilityMode;
 
     let dir = tempfile::tempdir().unwrap();
     let mut db_config = DbConfig::default();

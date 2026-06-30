@@ -73,26 +73,39 @@ pub struct RecoveryState {
     pub hash_init: [u8; 32],
     /// Any non-fatal warnings produced during recovery.
     pub warnings: Vec<RecoveryWarning>,
+    /// Number of valid records recovered in the active (last) segment. `0`
+    /// means the shard's active segment had no recoverable records (empty
+    /// shard); the owning ring must then resume at LOCAL seq 0 rather than from
+    /// the `base_sequence - 1` sentinel.
+    pub recovered_count: u64,
 }
 
-/// Recover the database state from `data_dir`.
+/// Recover a single shard's directory. `shard_dir` is `data_dir` for
+/// `shards == 1` (flat layout) or `data_dir/s<shard>/` for `shards > 1`.
+///
+/// Each shard is an independent, self-contained recoverable log: within a shard,
+/// consecutive record ids differ by exactly `1 << shard_bits` (the shard id
+/// occupies the low `shard_bits` bits and is constant per shard). The torn-write
+/// scan uses that stride; for `shards == 1`, `shard_bits == 0` → stride 1
+/// (identical to the legacy single-shard scan).
 ///
 /// Returns `Ok(RecoveryState)` on success. Returns `Err(String)` if recovery
 /// fails catastrophically (no valid segments found, etc.).
-pub fn recover(
-    data_dir: &Path,
+pub fn recover_shard(
+    shard_dir: &Path,
+    shard_bits: u32,
     segment_size: u64,
     retention: RetentionPolicy,
     encryption_key: Option<[u8; 32]>,
 ) -> Result<RecoveryState, String> {
-    if !data_dir.exists() {
-        return Err(format!("data directory does not exist: {:?}", data_dir));
+    if !shard_dir.exists() {
+        return Err(format!("data directory does not exist: {:?}", shard_dir));
     }
 
     // 1. List and sort segment files
-    let mut seg_files = list_segment_files(data_dir)?;
+    let mut seg_files = list_segment_files(shard_dir)?;
     if seg_files.is_empty() {
-        return Err(format!("no segment files found in {:?}", data_dir));
+        return Err(format!("no segment files found in {:?}", shard_dir));
     }
     seg_files.sort_by_key(|(id, _)| *id);
 
@@ -167,13 +180,15 @@ pub fn recover(
     // 4. Scan the last segment for torn writes
     let last_idx = valid_segments.len() - 1;
     let (last_seg_id, last_path, last_header, _last_size) = &valid_segments[last_idx];
-    let (last_sequence, last_hash, active_offset, truncation_warnings) = scan_last_segment(
-        last_path,
-        *last_seg_id,
-        last_header,
-        hash_enabled,
-        encryption_key,
-    )?;
+    let (last_sequence, last_hash, active_offset, truncation_warnings, recovered_count) =
+        scan_last_segment(
+            last_path,
+            *last_seg_id,
+            last_header,
+            hash_enabled,
+            encryption_key,
+            shard_bits,
+        )?;
 
     warnings.extend(truncation_warnings);
 
@@ -204,7 +219,7 @@ pub fn recover(
     let final_offset = active_offset;
 
     let seg_mgr = SegmentManager::open_existing(
-        data_dir.to_path_buf(),
+        shard_dir.to_path_buf(),
         last_path.clone(),
         *last_seg_id,
         final_offset,
@@ -227,7 +242,20 @@ pub fn recover(
         hash_enabled,
         hash_init,
         warnings,
+        recovered_count,
     })
+}
+
+/// Recover a single-shard (flat) database. Thin wrapper around
+/// [`recover_shard`] with `shard_bits == 0` (stride 1, identity id encoding).
+/// Kept for source compatibility with callers that predate per-shard recovery.
+pub fn recover(
+    data_dir: &Path,
+    segment_size: u64,
+    retention: RetentionPolicy,
+    encryption_key: Option<[u8; 32]>,
+) -> Result<RecoveryState, String> {
+    recover_shard(data_dir, 0, segment_size, retention, encryption_key)
 }
 
 /// Scan the last segment to detect torn writes and find the recovery point.
@@ -243,13 +271,18 @@ pub fn recover(
 /// - `last_hash`: the hash_n of the last valid record
 /// - `valid_offset`: the file offset just past the last valid record/frame
 /// - `warnings`: any warnings generated
+/// - `count`: number of valid records recovered (0 ⇒ empty active segment)
+///
+/// `shard_bits` sets the id stride: within a shard, consecutive record ids
+/// differ by `1 << shard_bits`. For `shards == 1`, `shard_bits == 0` → stride 1.
 fn scan_last_segment(
     path: &Path,
     segment_id: u32,
     header: &SegmentHeader,
     hash_enabled: bool,
     encryption_key: Option<[u8; 32]>,
-) -> Result<(u64, [u8; 32], u64, Vec<RecoveryWarning>), String> {
+    shard_bits: u32,
+) -> Result<(u64, [u8; 32], u64, Vec<RecoveryWarning>, u64), String> {
     let mut file = OpenOptions::new().write(true).read(true).open(path)
         .map_err(|e| format!("open {:?}: {}", path, e))?;
     let file_size = file
@@ -266,6 +299,13 @@ fn scan_last_segment(
     let mut last_hash = [0u8; 32];
     let mut warnings = Vec::new();
     let mut expected_record_id = header.base_sequence;
+
+    // Within a shard, consecutive record ids differ by `1 << shard_bits`: the
+    // shard id occupies the low `shard_bits` bits (constant per shard), so a
+    // local-sequence increment of 1 raises the global id by exactly this stride.
+    // shards=1 ⇒ shard_bits=0 ⇒ stride 1 (identical to the legacy scan).
+    let stride: u64 = 1u64 << shard_bits;
+    let mut count: u64 = 0;
 
     // Hash-chain verification (P0-4): recompute BLAKE3 keyed chain over each
     // record and compare to the stored hash_n. A mismatch means tampering or
@@ -341,6 +381,7 @@ fn scan_last_segment(
                         }
                         last_sequence = record.id.sequence;
                         last_hash = record.hash_n;
+                        count += 1;
                         #[cfg(feature = "hash-chain")]
                         if hash_enabled {
                             let expected = crate::pipeline::sealer::blake3_keyed_chain(
@@ -356,7 +397,7 @@ fn scan_last_segment(
                             }
                             chain_prev = record.hash_n;
                         }
-                        expected_record_id = record.id.sequence + 1;
+                        expected_record_id = record.id.sequence + stride;
                         doff += total;
                     }
                     Err(_) => { frame_ok = false; break; }
@@ -398,6 +439,7 @@ fn scan_last_segment(
                     }
                     last_sequence = record.id.sequence;
                     last_hash = record.hash_n;
+                    count += 1;
                     #[cfg(feature = "hash-chain")]
                     if hash_enabled {
                         let expected = crate::pipeline::sealer::blake3_keyed_chain(
@@ -436,7 +478,7 @@ fn scan_last_segment(
         }
     }
 
-    Ok((last_sequence, last_hash, last_valid_offset, warnings))
+    Ok((last_sequence, last_hash, last_valid_offset, warnings, count))
 }
 
 /// List segment files in a directory, returning (segment_id, path) pairs.
@@ -502,5 +544,6 @@ mod tests {
         assert_eq!(state.active_segment_id, 1);
         assert!(!state.hash_enabled);
         assert!(state.warnings.is_empty());
+        assert_eq!(state.recovered_count, 10);
     }
 }

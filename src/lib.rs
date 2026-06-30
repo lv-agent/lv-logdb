@@ -767,6 +767,7 @@ impl Drop for LogDb {
 mod tests {
     use super::*;
     use config::DurabilityMode;
+    use std::sync::Arc;
 
     #[test]
     fn open_and_append_and_read() {
@@ -1037,5 +1038,148 @@ mod tests {
         db.flush().unwrap();
         let rec = db.read(id).unwrap().expect("visible after flush");
         assert_eq!(rec.content, b"not-yet-durable");
+    }
+
+    // ── cr-003 Phase 3: cross-shard + cross-segment scan ─────────────────
+
+    #[test]
+    fn scan_under_sharding_is_complete_and_ordered() {
+        // Multi-thread appends spread across shards (thread-affine routing).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        let db = Arc::new(db);
+        let mut handles = Vec::new();
+        let mut all_ids = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                for i in 0..10u64 {
+                    ids.push(db.append(format!("t{}-{}", t, i).as_bytes()).unwrap());
+                }
+                ids
+            }));
+        }
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+
+        // Every appended record must be visible; ids strictly ascending.
+        let scanned: Vec<u64> = db
+            .scan(0, u64::MAX).unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(scanned.len(), all_ids.len(), "scan must see every record across shards");
+        assert!(all_ids.iter().all(|id| scanned.contains(id)), "scan missing some ids");
+        assert!(scanned.windows(2).all(|w| w[0] < w[1]), "scan must be strictly ascending");
+    }
+
+    #[test]
+    fn scan_under_sharding_respects_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.ring_size = 128;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let mut all_ids = Vec::new();
+        let mut handles = Vec::new();
+        for t in 0..2u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                (0..12u64).map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap()).collect::<Vec<_>>()
+            }));
+        }
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+
+        all_ids.sort();
+        let from = all_ids[5];
+        let to = all_ids[15];
+        let got: Vec<u64> = db.scan(from, to).unwrap()
+            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
+        let want: Vec<u64> = all_ids.iter().copied().filter(|&id| id >= from && id < to).collect();
+        assert_eq!(got, want, "scan([from,to)) must clip to the global-id range");
+    }
+
+    #[test]
+    fn scan_crosses_segment_boundary_single_shard() {
+        // Force a segment roll: tiny segment_size, write >1 segment of data.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 1;
+        config.segment_size = 1 * 1024 * 1024; // 1MB minimum
+        config.ring_size = 8192;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(10);
+        let db = LogDb::open(config).unwrap();
+
+        let payload = vec![0xA5u8; 64 * 1024]; // 64KB each -> ~17 records fill >1MB
+        let n = 20u64;
+        for _ in 0..n {
+            db.append(&payload).unwrap();
+        }
+        db.flush().unwrap();
+
+        // More than one segment file must exist (the roll happened).
+        let segs = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().map_or(false, |n| n.ends_with(".log")))
+            .count();
+        assert!(segs >= 2, "expected a segment roll, found {} segment files", segs);
+
+        // scan must return ALL records across both segments, ascending.
+        let scanned: Vec<u64> = db.scan(0, u64::MAX).unwrap()
+            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
+        assert_eq!(scanned.len(), n as usize, "scan must cross the segment boundary");
+        assert!(scanned.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!((0..n).collect::<Vec<_>>(), scanned);
+    }
+
+    #[test]
+    fn replay_from_under_sharding_returns_tail_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let mut all_ids = Vec::new();
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                (0..8u64).map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap()).collect::<Vec<_>>()
+            }));
+        }
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+
+        all_ids.sort();
+        let pivot = all_ids[10];
+        let tail: Vec<u64> = db.replay_from(pivot).unwrap()
+            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
+        let want: Vec<u64> = all_ids.iter().copied().filter(|&id| id >= pivot).collect();
+        assert_eq!(tail, want, "replay_from must return the ordered tail across shards");
     }
 }

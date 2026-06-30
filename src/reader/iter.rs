@@ -75,9 +75,8 @@ impl RecordIter {
         is_encrypted: bool,
         key: Option<[u8; 32]>,
     ) -> Result<Self, ReadError> {
-        let file = File::open(&segment_path).map_err(|e| {
-            ReadError::Io(format!("open {:?}: {}", segment_path, e))
-        })?;
+        let file = File::open(&segment_path)
+            .map_err(|e| ReadError::Io(format!("open {:?}: {}", segment_path, e)))?;
 
         Ok(Self {
             offset: start_offset,
@@ -118,9 +117,7 @@ impl RecordIter {
         let (cl, dl) = read_frame_header(&fh);
         let cl = cl as usize;
         let dl = dl as usize;
-        if cl == 0
-            || dl == 0
-            || self.offset + FRAME_HEADER_SIZE as u64 + cl as u64 > self.file_size
+        if cl == 0 || dl == 0 || self.offset + FRAME_HEADER_SIZE as u64 + cl as u64 > self.file_size
         {
             return false;
         }

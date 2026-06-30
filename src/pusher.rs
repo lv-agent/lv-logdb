@@ -14,15 +14,15 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::record::Record;
-use crate::ring::Ring;
 use crate::pipeline::signal::ShutdownState;
 use crate::reader::Reader;
+use crate::record::Record;
+use crate::ring::Ring;
 
 // ── RemoteSink trait ───────────────────────────────────────────────────────
 
@@ -71,8 +71,7 @@ fn load_progress(dir: &Path) -> Option<u64> {
         return None;
     }
     let seq = u64::from_le_bytes([
-        data[0], data[1], data[2], data[3],
-        data[4], data[5], data[6], data[7],
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
     ]);
     let stored_crc = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
     let computed_crc = crc32c::crc32c(&data[..8]);
@@ -227,12 +226,14 @@ pub fn run_pusher(
 
 /// Read a batch of records from segment files in [from, to) range.
 fn read_batch(dir: &Path, from: u64, to: u64) -> Result<Vec<Record>, String> {
-    let manifest = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::reader::SegmentManifest::new(dir.to_path_buf()),
-    ));
+    let manifest = std::sync::Arc::new(std::sync::Mutex::new(crate::reader::SegmentManifest::new(
+        dir.to_path_buf(),
+    )));
     let reader = Reader::new(manifest, None);
     let mut records = Vec::with_capacity((to - from) as usize);
-    let iter = reader.scan(from, to).map_err(|e| format!("scan: {:?}", e))?;
+    let iter = reader
+        .scan(from, to)
+        .map_err(|e| format!("scan: {:?}", e))?;
     for result in iter {
         match result {
             Ok(r) => records.push(r),
@@ -266,10 +267,7 @@ impl PusherHandle {
             })
             .ok();
 
-        Self {
-            handle,
-            push_seq,
-        }
+        Self { handle, push_seq }
     }
 
     /// Join the pusher thread (during shutdown).
@@ -295,8 +293,8 @@ impl Drop for PusherHandle {
 mod tests {
     use super::*;
     use crate::config::{Config, DurabilityMode};
-    use crate::LogDb;
     use crate::record::Record;
+    use crate::LogDb;
     use std::sync::Mutex;
 
     struct TestSink {
@@ -304,8 +302,14 @@ mod tests {
     }
 
     impl TestSink {
-        fn new() -> Self { Self { received: Mutex::new(Vec::new()) } }
-        fn total(&self) -> usize { self.received.lock().unwrap().iter().map(|b| b.len()).sum() }
+        fn new() -> Self {
+            Self {
+                received: Mutex::new(Vec::new()),
+            }
+        }
+        fn total(&self) -> usize {
+            self.received.lock().unwrap().iter().map(|b| b.len()).sum()
+        }
     }
 
     impl RemoteSink for TestSink {

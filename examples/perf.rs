@@ -30,7 +30,13 @@ fn main() {
 
     println!("=== logdb v1.0 Performance Baseline ===");
     let env = detect_env();
-    println!("Environment: {}, ring={}, iterations={} ({}x ring)", env, ring_size, iter_count, iter_count / ring_size);
+    println!(
+        "Environment: {}, ring={}, iterations={} ({}x ring)",
+        env,
+        ring_size,
+        iter_count,
+        iter_count / ring_size
+    );
     println!("Durability: Async (no fsync during append), Policy: Block\n");
 
     println!("═══ Scenario A: Full Pipeline (Committer active) ═══\n");
@@ -90,32 +96,39 @@ fn main() {
     println!("(Explains non-monotonic throughput across payload sizes)");
     println!("Trigger: 256KB | 1024 records | 10ms interval\n");
 
-    println!("{:<10} {:>10} {:>12} {:>12} {:>14}",
-        "payload", "rec/batch", "bytes/batch", "batches/262K", "pwrite calls");
+    println!(
+        "{:<10} {:>10} {:>12} {:>12} {:>14}",
+        "payload", "rec/batch", "bytes/batch", "batches/262K", "pwrite calls"
+    );
     for &(label, size, est_rec_per_batch) in &[
-        ("0B",   0,   1024u64),  // record-count trigger (60B/rec → 60KB)
-        ("64B",  64,  1024),     // record-count trigger (124B/rec → 124KB)
-        ("128B", 128, 1024),     // record-count trigger (188B/rec → 188KB)
-        ("256B", 256, 829),      // byte trigger: 256KB / (60+256+4+4) ≈ 810
-        ("300B", 300, 710),      // byte trigger: 256KB / (60+300+4+4) ≈ 710
-        ("512B", 512, 446),      // byte trigger: 256KB / (60+512+4+4) ≈ 446
-        ("1KB",  1024,260),      // byte trigger: 256KB / (60+1024+4+4) ≈ 260
-        ("4KB",  4096,63),       // byte trigger: 256KB / (60+4096+4+4) ≈ 63
+        ("0B", 0, 1024u64),  // record-count trigger (60B/rec → 60KB)
+        ("64B", 64, 1024),   // record-count trigger (124B/rec → 124KB)
+        ("128B", 128, 1024), // record-count trigger (188B/rec → 188KB)
+        ("256B", 256, 829),  // byte trigger: 256KB / (60+256+4+4) ≈ 810
+        ("300B", 300, 710),  // byte trigger: 256KB / (60+300+4+4) ≈ 710
+        ("512B", 512, 446),  // byte trigger: 256KB / (60+512+4+4) ≈ 446
+        ("1KB", 1024, 260),  // byte trigger: 256KB / (60+1024+4+4) ≈ 260
+        ("4KB", 4096, 63),   // byte trigger: 256KB / (60+4096+4+4) ≈ 63
     ] {
         let batches = 262144u64 / est_rec_per_batch;
         let bytes_per_batch = est_rec_per_batch * (60 + size as u64);
-        println!("{:<10} {:>10} {:>12} {:>12} {:>14}",
-            label, est_rec_per_batch,
+        println!(
+            "{:<10} {:>10} {:>12} {:>12} {:>14}",
+            label,
+            est_rec_per_batch,
             format!("{}KB", bytes_per_batch / 1024),
             batches,
-            batches);
+            batches
+        );
     }
     println!();
     println!("Interpretation:");
     println!("  - 128B triggers at 1024 recs (record-count), writes ~188KB per batch.");
 
     println!("  - 256B hit the bytes threshold at ~810 recs, writes exactly 256KB → optimal.");
-    println!("  - 300B+ all hit bytes threshold with decreasing recs/batch → more frequent pwrite.");
+    println!(
+        "  - 300B+ all hit bytes threshold with decreasing recs/batch → more frequent pwrite."
+    );
     println!("  - More frequent pwrite = more syscalls = lower throughput (all else equal).");
     println!("  - This explains 256B being the throughput peak and the non-monotonic curve.\n");
 
@@ -124,8 +137,14 @@ fn main() {
     let p = db.producer_cursor();
     let c = db.committed_cursor();
     let d = db.durable_cursor();
-    println!("producer={}, committed={}, durable={}, in_flight={}/{}",
-        p, c, d, p.saturating_sub(c), ring_size);
+    println!(
+        "producer={}, committed={}, durable={}, in_flight={}/{}",
+        p,
+        c,
+        d,
+        p.saturating_sub(c),
+        ring_size
+    );
     println!();
 
     // ═══════════════════════════════════════════════════════════════════
@@ -148,7 +167,12 @@ fn main() {
     for &(label, size) in &[("64B", 64), ("256B", 256), ("300B", 300)] {
         let path = if size <= 256 { "inline" } else { "spill" };
         let content = vec![0x42u8; size];
-        measure_ring_only(&db2, &content, &format!("append/{}/1t ({}, ring-only)", label, path), RING_ONLY_N);
+        measure_ring_only(
+            &db2,
+            &content,
+            &format!("append/{}/1t ({}, ring-only)", label, path),
+            RING_ONLY_N,
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -181,7 +205,9 @@ fn calibrate_clock() -> u64 {
     for _ in 0..100_000 {
         let now = Instant::now();
         let delta = now.duration_since(prev).as_nanos() as u64;
-        if delta > 0 && delta < min_delta { min_delta = delta; }
+        if delta > 0 && delta < min_delta {
+            min_delta = delta;
+        }
         prev = now;
     }
     min_delta
@@ -193,7 +219,9 @@ fn measure_full_pipeline(db: &LogDb, content: &[u8], label: &str, n: usize) {
     drain_ring(db);
 
     let warmup = n / 4;
-    for _ in 0..warmup { db.append(content).unwrap(); }
+    for _ in 0..warmup {
+        db.append(content).unwrap();
+    }
 
     let mut nanos = Vec::with_capacity(n);
     let mut ok_count: u64 = 0;
@@ -201,7 +229,10 @@ fn measure_full_pipeline(db: &LogDb, content: &[u8], label: &str, n: usize) {
     for _ in 0..n {
         let t0 = Instant::now();
         match db.append(content) {
-            Ok(_) => { nanos.push(t0.elapsed().as_nanos() as u64); ok_count += 1; }
+            Ok(_) => {
+                nanos.push(t0.elapsed().as_nanos() as u64);
+                ok_count += 1;
+            }
             Err(_) => {}
         }
     }
@@ -211,8 +242,13 @@ fn measure_full_pipeline(db: &LogDb, content: &[u8], label: &str, n: usize) {
     let len = nanos.len();
     let rec_per_sec = ok_count as f64 / elapsed.as_secs_f64();
     println!("{}:", label);
-    println!("  throughput: {:>10.0} rec/s  (ok={}/{}, {:.2}s)",
-        rec_per_sec, ok_count, n, elapsed.as_secs_f64());
+    println!(
+        "  throughput: {:>10.0} rec/s  (ok={}/{}, {:.2}s)",
+        rec_per_sec,
+        ok_count,
+        n,
+        elapsed.as_secs_f64()
+    );
     if len > 0 {
         println!("  p50:   {:>6} ns", nanos[len / 2]);
         println!("  p90:   {:>6} ns", nanos[len * 90 / 100]);
@@ -229,10 +265,17 @@ fn measure_full_pipeline(db: &LogDb, content: &[u8], label: &str, n: usize) {
 fn measure_ring_only(db: &LogDb, content: &[u8], label: &str, n: usize) {
     drain_ring(db);
     let rs = db.ring_size();
-    assert!(n < rs, "ring-only test must have n < ring_size ({}) to avoid back-pressure, got n={}", rs, n);
+    assert!(
+        n < rs,
+        "ring-only test must have n < ring_size ({}) to avoid back-pressure, got n={}",
+        rs,
+        n
+    );
 
     // Warmup
-    for _ in 0..n / 10 { db.append(content).unwrap(); }
+    for _ in 0..n / 10 {
+        db.append(content).unwrap();
+    }
     drain_ring(db);
 
     let mut nanos = Vec::with_capacity(n);
@@ -241,7 +284,10 @@ fn measure_ring_only(db: &LogDb, content: &[u8], label: &str, n: usize) {
     for _ in 0..n {
         let t0 = Instant::now();
         match db.append(content) {
-            Ok(_) => { nanos.push(t0.elapsed().as_nanos() as u64); ok_count += 1; }
+            Ok(_) => {
+                nanos.push(t0.elapsed().as_nanos() as u64);
+                ok_count += 1;
+            }
             Err(_) => {}
         }
     }
@@ -251,8 +297,13 @@ fn measure_ring_only(db: &LogDb, content: &[u8], label: &str, n: usize) {
     let len = nanos.len();
     let rec_per_sec = ok_count as f64 / elapsed.as_secs_f64();
     println!("{}:", label);
-    println!("  throughput: {:>10.0} rec/s  (ok={}/{}, {:.3}s)",
-        rec_per_sec, ok_count, n, elapsed.as_secs_f64());
+    println!(
+        "  throughput: {:>10.0} rec/s  (ok={}/{}, {:.3}s)",
+        rec_per_sec,
+        ok_count,
+        n,
+        elapsed.as_secs_f64()
+    );
     if len > 0 {
         println!("  p50:   {:>6} ns", nanos[len / 2]);
         println!("  p90:   {:>6} ns", nanos[len * 90 / 100]);
@@ -267,7 +318,9 @@ fn measure_ring_only(db: &LogDb, content: &[u8], label: &str, n: usize) {
 // ── Multi-thread ───────────────────────────────────────────────────────────
 
 fn bench_multi_thread(db: &LogDb, content: &[u8], num_threads: usize, per_thread: usize) {
-    for _ in 0..1000 { db.append(content).unwrap(); }
+    for _ in 0..1000 {
+        db.append(content).unwrap();
+    }
     drain_ring(db);
 
     let ok_count = Arc::new(AtomicU64::new(0));
@@ -282,7 +335,9 @@ fn bench_multi_thread(db: &LogDb, content: &[u8], num_threads: usize, per_thread
             s.spawn(move || {
                 b.wait();
                 for _ in 0..per_thread {
-                    if db.append(&c).is_ok() { ok.fetch_add(1, Ordering::Relaxed); }
+                    if db.append(&c).is_ok() {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             });
         }
@@ -292,8 +347,14 @@ fn bench_multi_thread(db: &LogDb, content: &[u8], num_threads: usize, per_thread
     let total_ok = ok_count.load(Ordering::Relaxed);
     let total = (per_thread * num_threads) as u64;
     let rec_per_sec = total_ok as f64 / elapsed.as_secs_f64();
-    println!("  {}t: {:>10.0} rec/s  (ok={}/{}, {:.2}s)",
-        num_threads, rec_per_sec, total_ok, total, elapsed.as_secs_f64());
+    println!(
+        "  {}t: {:>10.0} rec/s  (ok={}/{}, {:.2}s)",
+        num_threads,
+        rec_per_sec,
+        total_ok,
+        total,
+        elapsed.as_secs_f64()
+    );
 }
 
 // ── Durable latency (T5) ──────────────────────────────────────────────────
@@ -311,7 +372,9 @@ fn bench_durable_latency_batch(interval_ms: u64) {
     let n = 2000;
 
     // Warmup
-    for _ in 0..500 { db.append(&content).unwrap(); }
+    for _ in 0..500 {
+        db.append(&content).unwrap();
+    }
     db.flush().ok();
     std::thread::sleep(Duration::from_millis(200));
 
@@ -320,8 +383,12 @@ fn bench_durable_latency_batch(interval_ms: u64) {
         let t0 = Instant::now();
         let id = db.append(&content).unwrap();
         loop {
-            if db.durable_cursor() > id { break; }
-            if t0.elapsed() > Duration::from_secs(5) { break; }
+            if db.durable_cursor() > id {
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(5) {
+                break;
+            }
             std::hint::spin_loop();
         }
         durable_lats.push(t0.elapsed());
@@ -334,7 +401,10 @@ fn bench_durable_latency_batch(interval_ms: u64) {
     println!("    p50:   {:>6} μs", nanos[len / 2] / 1000);
     println!("    p90:   {:>6} μs", nanos[len * 90 / 100] / 1000);
     println!("    p99:   {:>6} μs", nanos[len * 99 / 100] / 1000);
-    println!("    p99.9: {:>6} μs", nanos[len.saturating_mul(999) / 1000] / 1000);
+    println!(
+        "    p99.9: {:>6} μs",
+        nanos[len.saturating_mul(999) / 1000] / 1000
+    );
     println!("    max:   {:>6} μs", nanos.last().unwrap_or(&0) / 1000);
 }
 
@@ -358,7 +428,9 @@ fn bench_segment_roll_latency() {
     let n = 200_000;
 
     // Warmup
-    for _ in 0..2000 { db.append(&content).unwrap(); }
+    for _ in 0..2000 {
+        db.append(&content).unwrap();
+    }
     drain_ring(&db);
 
     let prev_committed = db.committed_cursor();
@@ -385,39 +457,68 @@ fn bench_segment_roll_latency() {
     let estimated_rolls = total_committed / 6600;
 
     // Classify spikes: roll-related if committed_cursor didn't advance between consecutive spikes
-    let roll_spikes: Vec<u64> = spike_data.windows(2)
+    let roll_spikes: Vec<u64> = spike_data
+        .windows(2)
         .filter(|w| w[0].1 == w[1].1) // committed frozen → likely roll
         .map(|w| w[0].0.as_micros() as u64)
         .collect();
-    let io_spikes: Vec<u64> = spike_data.windows(2)
+    let io_spikes: Vec<u64> = spike_data
+        .windows(2)
         .filter(|w| w[0].1 != w[1].1) // committed advancing → I/O contention
         .map(|w| w[0].0.as_micros() as u64)
         .collect();
 
     println!("segment_size=4MB, Async mode, 512B records");
-    println!("  total: {} records in {:.2}s ({} rec/s)",
-        n, total_elapsed.as_secs_f64(), (n as f64 / total_elapsed.as_secs_f64()) as u64);
-    println!("  committed: {} records (~{} rolls expected)",
-        total_committed, estimated_rolls);
-    println!("  total spikes >500μs: {} (roll-freeze: {}, I/O contention: {})",
-        spike_data.len(), roll_spikes.len(), io_spikes.len());
+    println!(
+        "  total: {} records in {:.2}s ({} rec/s)",
+        n,
+        total_elapsed.as_secs_f64(),
+        (n as f64 / total_elapsed.as_secs_f64()) as u64
+    );
+    println!(
+        "  committed: {} records (~{} rolls expected)",
+        total_committed, estimated_rolls
+    );
+    println!(
+        "  total spikes >500μs: {} (roll-freeze: {}, I/O contention: {})",
+        spike_data.len(),
+        roll_spikes.len(),
+        io_spikes.len()
+    );
 
     if !roll_spikes.is_empty() {
-        let mut us = roll_spikes.clone(); us.sort_unstable();
-        println!("  ROLL spikes (committed frozen, p50/p90/max): {} / {} / {} μs",
-            us[us.len()/2], us[us.len()*90/100], us.last().unwrap_or(&0));
+        let mut us = roll_spikes.clone();
+        us.sort_unstable();
+        println!(
+            "  ROLL spikes (committed frozen, p50/p90/max): {} / {} / {} μs",
+            us[us.len() / 2],
+            us[us.len() * 90 / 100],
+            us.last().unwrap_or(&0)
+        );
     }
     if !io_spikes.is_empty() {
-        let mut us = io_spikes.clone(); us.sort_unstable();
-        println!("  I/O spikes (committed advancing, p50/p90/max): {} / {} / {} μs",
-            us[us.len()/2], us[us.len()*90/100], us.last().unwrap_or(&0));
+        let mut us = io_spikes.clone();
+        us.sort_unstable();
+        println!(
+            "  I/O spikes (committed advancing, p50/p90/max): {} / {} / {} μs",
+            us[us.len() / 2],
+            us[us.len() * 90 / 100],
+            us.last().unwrap_or(&0)
+        );
     }
 
     // Baseline: measure raw append latency without Committer running
     // (all appends happen while ring is not full → Committer not the bottleneck)
     let baseline_p50 = if !spike_data.is_empty() {
-        spike_data.iter().map(|(d,_)| d.as_nanos() as u64).min().unwrap_or(0) / 1000
-    } else { 0 };
+        spike_data
+            .iter()
+            .map(|(d, _)| d.as_nanos() as u64)
+            .min()
+            .unwrap_or(0)
+            / 1000
+    } else {
+        0
+    };
 
     println!();
     println!("  D1-async: fdatasync(new+old) removed from Committer hot path.");
@@ -447,10 +548,18 @@ fn detect_env() -> &'static str {
                 // Try to identify the hypervisor
                 if let Ok(v) = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
                     let v = v.trim().to_lowercase();
-                    if v.contains("qemu") || v.contains("kvm") { return "KVM VM"; }
-                    if v.contains("vmware") { return "VMware VM"; }
-                    if v.contains("virtualbox") { return "VirtualBox VM"; }
-                    if v.contains("microsoft") { return "Hyper-V VM"; }
+                    if v.contains("qemu") || v.contains("kvm") {
+                        return "KVM VM";
+                    }
+                    if v.contains("vmware") {
+                        return "VMware VM";
+                    }
+                    if v.contains("virtualbox") {
+                        return "VirtualBox VM";
+                    }
+                    if v.contains("microsoft") {
+                        return "Hyper-V VM";
+                    }
                 }
                 return "VM";
             }
@@ -458,9 +567,15 @@ fn detect_env() -> &'static str {
         // 4. Check DMI product_name as fallback
         if let Ok(p) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
             let p = p.trim().to_lowercase();
-            if p.contains("kvm") || p.contains("qemu") { return "KVM VM"; }
-            if p.contains("vmware") { return "VMware VM"; }
-            if p.contains("virtualbox") { return "VirtualBox VM"; }
+            if p.contains("kvm") || p.contains("qemu") {
+                return "KVM VM";
+            }
+            if p.contains("vmware") {
+                return "VMware VM";
+            }
+            if p.contains("virtualbox") {
+                return "VirtualBox VM";
+            }
         }
         "Linux (bare metal)"
     } else if cfg!(target_os = "macos") {
@@ -474,9 +589,15 @@ fn drain_ring(db: &LogDb) {
     let target = db.producer_cursor();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if db.committed_cursor() >= target { break; }
+        if db.committed_cursor() >= target {
+            break;
+        }
         if Instant::now() > deadline {
-            eprintln!("  (drain timeout: committed={}, target={})", db.committed_cursor(), target);
+            eprintln!(
+                "  (drain timeout: committed={}, target={})",
+                db.committed_cursor(),
+                target
+            );
             break;
         }
         std::hint::spin_loop();

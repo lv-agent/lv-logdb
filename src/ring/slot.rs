@@ -303,7 +303,9 @@ mod tests {
 
         // First write: spill
         let large = vec![0xBBu8; 300];
-        unsafe { slot.producer_write(1, 100, &large); }
+        unsafe {
+            slot.producer_write(1, 100, &large);
+        }
         slot.publish(1);
         unsafe {
             let view = slot.read();
@@ -312,7 +314,9 @@ mod tests {
 
         // Second write: inline (reuses the same slot, frees the old Box)
         let small = b"small";
-        unsafe { slot.producer_write(2, 200, small); }
+        unsafe {
+            slot.producer_write(2, 200, small);
+        }
         slot.publish(2);
         unsafe {
             let view = slot.read();

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  build-test:
+    name: build + test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # '' = default features. The lib gates several scan/recovery tests
+        # behind individual features, so each is exercised on its own, plus the
+        # full combination.
+        features:
+          - ''
+          - '--all-features'
+          - '--features compression'
+          - '--features encryption'
+          - '--features hash-chain'
+          - '--features remote-push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build ${{ matrix.features }}
+      - run: cargo test ${{ matrix.features }}
+
+  clippy:
+    name: clippy (warnings noted, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Run without -D warnings: surface lints without failing the pipeline.
+      - run: cargo clippy --all-features

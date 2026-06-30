@@ -76,7 +76,11 @@ pub const ENCRYPTION_NONCE_SIZE: usize = 12;
 /// Per-frame header size: compressed_len(u32 LE) + decompressed_len(u32 LE).
 pub const FRAME_HEADER_SIZE: usize = 8;
 
-pub fn write_frame_header(buf: &mut [u8; FRAME_HEADER_SIZE], compressed_len: u32, decompressed_len: u32) {
+pub fn write_frame_header(
+    buf: &mut [u8; FRAME_HEADER_SIZE],
+    compressed_len: u32,
+    decompressed_len: u32,
+) {
     buf[0..4].copy_from_slice(&compressed_len.to_le_bytes());
     buf[4..8].copy_from_slice(&decompressed_len.to_le_bytes());
 }
@@ -139,7 +143,10 @@ impl SegmentHeader {
     pub fn deserialize(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self, String> {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != MAGIC {
-            return Err(format!("bad magic: 0x{:08X}, expected 0x{:08X}", magic, MAGIC));
+            return Err(format!(
+                "bad magic: 0x{:08X}, expected 0x{:08X}",
+                magic, MAGIC
+            ));
         }
 
         let stored_crc = u32::from_le_bytes([buf[72], buf[73], buf[74], buf[75]]);
@@ -159,8 +166,7 @@ impl SegmentHeader {
         hash_init.copy_from_slice(&buf[8..40]);
 
         let base_sequence = u64::from_le_bytes([
-            buf[40], buf[41], buf[42], buf[43],
-            buf[44], buf[45], buf[46], buf[47],
+            buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
         ]);
 
         let partition_id = u32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]);
@@ -168,13 +174,11 @@ impl SegmentHeader {
         let segment_id = u32::from_le_bytes([buf[52], buf[53], buf[54], buf[55]]);
 
         let min_timestamp_ns = u64::from_le_bytes([
-            buf[56], buf[57], buf[58], buf[59],
-            buf[60], buf[61], buf[62], buf[63],
+            buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63],
         ]);
 
         let max_timestamp_ns = u64::from_le_bytes([
-            buf[64], buf[65], buf[66], buf[67],
-            buf[68], buf[69], buf[70], buf[71],
+            buf[64], buf[65], buf[66], buf[67], buf[68], buf[69], buf[70], buf[71],
         ]);
 
         let mut prev_last_hash = [0u8; 32];
@@ -306,17 +310,19 @@ pub fn deserialize_record(buf: &[u8]) -> Result<(Record, usize), String> {
         return Err(format!("record len too small: {}", total));
     }
     if total > buf.len() {
-        return Err(format!("record len {} exceeds buffer size {}", total, buf.len()));
+        return Err(format!(
+            "record len {} exceeds buffer size {}",
+            total,
+            buf.len()
+        ));
     }
 
     let sequence = u64::from_le_bytes([
-        buf[4], buf[5], buf[6], buf[7],
-        buf[8], buf[9], buf[10], buf[11],
+        buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
     ]);
 
     let timestamp_ns = u64::from_le_bytes([
-        buf[12], buf[13], buf[14], buf[15],
-        buf[16], buf[17], buf[18], buf[19],
+        buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
     ]);
 
     let content_len = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]) as usize;
@@ -339,7 +345,10 @@ pub fn deserialize_record(buf: &[u8]) -> Result<(Record, usize), String> {
 
     let crc_start = hash_end;
     let stored_crc = u32::from_le_bytes([
-        buf[crc_start], buf[crc_start + 1], buf[crc_start + 2], buf[crc_start + 3],
+        buf[crc_start],
+        buf[crc_start + 1],
+        buf[crc_start + 2],
+        buf[crc_start + 3],
     ]);
 
     let mut crc_buf = Vec::with_capacity(crc_start);
@@ -398,7 +407,8 @@ mod tests {
 
         // CRC bytes at 72..76 must differ
         assert_ne!(
-            &buf1[72..76], &buf2[72..76],
+            &buf1[72..76],
+            &buf2[72..76],
             "partition_id must be covered by header CRC"
         );
     }
@@ -415,8 +425,11 @@ mod tests {
         let mut buf2 = [0u8; SEGMENT_HEADER_SIZE];
         header.serialize(&mut buf2, [0u8; 32]);
 
-        assert_ne!(&buf1[72..76], &buf2[72..76],
-            "hash_algo must be covered by header CRC");
+        assert_ne!(
+            &buf1[72..76],
+            &buf2[72..76],
+            "hash_algo must be covered by header CRC"
+        );
     }
 
     #[test]
@@ -431,8 +444,11 @@ mod tests {
         let mut buf2 = [0u8; SEGMENT_HEADER_SIZE];
         header.serialize(&mut buf2, [0u8; 32]);
 
-        assert_ne!(&buf1[72..76], &buf2[72..76],
-            "base_sequence must be covered by header CRC");
+        assert_ne!(
+            &buf1[72..76],
+            &buf2[72..76],
+            "base_sequence must be covered by header CRC"
+        );
     }
 
     #[test]
@@ -497,7 +513,12 @@ mod tests {
 
     #[test]
     fn record_round_trip() {
-        let view = ReadView { record_id: 42, timestamp_ns: 1000, content: b"hello", hash_n: &[0u8; 32] };
+        let view = ReadView {
+            record_id: 42,
+            timestamp_ns: 1000,
+            content: b"hello",
+            hash_n: &[0u8; 32],
+        };
         let mut buf = vec![0u8; record_size(5)];
         serialize_record(&mut buf, 99, &view);
         let (record, consumed) = deserialize_record(&buf).unwrap();
@@ -509,7 +530,12 @@ mod tests {
 
     #[test]
     fn record_crc_detects_corruption() {
-        let view = ReadView { record_id: 1, timestamp_ns: 100, content: b"data", hash_n: &[0u8; 32] };
+        let view = ReadView {
+            record_id: 1,
+            timestamp_ns: 100,
+            content: b"data",
+            hash_n: &[0u8; 32],
+        };
         let mut buf = vec![0u8; record_size(4)];
         serialize_record(&mut buf, 1, &view);
         buf[24] ^= 0x01;

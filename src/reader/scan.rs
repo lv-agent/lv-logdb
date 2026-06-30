@@ -154,8 +154,7 @@ impl Iterator for MergeIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(Reverse((_, i))) = self.heap.pop() {
-            let r = self
-                .peeked[i]
+            let r = self.peeked[i]
                 .take()
                 .expect("heap entry must have a peeked record");
             self.refill(i);

@@ -13,8 +13,8 @@ use crate::config::DurabilityMode;
 use crate::health::{HealthState, HEALTH_DISK_FULL, HEALTH_IO_ERROR};
 use crate::platform;
 use crate::ring::Ring;
-use crate::storage::SegmentManager;
 use crate::storage::SegmentError;
+use crate::storage::SegmentManager;
 
 use super::signal::FlushSignal;
 use super::signal::ShutdownState;
@@ -42,7 +42,10 @@ pub fn run_committer(
     // Per-shard committed cursors (local sequences)
     let mut committed: Vec<u64> = rings
         .iter()
-        .map(|r| r.committed_cursor.load(std::sync::atomic::Ordering::Acquire))
+        .map(|r| {
+            r.committed_cursor
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
         .collect();
     let mut durable: Vec<u64> = rings
         .iter()
@@ -77,9 +80,7 @@ pub fn run_committer(
             && !need_commit_for_flush
             && !need_sync_for_flush;
         if fully_idle {
-            if shutdown.draining()
-                && min_durable(&durable) >= min_durable(&committed)
-            {
+            if shutdown.draining() && min_durable(&durable) >= min_durable(&committed) {
                 return;
             }
             pending_since = None;
@@ -109,9 +110,7 @@ pub fn run_committer(
         // If no shard has uncommitted records but we have unsynced data,
         // stay on the last shard for fsync
         if chosen_shard.is_none() && !has_any_unsynced {
-            if shutdown.draining()
-                && min_durable(&durable) >= min_durable(&committed)
-            {
+            if shutdown.draining() && min_durable(&durable) >= min_durable(&committed) {
                 return;
             }
             for m in seg_mgrs.iter_mut() {
@@ -156,13 +155,14 @@ pub fn run_committer(
                 }
                 Err(SegmentError::Full) => {
                     let next_base = crate::shard::encode_record_id(si, committed[si], shard_bits);
-                    match seg_mgrs[si].roll(next_base, checkpoint.load(std::sync::atomic::Ordering::Acquire)) {
+                    match seg_mgrs[si].roll(
+                        next_base,
+                        checkpoint.load(std::sync::atomic::Ordering::Acquire),
+                    ) {
                         Ok(()) => continue,
                         Err(e) => {
                             health.set_error(match &e {
-                                SegmentError::Io(io_err)
-                                    if platform::is_enospc(io_err) =>
-                                {
+                                SegmentError::Io(io_err) if platform::is_enospc(io_err) => {
                                     HEALTH_DISK_FULL
                                 }
                                 _ => HEALTH_IO_ERROR,
@@ -174,9 +174,7 @@ pub fn run_committer(
                 }
                 Err(e) => {
                     health.set_error(match &e {
-                        SegmentError::Io(io_err) if platform::is_enospc(io_err) => {
-                            HEALTH_DISK_FULL
-                        }
+                        SegmentError::Io(io_err) if platform::is_enospc(io_err) => HEALTH_DISK_FULL,
                         _ => HEALTH_IO_ERROR,
                     });
                     backoff.step();
@@ -239,10 +237,7 @@ pub fn run_committer(
             }
         }
 
-        if shutdown.draining()
-            && !has_any_uncommitted
-            && !has_any_unsynced
-        {
+        if shutdown.draining() && !has_any_uncommitted && !has_any_unsynced {
             return;
         }
 
@@ -262,8 +257,7 @@ fn available_hi(ring: &Ring, committed: u64) -> u64 {
         ring.sealed_cursor
             .load(std::sync::atomic::Ordering::Acquire)
     } else {
-        ring.highest_published_contiguous(committed)
-            .wrapping_add(1)
+        ring.highest_published_contiguous(committed).wrapping_add(1)
     }
 }
 
@@ -276,9 +270,9 @@ fn choose_batch_end(committed: u64, avail: u64, buf_capacity: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
     use crate::config::{QueueFullPolicy, RetentionPolicy};
     use crate::ring::Ring;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     #[test]
@@ -292,12 +286,16 @@ mod tests {
         // Publish records to both shards
         for i in 0..5 {
             let seq = ring0.claim(QueueFullPolicy::Block).unwrap();
-            unsafe { ring0.slot(seq).producer_write(seq, i * 100, b"shard0"); }
+            unsafe {
+                ring0.slot(seq).producer_write(seq, i * 100, b"shard0");
+            }
             ring0.slot(seq).publish(seq);
         }
         for i in 0..3 {
             let seq = ring1.claim(QueueFullPolicy::Block).unwrap();
-            unsafe { ring1.slot(seq).producer_write(seq, i * 100, b"shard1"); }
+            unsafe {
+                ring1.slot(seq).producer_write(seq, i * 100, b"shard1");
+            }
             ring1.slot(seq).publish(seq);
         }
 
@@ -305,7 +303,9 @@ mod tests {
         let seg_mgr0 = SegmentManager::create(
             dir.path().join("s0"),
             10 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -314,7 +314,9 @@ mod tests {
         let seg_mgr1 = SegmentManager::create(
             dir.path().join("s1"),
             10 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -337,7 +339,17 @@ mod tests {
         let s = Arc::clone(&shutdown);
 
         let handle = std::thread::spawn(move || {
-            run_committer(rings, seg_mgrs, 1, trigger, flush, s, health, Arc::new(std::sync::atomic::AtomicU64::new(0)), wait);
+            run_committer(
+                rings,
+                seg_mgrs,
+                1,
+                trigger,
+                flush,
+                s,
+                health,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                wait,
+            );
         });
 
         std::thread::sleep(Duration::from_millis(200));
@@ -359,14 +371,18 @@ mod tests {
 
         for i in 0..5 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-            unsafe { ring.slot(seq).producer_write(seq, i * 100, b"test"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, i * 100, b"test");
+            }
             ring.slot(seq).publish(seq);
         }
 
         let seg_mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             10 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -388,7 +404,17 @@ mod tests {
         let s = Arc::clone(&shutdown);
 
         let handle = std::thread::spawn(move || {
-            run_committer(rings, vec![seg_mgr], 0, trigger, flush, s, health, Arc::new(std::sync::atomic::AtomicU64::new(0)), wait);
+            run_committer(
+                rings,
+                vec![seg_mgr],
+                0,
+                trigger,
+                flush,
+                s,
+                health,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                wait,
+            );
         });
 
         std::thread::sleep(Duration::from_millis(200));

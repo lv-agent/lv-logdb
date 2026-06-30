@@ -81,7 +81,7 @@ pub struct CommitTrigger {
 impl Default for CommitTrigger {
     fn default() -> Self {
         Self {
-            bytes: 256 * 1024,       // 256KB
+            bytes: 256 * 1024, // 256KB
             records: 1024,
             interval: Duration::from_millis(10),
             durability: DurabilityMode::Batch,
@@ -111,7 +111,7 @@ pub struct Config {
     pub hash_enabled: bool,
     /// Enable streaming zstd compression (requires "compression" feature).
     pub compression_enabled: bool,
-    pub encryption_key: Option<[u8; 32]>,  // Requires "encryption" feature
+    pub encryption_key: Option<[u8; 32]>, // Requires "encryption" feature
 
     /// Durability mode. Default: Batch.
     pub durability_mode: DurabilityMode,
@@ -195,10 +195,7 @@ impl Config {
             ));
         }
         if self.shards < 1 || self.shards > 256 {
-            return Err(format!(
-                "shards must be in [1, 256], got {}",
-                self.shards
-            ));
+            return Err(format!("shards must be in [1, 256], got {}", self.shards));
         }
         if self.segment_size < 1 * 1024 * 1024 {
             return Err(format!(
@@ -274,7 +271,7 @@ mod tests {
         let mut c = Config::default();
         c.ring_size = 8192;
         c.max_content_size = 1 * 1024 * 1024; // 1MB
-        // No arena_size field exists — constraint is gone.
+                                              // No arena_size field exists — constraint is gone.
         c.validate().unwrap();
     }
 }

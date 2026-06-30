@@ -433,7 +433,9 @@ mod tests {
 
         // Publish seqs 0, 1, 2
         for seq in 0..3 {
-            unsafe { ring.slot(seq).producer_write(seq, 0, b"x"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, 0, b"x");
+            }
             ring.slot(seq).publish(seq);
         }
 
@@ -447,7 +449,9 @@ mod tests {
 
         // Publish 0, 1, but not 2
         for seq in 0..2 {
-            unsafe { ring.slot(seq).producer_write(seq, 0, b"x"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, 0, b"x");
+            }
             ring.slot(seq).publish(seq);
         }
 
@@ -461,7 +465,9 @@ mod tests {
 
         // Publish 0, 1, 2, 3
         for seq in 0..4 {
-            unsafe { ring.slot(seq).producer_write(seq, 0, b"x"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, 0, b"x");
+            }
             ring.slot(seq).publish(seq);
         }
 
@@ -522,7 +528,9 @@ mod tests {
 
         let content = b"integration test";
         let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-        unsafe { ring.slot(seq).producer_write(seq, 5000, content); }
+        unsafe {
+            ring.slot(seq).producer_write(seq, 5000, content);
+        }
         ring.slot(seq).publish(seq);
 
         assert!(ring.slot(seq).is_published(seq));

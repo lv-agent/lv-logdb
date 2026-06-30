@@ -17,7 +17,11 @@ fn main() {
     let data_dir: String = parse_arg_str(&args, "--data-dir", "/tmp/logdb-soak");
 
     println!("=== logdb Soak Test ===");
-    println!("duration: {}s ({:.1}h)", duration_secs, duration_secs as f64 / 3600.0);
+    println!(
+        "duration: {}s ({:.1}h)",
+        duration_secs,
+        duration_secs as f64 / 3600.0
+    );
     println!("data_dir: {}", data_dir);
     println!();
 
@@ -40,8 +44,10 @@ fn main() {
     let mut last_verify = start;
     let mut peak_rss: u64 = 0;
 
-    println!("{:>8} {:>12} {:>12} {:>12} {:>10}",
-        "time", "total_ops", "rate", "instant", "RSS_KB");
+    println!(
+        "{:>8} {:>12} {:>12} {:>12} {:>10}",
+        "time", "total_ops", "rate", "instant", "RSS_KB"
+    );
 
     loop {
         if Instant::now() >= deadline {
@@ -58,13 +64,17 @@ fn main() {
         if now.duration_since(last_report) >= Duration::from_secs(5) {
             let elapsed = now.duration_since(start).as_secs_f64();
             let rate = total_ops as f64 / elapsed;
-            let instant_rate = (total_ops - last_ops) as f64
-                / now.duration_since(last_report).as_secs_f64();
+            let instant_rate =
+                (total_ops - last_ops) as f64 / now.duration_since(last_report).as_secs_f64();
             let rss = get_rss_kb();
-            if rss > peak_rss { peak_rss = rss; }
+            if rss > peak_rss {
+                peak_rss = rss;
+            }
 
-            println!("{:>7.0}s {:>12} {:>11.0} r/s {:>11.0} r/s {:>8} KB",
-                elapsed, total_ops, rate, instant_rate, rss);
+            println!(
+                "{:>7.0}s {:>12} {:>11.0} r/s {:>11.0} r/s {:>8} KB",
+                elapsed, total_ops, rate, instant_rate, rss
+            );
 
             last_report = now;
             last_ops = total_ops;
@@ -84,7 +94,9 @@ fn main() {
                 match db.read(durable - 1) {
                     Ok(Some(rec)) => println!(
                         "OK (seq={}, len={}, durable={})",
-                        rec.id.sequence, rec.content.len(), durable
+                        rec.id.sequence,
+                        rec.content.len(),
+                        durable
                     ),
                     Ok(None) => eprintln!("FAIL: record {} not found!", durable - 1),
                     Err(e) => eprintln!("READ ERROR: {:?}", e),
@@ -109,18 +121,27 @@ fn main() {
     if final_durable > 100 {
         for seq in (final_durable - 100)..final_durable {
             match db.read(seq) {
-                Ok(Some(_)) => {},
-                _ => { verify_errors += 1; },
+                Ok(Some(_)) => {}
+                _ => {
+                    verify_errors += 1;
+                }
             }
         }
     }
 
     println!();
     println!("═══ Soak Test Complete ═══");
-    println!("  duration:       {:.0}s ({:.1}h)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / 3600.0);
+    println!(
+        "  duration:       {:.0}s ({:.1}h)",
+        elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() / 3600.0
+    );
     println!("  total ops:      {}", total_ops);
     println!("  durable:        {}", final_durable);
-    println!("  avg rate:       {:.0} rec/s", total_ops as f64 / elapsed.as_secs_f64());
+    println!(
+        "  avg rate:       {:.0} rec/s",
+        total_ops as f64 / elapsed.as_secs_f64()
+    );
     println!("  peak RSS:       {} KB", peak_rss);
     println!("  verify errors:  {}", verify_errors);
 
@@ -138,7 +159,12 @@ fn get_rss_kb() -> u64 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if line.starts_with("VmRSS:") {
-                return line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+                return line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
             }
         }
     }

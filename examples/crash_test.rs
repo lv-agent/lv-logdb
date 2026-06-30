@@ -25,7 +25,10 @@ fn main() {
     match mode.as_str() {
         "writer" => writer_mode(data_dir),
         "reader" => reader_mode(data_dir),
-        _ => { eprintln!("Unknown mode: {}", mode); std::process::exit(1); }
+        _ => {
+            eprintln!("Unknown mode: {}", mode);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -81,8 +84,12 @@ fn reader_mode(data_dir: &str) {
             Ok(Some(rec)) => {
                 let expected = format!("crash-test-record-{:06}", seq);
                 if rec.content != expected.as_bytes() {
-                    eprintln!("reader: CONTENT MISMATCH at seq={}: expected '{}', got '{:?}'",
-                        seq, expected, String::from_utf8_lossy(&rec.content));
+                    eprintln!(
+                        "reader: CONTENT MISMATCH at seq={}: expected '{}', got '{:?}'",
+                        seq,
+                        expected,
+                        String::from_utf8_lossy(&rec.content)
+                    );
                     errors += 1;
                 }
             }

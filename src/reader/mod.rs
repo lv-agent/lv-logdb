@@ -25,8 +25,8 @@ use std::time::SystemTime;
 use crate::error::ReadError;
 use crate::record::Record;
 use crate::storage::format::{
-    deserialize_record, SegmentHeader, MIN_RECORD_SIZE, SEGMENT_HEADER_SIZE,
-    FRAME_HEADER_SIZE, read_frame_header,
+    deserialize_record, read_frame_header, SegmentHeader, FRAME_HEADER_SIZE, MIN_RECORD_SIZE,
+    SEGMENT_HEADER_SIZE,
 };
 use crate::storage::index::SparseIndex;
 
@@ -47,13 +47,16 @@ fn decompress_frame(_compressed: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(feature = "encryption")]
 fn decrypt_frame_data(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, String> {
     let nonce_size = crate::storage::format::ENCRYPTION_NONCE_SIZE;
-    if encrypted.len() < nonce_size { return Err("too short".into()); }
-    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    if encrypted.len() < nonce_size {
+        return Err("too short".into());
+    }
     use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
     let key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(&encrypted[..nonce_size]);
-    cipher.decrypt(nonce, &encrypted[nonce_size..])
+    cipher
+        .decrypt(nonce, &encrypted[nonce_size..])
         .map_err(|_| "decryption failed".into())
 }
 
@@ -119,16 +122,18 @@ pub(crate) struct SegmentManifest {
 
 impl SegmentManifest {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir, entries: Vec::new(), dir_mtime: None }
+        Self {
+            data_dir,
+            entries: Vec::new(),
+            dir_mtime: None,
+        }
     }
 
     /// Re-scan the directory into `entries` iff its mtime changed (or on first
     /// call). On filesystems where mtime is unavailable, falls back to
     /// refreshing every call (correct, just slower).
     fn refresh_if_needed(&mut self) -> Result<(), ReadError> {
-        let mtime = fs::metadata(&self.data_dir)
-            .and_then(|m| m.modified())
-            .ok();
+        let mtime = fs::metadata(&self.data_dir).and_then(|m| m.modified()).ok();
         if mtime == self.dir_mtime && !self.entries.is_empty() {
             return Ok(());
         }
@@ -142,7 +147,12 @@ impl SegmentManifest {
                 if name.starts_with("segment-") && name.ends_with(".log") {
                     if let Ok(id) = name[8..name.len() - 4].parse::<u32>() {
                         if let Some((base_sequence, flags)) = read_header_for_manifest(&path) {
-                            entries.push(ManifestEntry { segment_id: id, path, base_sequence, flags });
+                            entries.push(ManifestEntry {
+                                segment_id: id,
+                                path,
+                                base_sequence,
+                                flags,
+                            });
                         }
                     }
                 }
@@ -161,7 +171,11 @@ impl SegmentManifest {
     pub(crate) fn find(&mut self, seq: u64) -> Result<Option<ManifestEntry>, ReadError> {
         self.refresh_if_needed()?;
         let idx = self.entries.partition_point(|e| e.base_sequence <= seq);
-        Ok(if idx == 0 { None } else { Some(self.entries[idx - 1].clone()) })
+        Ok(if idx == 0 {
+            None
+        } else {
+            Some(self.entries[idx - 1].clone())
+        })
     }
 
     /// All segment entries from the one containing `seq` onward, in ascending
@@ -249,8 +263,14 @@ pub struct Reader {
 
 impl Reader {
     /// Create a new reader sharing a segment manifest (cached dir listing).
-    pub(crate) fn new(manifest: Arc<Mutex<SegmentManifest>>, encryption_key: Option<[u8; 32]>) -> Self {
-        Self { manifest, encryption_key }
+    pub(crate) fn new(
+        manifest: Arc<Mutex<SegmentManifest>>,
+        encryption_key: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            manifest,
+            encryption_key,
+        }
     }
 
     /// Read a single record by its `record_id`.
@@ -290,8 +310,7 @@ impl Reader {
             }
         };
 
-        let mut file = File::open(&path)
-            .map_err(|e| ReadError::Io(format!("open: {}", e)))?;
+        let mut file = File::open(&path).map_err(|e| ReadError::Io(format!("open: {}", e)))?;
         let mut offset = start_offset;
 
         if is_compressed || is_encrypted {
@@ -300,14 +319,17 @@ impl Reader {
             // triggers the frame layout (P0-1: encrypted-only also frames).
             let key = self.encryption_key.as_ref();
             while offset < file_size {
-                if offset + FRAME_HEADER_SIZE as u64 > file_size { break; }
+                if offset + FRAME_HEADER_SIZE as u64 > file_size {
+                    break;
+                }
                 let mut fh_buf = [0u8; FRAME_HEADER_SIZE];
                 file.seek(std::io::SeekFrom::Start(offset))
                     .map_err(|e| ReadError::Io(format!("seek frame: {}", e)))?;
                 file.read_exact(&mut fh_buf)
                     .map_err(|e| ReadError::Io(format!("read frame hdr: {}", e)))?;
                 let (cl, dl) = read_frame_header(&fh_buf);
-                let cl = cl as usize; let dl = dl as usize;
+                let cl = cl as usize;
+                let dl = dl as usize;
                 if cl == 0 || dl == 0 || offset + FRAME_HEADER_SIZE as u64 + cl as u64 > file_size {
                     break;
                 }
@@ -320,15 +342,29 @@ impl Reader {
                 };
                 let mut doff = 0usize;
                 while doff + MIN_RECORD_SIZE <= dl && doff <= decoded.len() {
-                    let total = u32::from_le_bytes([decoded[doff], decoded[doff+1], decoded[doff+2], decoded[doff+3]]) as usize;
-                    if total < MIN_RECORD_SIZE || doff + total > dl || doff + total > decoded.len() { break; }
-                    match deserialize_record(&decoded[doff..doff+total]) {
+                    let total = u32::from_le_bytes([
+                        decoded[doff],
+                        decoded[doff + 1],
+                        decoded[doff + 2],
+                        decoded[doff + 3],
+                    ]) as usize;
+                    if total < MIN_RECORD_SIZE || doff + total > dl || doff + total > decoded.len()
+                    {
+                        break;
+                    }
+                    match deserialize_record(&decoded[doff..doff + total]) {
                         Ok((record, _)) => {
-                            if record.id.sequence == record_id { return Ok(Some(record)); }
-                            if record.id.sequence > record_id { break; }
+                            if record.id.sequence == record_id {
+                                return Ok(Some(record));
+                            }
+                            if record.id.sequence > record_id {
+                                break;
+                            }
                             doff += total;
                         }
-                        Err(_) => { doff += total; }
+                        Err(_) => {
+                            doff += total;
+                        }
                     }
                 }
                 offset += FRAME_HEADER_SIZE as u64 + cl as u64;
@@ -336,15 +372,22 @@ impl Reader {
         } else {
             // Uncompressed, unencrypted: record-by-record scan.
             while offset < file_size {
-                if offset + 4 > file_size { break; }
+                if offset + 4 > file_size {
+                    break;
+                }
                 let mut len_buf = [0u8; 4];
                 file.seek(std::io::SeekFrom::Start(offset))
                     .map_err(|e| ReadError::Io(format!("seek: {}", e)))?;
                 file.read_exact(&mut len_buf)
                     .map_err(|e| ReadError::Io(format!("read len: {}", e)))?;
                 let total = u32::from_le_bytes(len_buf) as usize;
-                if total < MIN_RECORD_SIZE { offset += 1; continue; }
-                if offset + total as u64 > file_size { break; }
+                if total < MIN_RECORD_SIZE {
+                    offset += 1;
+                    continue;
+                }
+                if offset + total as u64 > file_size {
+                    break;
+                }
                 let mut record_buf = vec![0u8; total];
                 file.seek(std::io::SeekFrom::Start(offset))
                     .map_err(|e| ReadError::Io(format!("seek: {}", e)))?;
@@ -352,11 +395,17 @@ impl Reader {
                     .map_err(|e| ReadError::Io(format!("read record: {}", e)))?;
                 match deserialize_record(&record_buf) {
                     Ok((record, _)) => {
-                        if record.id.sequence == record_id { return Ok(Some(record)); }
-                        if record.id.sequence > record_id { break; }
+                        if record.id.sequence == record_id {
+                            return Ok(Some(record));
+                        }
+                        if record.id.sequence > record_id {
+                            break;
+                        }
                         offset += total as u64;
                     }
-                    Err(_) => { offset += total as u64; }
+                    Err(_) => {
+                        offset += total as u64;
+                    }
                 }
             }
         }
@@ -392,7 +441,9 @@ mod tests {
         let mut mgr = crate::storage::SegmentManager::create(
             dir.path().to_path_buf(),
             10 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -403,14 +454,20 @@ mod tests {
         for i in 0..5 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
             let content = format!("record-{}", i);
-            unsafe { ring.slot(seq).producer_write(seq, i * 100, content.as_bytes()); }
+            unsafe {
+                ring.slot(seq)
+                    .producer_write(seq, i * 100, content.as_bytes());
+            }
             ring.slot(seq).publish(seq);
         }
         mgr.append_batch(&ring, 0, 4).unwrap();
         mgr.fdatasync().unwrap();
         drop(mgr);
 
-        let reader = Reader::new(Arc::new(Mutex::new(SegmentManifest::new(dir.path().to_path_buf()))), None);
+        let reader = Reader::new(
+            Arc::new(Mutex::new(SegmentManifest::new(dir.path().to_path_buf()))),
+            None,
+        );
         let record = reader.read(3).unwrap().unwrap();
         assert_eq!(record.id.sequence, 3);
         assert_eq!(record.content, b"record-3");
@@ -424,7 +481,9 @@ mod tests {
         let mut mgr = crate::storage::SegmentManager::create(
             dir.path().to_path_buf(),
             10 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -432,13 +491,18 @@ mod tests {
         .unwrap();
 
         let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-        unsafe { ring.slot(seq).producer_write(seq, 0, b"only-one"); }
+        unsafe {
+            ring.slot(seq).producer_write(seq, 0, b"only-one");
+        }
         ring.slot(seq).publish(seq);
         mgr.append_batch(&ring, 0, 0).unwrap();
         mgr.fdatasync().unwrap();
         drop(mgr);
 
-        let reader = Reader::new(Arc::new(Mutex::new(SegmentManifest::new(dir.path().to_path_buf()))), None);
+        let reader = Reader::new(
+            Arc::new(Mutex::new(SegmentManifest::new(dir.path().to_path_buf()))),
+            None,
+        );
         assert!(reader.read(999).unwrap().is_none());
     }
 }

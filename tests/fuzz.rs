@@ -8,11 +8,11 @@
 //! Run with: cargo test --test fuzz
 //! Run longer: PROPTEST_CASES=100000 cargo test --test fuzz -- --nocapture
 
-use std::time::Duration;
-use proptest::prelude::*;
 use logdb::config::{Config, DurabilityMode};
 use logdb::storage::format::{deserialize_record, SegmentHeader, SEGMENT_HEADER_SIZE};
 use logdb::LogDb;
+use proptest::prelude::*;
+use std::time::Duration;
 
 // ── Target 1: deserialize_record ───────────────────────────────────────────
 

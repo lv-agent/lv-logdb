@@ -27,10 +27,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::reader::{ScanIter, SegmentManifest};
 use crate::record::Record;
 use crate::ring::Ring;
-use crate::reader::{SegmentManifest, ScanIter};
-use crate::shard::{encode_record_id, decode_record_id};
+use crate::shard::{decode_record_id, encode_record_id};
 
 // ── Progress persistence ───────────────────────────────────────────────────
 //

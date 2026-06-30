@@ -10,19 +10,19 @@
 use std::time::Duration;
 
 use logdb::config::{Config, DurabilityMode, QueueFullPolicy, RetentionPolicy};
-use logdb::ring::Ring;
-use logdb::storage::SegmentManager;
-use logdb::health::{HealthState, HEALTH_OK, HEALTH_DISK_FULL, HEALTH_IO_ERROR};
+use logdb::health::{HealthState, HEALTH_DISK_FULL, HEALTH_IO_ERROR, HEALTH_OK};
 use logdb::pipeline::signal::{FlushSignal, ShutdownState};
-use logdb::pipeline::trigger::{CommitTrigger, WaitStrategy, Backoff};
+use logdb::pipeline::trigger::{Backoff, CommitTrigger, WaitStrategy};
+use logdb::record::{Record, RecordId};
+use logdb::ring::Ring;
 use logdb::shard::ShardMap;
-use logdb::record::{RecordId, Record};
 use logdb::storage::format::{
-    SegmentHeader, MAGIC, FORMAT_VERSION, SEGMENT_HEADER_SIZE, HEADER_CRC_END,
-    HASH_ALGO_SHA256, HASH_ALGO_BLAKE3, RECORD_FORMAT_V1, FLAG_NOT_FIRST, FLAG_HASH_ENABLED,
-    MIN_RECORD_SIZE, record_size, serialize_record, deserialize_record,
+    deserialize_record, record_size, serialize_record, SegmentHeader, FLAG_HASH_ENABLED,
+    FLAG_NOT_FIRST, FORMAT_VERSION, HASH_ALGO_BLAKE3, HASH_ALGO_SHA256, HEADER_CRC_END, MAGIC,
+    MIN_RECORD_SIZE, RECORD_FORMAT_V1, SEGMENT_HEADER_SIZE,
 };
-use logdb::storage::index::{SparseIndex, IndexEntry};
+use logdb::storage::index::{IndexEntry, SparseIndex};
+use logdb::storage::SegmentManager;
 use logdb::LogDb;
 
 macro_rules! check {
@@ -182,7 +182,9 @@ fn test_slot_inline_write_read() -> i32 {
     let ring = Ring::new(16, false, 0);
     let seq = ring.claim(QueueFullPolicy::Block).unwrap();
     let content = b"hello logdb";
-    unsafe { ring.slot(seq).producer_write(seq, 1000, content); }
+    unsafe {
+        ring.slot(seq).producer_write(seq, 1000, content);
+    }
     ring.slot(seq).publish(seq);
     check!(ring.slot(seq).is_published(seq), "published");
     unsafe {
@@ -197,7 +199,9 @@ fn test_slot_spill_write_read() -> i32 {
     let ring = Ring::new(16, false, 0);
     let seq = ring.claim(QueueFullPolicy::Block).unwrap();
     let content = vec![0xAAu8; 300];
-    unsafe { ring.slot(seq).producer_write(seq, 2000, &content); }
+    unsafe {
+        ring.slot(seq).producer_write(seq, 2000, &content);
+    }
     ring.slot(seq).publish(seq);
     unsafe {
         let view = ring.slot(seq).read();
@@ -210,18 +214,27 @@ fn test_slot_spill_write_read() -> i32 {
 fn test_slot_switch_spill_to_inline() -> i32 {
     let ring = Ring::new(16, false, 0);
     let seq0 = ring.claim(QueueFullPolicy::Block).unwrap();
-    unsafe { ring.slot(seq0).producer_write(seq0, 0, &vec![0xBBu8; 300]); }
+    unsafe {
+        ring.slot(seq0).producer_write(seq0, 0, &vec![0xBBu8; 300]);
+    }
     ring.slot(seq0).publish(seq0);
     let seq1 = ring.claim(QueueFullPolicy::Block).unwrap();
-    unsafe { ring.slot(seq1).producer_write(seq1, 0, b"small"); }
+    unsafe {
+        ring.slot(seq1).producer_write(seq1, 0, b"small");
+    }
     ring.slot(seq1).publish(seq1);
     unsafe {
-        check!(ring.slot(seq1).read().content == b"small", "switch to inline");
+        check!(
+            ring.slot(seq1).read().content == b"small",
+            "switch to inline"
+        );
     }
     0
 }
 
-fn test_slot_send_sync() -> i32 { 0 }
+fn test_slot_send_sync() -> i32 {
+    0
+}
 
 fn test_slot_release_acquire() -> i32 {
     use std::sync::Arc;
@@ -229,7 +242,9 @@ fn test_slot_release_acquire() -> i32 {
     let r = Arc::clone(&ring);
     let h = std::thread::spawn(move || {
         let seq = r.claim(QueueFullPolicy::Block).unwrap();
-        unsafe { r.slot(seq).producer_write(seq, 9999, b"concurrent"); }
+        unsafe {
+            r.slot(seq).producer_write(seq, 9999, b"concurrent");
+        }
         r.slot(seq).publish(seq);
     });
     h.join().unwrap();
@@ -241,9 +256,13 @@ fn test_slot_exact_inline_boundary() -> i32 {
     let ring = Ring::new(16, false, 0);
     let seq = ring.claim(QueueFullPolicy::Block).unwrap();
     let content = vec![0xCCu8; 256];
-    unsafe { ring.slot(seq).producer_write(seq, 0, &content); }
+    unsafe {
+        ring.slot(seq).producer_write(seq, 0, &content);
+    }
     ring.slot(seq).publish(seq);
-    unsafe { check!(ring.slot(seq).read().content.len() == 256, "exact boundary"); }
+    unsafe {
+        check!(ring.slot(seq).read().content.len() == 256, "exact boundary");
+    }
     0
 }
 
@@ -251,18 +270,26 @@ fn test_slot_just_above_inline() -> i32 {
     let ring = Ring::new(16, false, 0);
     let seq = ring.claim(QueueFullPolicy::Block).unwrap();
     let content = vec![0xDDu8; 257];
-    unsafe { ring.slot(seq).producer_write(seq, 0, &content); }
+    unsafe {
+        ring.slot(seq).producer_write(seq, 0, &content);
+    }
     ring.slot(seq).publish(seq);
-    unsafe { check!(ring.slot(seq).read().content.len() == 257, "just above"); }
+    unsafe {
+        check!(ring.slot(seq).read().content.len() == 257, "just above");
+    }
     0
 }
 
 fn test_slot_zero_length() -> i32 {
     let ring = Ring::new(16, false, 0);
     let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-    unsafe { ring.slot(seq).producer_write(seq, 0, b""); }
+    unsafe {
+        ring.slot(seq).producer_write(seq, 0, b"");
+    }
     ring.slot(seq).publish(seq);
-    unsafe { check!(ring.slot(seq).read().content.len() == 0, "zero length"); }
+    unsafe {
+        check!(ring.slot(seq).read().content.len() == 0, "zero length");
+    }
     0
 }
 
@@ -279,14 +306,22 @@ fn test_ring_claim_advances() -> i32 {
 
 fn test_ring_claim_queue_full_drop() -> i32 {
     let ring = Ring::new(16, false, 0);
-    for _ in 0..16 { ring.claim(QueueFullPolicy::Block).unwrap(); }
-    check!(ring.claim(QueueFullPolicy::Drop).is_err(), "queue full drop");
+    for _ in 0..16 {
+        ring.claim(QueueFullPolicy::Block).unwrap();
+    }
+    check!(
+        ring.claim(QueueFullPolicy::Drop).is_err(),
+        "queue full drop"
+    );
     0
 }
 
 fn test_ring_slot_index_wraps() -> i32 {
     let ring = Ring::new(16, false, 0);
-    check!(ring.slot(0) as *const _ == ring.slot(16) as *const _, "wrap");
+    check!(
+        ring.slot(0) as *const _ == ring.slot(16) as *const _,
+        "wrap"
+    );
     0
 }
 
@@ -311,16 +346,25 @@ fn test_ring_consume_watermark_with_hash() -> i32 {
 fn test_ring_full_write_read_cycle() -> i32 {
     let ring = Ring::new(16, false, 0);
     let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-    unsafe { ring.slot(seq).producer_write(seq, 5000, b"integration"); }
+    unsafe {
+        ring.slot(seq).producer_write(seq, 5000, b"integration");
+    }
     ring.slot(seq).publish(seq);
-    unsafe { check!(ring.slot(seq).read().content == b"integration", "full cycle"); }
+    unsafe {
+        check!(
+            ring.slot(seq).read().content == b"integration",
+            "full cycle"
+        );
+    }
     0
 }
 
 fn test_ring_claim_unblocks_after_consume() -> i32 {
     use std::sync::atomic::Ordering;
     let ring = std::sync::Arc::new(Ring::new(16, false, 0));
-    for _ in 0..16 { ring.claim(QueueFullPolicy::Block).unwrap(); }
+    for _ in 0..16 {
+        ring.claim(QueueFullPolicy::Block).unwrap();
+    }
     let r = std::sync::Arc::clone(&ring);
     let h = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
@@ -340,13 +384,21 @@ fn test_ring_multi_thread_no_duplicates() -> i32 {
         let r = std::sync::Arc::clone(&ring);
         handles.push(std::thread::spawn(move || {
             let mut v = vec![];
-            for _ in 0..50 { v.push(r.claim(QueueFullPolicy::Block).unwrap()); }
+            for _ in 0..50 {
+                v.push(r.claim(QueueFullPolicy::Block).unwrap());
+            }
             v
         }));
     }
     let mut all = HashSet::new();
-    for h in handles { for s in h.join().unwrap() { check!(all.insert(s), "duplicate"); } }
-    for i in 0..200u64 { check!(all.contains(&i), "missing seq"); }
+    for h in handles {
+        for s in h.join().unwrap() {
+            check!(all.insert(s), "duplicate");
+        }
+    }
+    for i in 0..200u64 {
+        check!(all.contains(&i), "missing seq");
+    }
     0
 }
 
@@ -369,9 +421,11 @@ fn test_header_round_trip() -> i32 {
 fn test_header_crc_covers_partition_id() -> i32 {
     let hi = [0xABu8; 32];
     let mut h = SegmentHeader::first_segment(hi, 0, 0, 1, false, HASH_ALGO_SHA256);
-    let mut b1 = [0u8; SEGMENT_HEADER_SIZE]; h.serialize(&mut b1, [0u8; 32]);
+    let mut b1 = [0u8; SEGMENT_HEADER_SIZE];
+    h.serialize(&mut b1, [0u8; 32]);
     h.partition_id = 99;
-    let mut b2 = [0u8; SEGMENT_HEADER_SIZE]; h.serialize(&mut b2, [0u8; 32]);
+    let mut b2 = [0u8; SEGMENT_HEADER_SIZE];
+    h.serialize(&mut b2, [0u8; 32]);
     check!(b1[72..76] != b2[72..76], "crc covers partition_id");
     0
 }
@@ -379,9 +433,11 @@ fn test_header_crc_covers_partition_id() -> i32 {
 fn test_header_crc_covers_hash_algo() -> i32 {
     let hi = [0xABu8; 32];
     let mut h = SegmentHeader::first_segment(hi, 0, 0, 1, false, HASH_ALGO_SHA256);
-    let mut b1 = [0u8; SEGMENT_HEADER_SIZE]; h.serialize(&mut b1, [0u8; 32]);
+    let mut b1 = [0u8; SEGMENT_HEADER_SIZE];
+    h.serialize(&mut b1, [0u8; 32]);
     h.hash_algo = HASH_ALGO_BLAKE3;
-    let mut b2 = [0u8; SEGMENT_HEADER_SIZE]; h.serialize(&mut b2, [0u8; 32]);
+    let mut b2 = [0u8; SEGMENT_HEADER_SIZE];
+    h.serialize(&mut b2, [0u8; 32]);
     check!(b1[72..76] != b2[72..76], "crc covers hash_algo");
     0
 }
@@ -389,9 +445,11 @@ fn test_header_crc_covers_hash_algo() -> i32 {
 fn test_header_crc_covers_base_sequence() -> i32 {
     let hi = [0xABu8; 32];
     let mut h = SegmentHeader::first_segment(hi, 0, 0, 1, false, HASH_ALGO_SHA256);
-    let mut b1 = [0u8; SEGMENT_HEADER_SIZE]; h.serialize(&mut b1, [0u8; 32]);
+    let mut b1 = [0u8; SEGMENT_HEADER_SIZE];
+    h.serialize(&mut b1, [0u8; 32]);
     h.base_sequence = 99999;
-    let mut b2 = [0u8; SEGMENT_HEADER_SIZE]; h.serialize(&mut b2, [0u8; 32]);
+    let mut b2 = [0u8; SEGMENT_HEADER_SIZE];
+    h.serialize(&mut b2, [0u8; 32]);
     check!(b1[72..76] != b2[72..76], "crc covers base_sequence");
     0
 }
@@ -414,7 +472,12 @@ fn test_header_bad_crc() -> i32 {
 }
 
 fn test_record_round_trip() -> i32 {
-    let view = logdb::record::ReadView { record_id: 42, timestamp_ns: 1000, content: b"hello", hash_n: &[0u8; 32] };
+    let view = logdb::record::ReadView {
+        record_id: 42,
+        timestamp_ns: 1000,
+        content: b"hello",
+        hash_n: &[0u8; 32],
+    };
     let mut buf = vec![0u8; record_size(5)];
     serialize_record(&mut buf, 99, &view);
     let (rec, n) = deserialize_record(&buf).unwrap();
@@ -425,7 +488,12 @@ fn test_record_round_trip() -> i32 {
 }
 
 fn test_record_crc_detects_corruption() -> i32 {
-    let view = logdb::record::ReadView { record_id: 1, timestamp_ns: 100, content: b"data", hash_n: &[0u8; 32] };
+    let view = logdb::record::ReadView {
+        record_id: 1,
+        timestamp_ns: 100,
+        content: b"data",
+        hash_n: &[0u8; 32],
+    };
     let mut buf = vec![0u8; record_size(4)];
     serialize_record(&mut buf, 1, &view);
     buf[24] ^= 0x01;
@@ -434,7 +502,12 @@ fn test_record_crc_detects_corruption() -> i32 {
 }
 
 fn test_record_empty_content() -> i32 {
-    let view = logdb::record::ReadView { record_id: 0, timestamp_ns: 0, content: b"", hash_n: &[0u8; 32] };
+    let view = logdb::record::ReadView {
+        record_id: 0,
+        timestamp_ns: 0,
+        content: b"",
+        hash_n: &[0u8; 32],
+    };
     let mut buf = vec![0u8; record_size(0)];
     serialize_record(&mut buf, 0, &view);
     let (rec, _) = deserialize_record(&buf).unwrap();
@@ -444,8 +517,18 @@ fn test_record_empty_content() -> i32 {
 
 fn test_record_two_back_to_back() -> i32 {
     let hash = [0u8; 32];
-    let v1 = logdb::record::ReadView { record_id: 0, timestamp_ns: 100, content: b"first", hash_n: &hash };
-    let v2 = logdb::record::ReadView { record_id: 1, timestamp_ns: 200, content: b"second", hash_n: &hash };
+    let v1 = logdb::record::ReadView {
+        record_id: 0,
+        timestamp_ns: 100,
+        content: b"first",
+        hash_n: &hash,
+    };
+    let v2 = logdb::record::ReadView {
+        record_id: 1,
+        timestamp_ns: 200,
+        content: b"second",
+        hash_n: &hash,
+    };
     let total = record_size(v1.content.len()) + record_size(v2.content.len());
     let mut buf = vec![0u8; total];
     let p1 = serialize_record(&mut buf, 0, &v1);
@@ -465,37 +548,89 @@ fn test_segment_create_and_append() -> i32 {
     for i in 0..10u64 {
         let seq = ring.claim(QueueFullPolicy::Block).unwrap();
         let content = format!("record-{}", i);
-        unsafe { ring.slot(seq).producer_write(seq, i * 100, content.as_bytes()); }
+        unsafe {
+            ring.slot(seq)
+                .producer_write(seq, i * 100, content.as_bytes());
+        }
         ring.slot(seq).publish(seq);
     }
-    let mut mgr = SegmentManager::create(dir.path().to_path_buf(), 1_000_000, false, false, None, [0u8; 32], RetentionPolicy::KeepAll, 0).unwrap();
+    let mut mgr = SegmentManager::create(
+        dir.path().to_path_buf(),
+        1_000_000,
+        false,
+        false,
+        None,
+        [0u8; 32],
+        RetentionPolicy::KeepAll,
+        0,
+    )
+    .unwrap();
     let last = mgr.append_batch(&ring, 0, 9).unwrap();
     check!(last == 9, "append batch");
-    check!(mgr.active_offset() > SEGMENT_HEADER_SIZE as u64, "offset advanced");
+    check!(
+        mgr.active_offset() > SEGMENT_HEADER_SIZE as u64,
+        "offset advanced"
+    );
     0
 }
 
 fn test_segment_roll() -> i32 {
     let dir = tempfile::tempdir().unwrap();
-    let mut mgr = SegmentManager::create(dir.path().to_path_buf(), 1024, false, false, None, [0u8; 32], RetentionPolicy::KeepAll, 0).unwrap();
+    let mut mgr = SegmentManager::create(
+        dir.path().to_path_buf(),
+        1024,
+        false,
+        false,
+        None,
+        [0u8; 32],
+        RetentionPolicy::KeepAll,
+        0,
+    )
+    .unwrap();
     check!(mgr.active_segment_id() == 1, "first seg id");
     mgr.roll(0, 0).unwrap();
     check!(mgr.active_segment_id() == 2, "rolled seg id");
-    check!(dir.path().join("segment-00000001.log").exists(), "seg1 exists");
-    check!(dir.path().join("segment-00000002.log").exists(), "seg2 exists");
+    check!(
+        dir.path().join("segment-00000001.log").exists(),
+        "seg1 exists"
+    );
+    check!(
+        dir.path().join("segment-00000002.log").exists(),
+        "seg2 exists"
+    );
     0
 }
 
 fn test_segment_fdatasync() -> i32 {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SegmentManager::create(dir.path().to_path_buf(), 1_000_000, false, false, None, [0u8; 32], RetentionPolicy::KeepAll, 0).unwrap();
+    let mgr = SegmentManager::create(
+        dir.path().to_path_buf(),
+        1_000_000,
+        false,
+        false,
+        None,
+        [0u8; 32],
+        RetentionPolicy::KeepAll,
+        0,
+    )
+    .unwrap();
     mgr.fdatasync().unwrap();
     0
 }
 
 fn test_segment_base_sequence() -> i32 {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SegmentManager::create(dir.path().to_path_buf(), 1_000_000, false, false, None, [0u8; 32], RetentionPolicy::KeepAll, 42).unwrap();
+    let mgr = SegmentManager::create(
+        dir.path().to_path_buf(),
+        1_000_000,
+        false,
+        false,
+        None,
+        [0u8; 32],
+        RetentionPolicy::KeepAll,
+        42,
+    )
+    .unwrap();
     check!(mgr.base_sequence() == 42, "base sequence");
     0
 }
@@ -591,10 +726,23 @@ fn test_shutdown_enter_rejected_after_drain() -> i32 {
 fn test_recover_after_write() -> i32 {
     let dir = tempfile::tempdir().unwrap();
     let ring = Ring::new(64, false, 0);
-    let mut mgr = SegmentManager::create(dir.path().to_path_buf(), 10_000_000, false, false, None, [0u8; 32], RetentionPolicy::KeepAll, 0).unwrap();
+    let mut mgr = SegmentManager::create(
+        dir.path().to_path_buf(),
+        10_000_000,
+        false,
+        false,
+        None,
+        [0u8; 32],
+        RetentionPolicy::KeepAll,
+        0,
+    )
+    .unwrap();
     for i in 0..10u64 {
         let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-        unsafe { ring.slot(seq).producer_write(seq, i * 100, format!("rec-{}", i).as_bytes()); }
+        unsafe {
+            ring.slot(seq)
+                .producer_write(seq, i * 100, format!("rec-{}", i).as_bytes());
+        }
         ring.slot(seq).publish(seq);
     }
     mgr.append_batch(&ring, 0, 9).unwrap();
@@ -602,7 +750,8 @@ fn test_recover_after_write() -> i32 {
     drop(mgr);
     drop(ring);
 
-    let state = logdb::recovery::recover(dir.path(), 10_000_000, RetentionPolicy::KeepAll, None).unwrap();
+    let state =
+        logdb::recovery::recover(dir.path(), 10_000_000, RetentionPolicy::KeepAll, None).unwrap();
     check!(state.last_sequence == 9, "recovered last sequence");
     0
 }

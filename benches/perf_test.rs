@@ -4,9 +4,9 @@
 //! Criterion benchmarks have issues in WSL2 due to tempdir overhead and
 //! thread interactions. This binary directly measures append latency.
 
-use std::time::{Duration, Instant};
 use logdb::config::{Config, DurabilityMode};
 use logdb::LogDb;
+use std::time::{Duration, Instant};
 
 fn main() {
     // Create a persistent temp dir
@@ -14,7 +14,7 @@ fn main() {
 
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
-    config.ring_size = 65536;       // large ring to avoid backpressure
+    config.ring_size = 65536; // large ring to avoid backpressure
     config.durability_mode = DurabilityMode::Async;
     config.flush_timeout = Duration::from_secs(30);
     config.queue_full_policy = logdb::config::QueueFullPolicy::Block;
@@ -122,8 +122,13 @@ fn main() {
         }
         let elapsed = start.elapsed();
         let rec_per_sec = total as f64 / elapsed.as_secs_f64();
-        println!("  {}t: {:.0} rec/s ({} records in {:.2}s)",
-            num_threads, rec_per_sec, total, elapsed.as_secs_f64());
+        println!(
+            "  {}t: {:.0} rec/s ({} records in {:.2}s)",
+            num_threads,
+            rec_per_sec,
+            total,
+            elapsed.as_secs_f64()
+        );
     }
 
     // ── 5. Multi-thread with shared DB ───────────────────────────────
@@ -150,8 +155,13 @@ fn main() {
         }
         let elapsed = start.elapsed();
         let rec_per_sec = total as f64 / elapsed.as_secs_f64();
-        println!("  {}t: {:.0} rec/s ({} records in {:.2}s)",
-            num_threads, rec_per_sec, total, elapsed.as_secs_f64());
+        println!(
+            "  {}t: {:.0} rec/s ({} records in {:.2}s)",
+            num_threads,
+            rec_per_sec,
+            total,
+            elapsed.as_secs_f64()
+        );
     }
 
     // ── 6. Latency percentiles for 256B single-thread ───────────────

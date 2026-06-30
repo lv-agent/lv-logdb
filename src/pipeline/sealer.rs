@@ -48,7 +48,9 @@ pub fn run_sealer(
                 for seq in next_seq..=hi {
                     let view = unsafe { ring.slot(seq).read() };
                     let hash_n = blake3_keyed_chain(&hash_init, &last_hash, view.content);
-                    unsafe { ring.slot(seq).write_hash(hash_n); }
+                    unsafe {
+                        ring.slot(seq).write_hash(hash_n);
+                    }
                     last_hash = hash_n;
                 }
                 ring.sealed_cursor.store(hi + 1, Ordering::Release);
@@ -217,7 +219,9 @@ mod tests {
     fn scan_published_finds_contiguous() {
         let ring = Ring::new(64, true, 0);
         for seq in 0..3 {
-            unsafe { ring.slot(seq).producer_write(seq, 0, b"x"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, 0, b"x");
+            }
             ring.slot(seq).publish(seq);
         }
         assert_eq!(scan_published(&ring, 0), Some(2));
@@ -226,9 +230,13 @@ mod tests {
     #[test]
     fn scan_published_with_gap() {
         let ring = Ring::new(64, true, 0);
-        unsafe { ring.slot(0).producer_write(0, 0, b"x"); }
+        unsafe {
+            ring.slot(0).producer_write(0, 0, b"x");
+        }
         ring.slot(0).publish(0);
-        unsafe { ring.slot(1).producer_write(1, 0, b"x"); }
+        unsafe {
+            ring.slot(1).producer_write(1, 0, b"x");
+        }
         ring.slot(1).publish(1);
         assert_eq!(scan_published(&ring, 0), Some(1));
     }
@@ -240,7 +248,9 @@ mod tests {
 
         for i in 0..3 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-            unsafe { ring.slot(seq).producer_write(seq, i * 100, b"data"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, i * 100, b"data");
+            }
             ring.slot(seq).publish(seq);
         }
 

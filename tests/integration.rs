@@ -13,7 +13,7 @@ fn full_lifecycle_append_flush_read() {
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
     config.ring_size = 128;
-    config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+    config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
     config.flush_timeout = Duration::from_secs(5);
 
     let db = LogDb::open(config).unwrap();
@@ -61,7 +61,7 @@ fn recovery_after_clean_shutdown() {
     {
         let mut config = Config::default();
         config.data_dir = data_dir.clone();
-        config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+        config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
         config.flush_timeout = Duration::from_secs(5);
 
         let db = LogDb::open(config).unwrap();
@@ -78,7 +78,7 @@ fn recovery_after_clean_shutdown() {
     {
         let mut config = Config::default();
         config.data_dir = data_dir.clone();
-        config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+        config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
         config.flush_timeout = Duration::from_secs(5);
 
         let db = LogDb::open(config).unwrap();
@@ -105,7 +105,7 @@ fn append_after_shutdown_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
-    config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+    config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
     config.flush_timeout = Duration::from_secs(2);
 
     let db = LogDb::open(config).unwrap();
@@ -151,7 +151,7 @@ fn large_record_spills_to_heap() {
     config.data_dir = dir.path().to_path_buf();
     config.ring_size = 64;
     config.max_content_size = 2 * 1024 * 1024; // 2MB
-    config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+    config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
     config.flush_timeout = Duration::from_secs(10);
 
     let db = LogDb::open(config).unwrap();
@@ -178,7 +178,13 @@ fn content_too_large_rejected() {
 
     let db = LogDb::open(config).unwrap();
     let err = db.append(&vec![0u8; 200]).unwrap_err();
-    assert!(matches!(err, AppendError::ContentTooLarge { size: 200, max: 100 }));
+    assert!(matches!(
+        err,
+        AppendError::ContentTooLarge {
+            size: 200,
+            max: 100
+        }
+    ));
 }
 
 #[test]
@@ -186,7 +192,7 @@ fn empty_content_works() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
-    config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+    config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
     config.flush_timeout = Duration::from_secs(5);
 
     let db = LogDb::open(config).unwrap();
@@ -208,7 +214,7 @@ fn persistent_checkpoint_survives_restart() {
     {
         let mut config = Config::default();
         config.data_dir = data_dir.clone();
-        config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+        config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
         config.flush_timeout = Duration::from_secs(5);
         let db = LogDb::open(config).unwrap();
         for i in 0..100u64 {
@@ -225,13 +231,16 @@ fn persistent_checkpoint_survives_restart() {
     {
         let mut config = Config::default();
         config.data_dir = data_dir.clone();
-        config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+        config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
         config.flush_timeout = Duration::from_secs(5);
         let db = LogDb::open(config).unwrap();
-        assert_eq!(db.checkpoint_sequence(), 50, "checkpoint should survive restart");
+        assert_eq!(
+            db.checkpoint_sequence(),
+            50,
+            "checkpoint should survive restart"
+        );
         // Verify replay_from works (reads already-durable records from disk)
-        let records: Vec<_> = db.replay_from(50).unwrap()
-            .filter_map(|r| r.ok()).collect();
+        let records: Vec<_> = db.replay_from(50).unwrap().filter_map(|r| r.ok()).collect();
         assert!(!records.is_empty(), "should have records from seq 50");
         // Write one record to ensure the Committer has work, then clean shutdown
         db.append(b"post-recovery").unwrap();
@@ -247,12 +256,14 @@ fn append_batch_is_atomic() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
-    config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+    config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
     config.flush_timeout = Duration::from_secs(5);
 
     let db = LogDb::open(config).unwrap();
     // Write 3 records atomically
-    let first = db.append_batch(&[b"PUT a 1", b"PUT b 2", b"PUT c 3"]).unwrap();
+    let first = db
+        .append_batch(&[b"PUT a 1", b"PUT b 2", b"PUT c 3"])
+        .unwrap();
     db.flush().unwrap();
     std::thread::sleep(Duration::from_millis(50));
 
@@ -276,10 +287,12 @@ fn recovery_report_after_write() {
     {
         let mut config = Config::default();
         config.data_dir = data_dir.clone();
-        config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+        config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
         config.flush_timeout = Duration::from_secs(5);
         let db = LogDb::open(config).unwrap();
-        for _ in 0..100 { db.append(b"data").unwrap(); }
+        for _ in 0..100 {
+            db.append(b"data").unwrap();
+        }
         db.flush().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         db.checkpoint(50);
@@ -290,7 +303,7 @@ fn recovery_report_after_write() {
     {
         let mut config = Config::default();
         config.data_dir = data_dir.clone();
-        config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+        config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
         config.flush_timeout = Duration::from_secs(5);
         let db = LogDb::open(config).unwrap();
         let report = db.recovery_report();
@@ -308,7 +321,7 @@ fn wal_usage_reports_space() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
-    config.durability_mode = DurabilityMode::Async;  // avoid WSL2 fdatasync hang
+    config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
     config.flush_timeout = Duration::from_secs(5);
 
     let db = LogDb::open(config).unwrap();
@@ -354,9 +367,10 @@ fn flush_across_multiple_rolls_all_durable() {
 
     // Every record must be readable back from disk.
     for i in 0..n {
-        let rec = db.read(i).unwrap().unwrap_or_else(|| {
-            panic!("record {} missing after flush across rolls (P0-5)", i)
-        });
+        let rec = db
+            .read(i)
+            .unwrap()
+            .unwrap_or_else(|| panic!("record {} missing after flush across rolls (P0-5)", i));
         assert_eq!(rec.id.sequence, i);
     }
 
@@ -364,11 +378,7 @@ fn flush_across_multiple_rolls_all_durable() {
     let seg_count = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("segment-")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("segment-"))
         .count();
     assert!(
         seg_count >= 2,
@@ -396,12 +406,15 @@ fn compressed_log_survives_restart_and_scan() {
         config.flush_timeout = Duration::from_secs(10);
         let db = LogDb::open(config).unwrap();
         for i in 0..50u64 {
-            db.append(format!("compressed-record-{}", i).as_bytes()).unwrap();
+            db.append(format!("compressed-record-{}", i).as_bytes())
+                .unwrap();
         }
         db.flush().unwrap();
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(25));
-            if db.durable_cursor() >= 50 { break; }
+            if db.durable_cursor() >= 50 {
+                break;
+            }
         }
         db.shutdown(Duration::from_secs(5)).unwrap();
     }
@@ -420,7 +433,11 @@ fn compressed_log_survives_restart_and_scan() {
     }
     // scan/replay must also be frame-aware (RecordIter P0-1).
     let scanned: Vec<_> = db.scan(0, 50).unwrap().filter_map(|r| r.ok()).collect();
-    assert_eq!(scanned.len(), 50, "scan must return all records on a compressed segment");
+    assert_eq!(
+        scanned.len(),
+        50,
+        "scan must return all records on a compressed segment"
+    );
     for (i, rec) in scanned.iter().enumerate() {
         assert_eq!(rec.id.sequence, i as u64);
     }
@@ -447,7 +464,9 @@ fn encrypted_log_roundtrip_survives_restart() {
         db.flush().unwrap();
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(25));
-            if db.durable_cursor() >= 30 { break; }
+            if db.durable_cursor() >= 30 {
+                break;
+            }
         }
         // Read back while open — must decrypt with the real key (P0-2).
         assert_eq!(db.read(0).unwrap().unwrap().content, b"secret-0");
@@ -466,7 +485,11 @@ fn encrypted_log_roundtrip_survives_restart() {
         assert_eq!(rec.content, format!("secret-{}", i).as_bytes());
     }
     let scanned: Vec<_> = db.scan(0, 30).unwrap().filter_map(|r| r.ok()).collect();
-    assert_eq!(scanned.len(), 30, "scan must decrypt all records after restart");
+    assert_eq!(
+        scanned.len(),
+        30,
+        "scan must decrypt all records after restart"
+    );
 }
 
 #[cfg(feature = "encryption")]
@@ -491,7 +514,9 @@ fn encrypted_log_unreadable_without_key() {
         db.flush().unwrap();
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(25));
-            if db.durable_cursor() >= 1 { break; }
+            if db.durable_cursor() >= 1 {
+                break;
+            }
         }
         db.shutdown(Duration::from_secs(5)).unwrap();
     }
@@ -526,12 +551,15 @@ fn hash_chain_log_survives_restart() {
         config.flush_timeout = Duration::from_secs(10);
         let db = LogDb::open(config).unwrap();
         for i in 0..40u64 {
-            db.append(format!("hashed-record-{}", i).as_bytes()).unwrap();
+            db.append(format!("hashed-record-{}", i).as_bytes())
+                .unwrap();
         }
         db.flush().unwrap();
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(25));
-            if db.durable_cursor() >= 40 { break; }
+            if db.durable_cursor() >= 40 {
+                break;
+            }
         }
         db.shutdown(Duration::from_secs(5)).unwrap();
     }
@@ -573,7 +601,9 @@ fn hash_chain_detects_tamper() {
         db.flush().unwrap();
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(25));
-            if db.durable_cursor() >= 20 { break; }
+            if db.durable_cursor() >= 20 {
+                break;
+            }
         }
         db.shutdown(Duration::from_secs(5)).unwrap();
     }
@@ -615,12 +645,19 @@ fn append_batch_preserves_distinct_records_across_batches() {
     let batches = 100usize;
     let per = 100usize;
     for b in 0..batches {
-        let recs: Vec<Vec<u8>> = (0..per).map(|i| format!("b{}r{}", b, i).into_bytes()).collect();
+        let recs: Vec<Vec<u8>> = (0..per)
+            .map(|i| format!("b{}r{}", b, i).into_bytes())
+            .collect();
         let refs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
         db.append_batch(&refs).unwrap();
     }
     db.flush().unwrap();
-    for _ in 0..60 { std::thread::sleep(Duration::from_millis(25)); if db.durable_cursor() >= (batches * per) as u64 { break; } }
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(25));
+        if db.durable_cursor() >= (batches * per) as u64 {
+            break;
+        }
+    }
 
     let total = (batches * per) as u64;
     let mut readable = 0u64;
@@ -629,13 +666,28 @@ fn append_batch_preserves_distinct_records_across_batches() {
         match db.read(seq).unwrap() {
             Some(r) => {
                 let want = format!("b{}r{}", seq / per as u64, seq % per as u64).into_bytes();
-                if r.content == want { readable += 1; } else if first_bad.is_none() { first_bad = Some((seq, format!("{:?}", r.content))); }
+                if r.content == want {
+                    readable += 1;
+                } else if first_bad.is_none() {
+                    first_bad = Some((seq, format!("{:?}", r.content)));
+                }
             }
-            None => { if first_bad.is_none() { first_bad = Some((seq, "MISSING".into())); } }
+            None => {
+                if first_bad.is_none() {
+                    first_bad = Some((seq, "MISSING".into()));
+                }
+            }
         }
     }
-    eprintln!("diag_append_batch: {} of {} readable; first_bad={:?}", readable, total, first_bad);
-    assert_eq!(readable, total, "append_batch must preserve all {} distinct records across batches", total);
+    eprintln!(
+        "diag_append_batch: {} of {} readable; first_bad={:?}",
+        readable, total, first_bad
+    );
+    assert_eq!(
+        readable, total,
+        "append_batch must preserve all {} distinct records across batches",
+        total
+    );
 }
 
 #[test]
@@ -660,7 +712,9 @@ fn index_stride_is_configurable() {
         db.flush().unwrap();
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(25));
-            if db.durable_cursor() >= 500 { break; }
+            if db.durable_cursor() >= 500 {
+                break;
+            }
         }
         for i in 0..500u64 {
             assert!(db.read(i).unwrap().is_some(), "record {} readable", i);

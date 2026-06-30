@@ -3,7 +3,7 @@
 //! The health state allows the system to distinguish between permanent errors
 //! and transient conditions (like ENOSPC) that can resolve without restart.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Health codes.
 pub const HEALTH_OK: u8 = 0;
@@ -44,12 +44,9 @@ impl HealthState {
     /// Record an error.  Only transitions from OK → error; once in error,
     /// the code stays until explicitly cleared.
     pub fn set_error(&self, code: u8) {
-        let _ = self.code.compare_exchange(
-            HEALTH_OK,
-            code,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        let _ = self
+            .code
+            .compare_exchange(HEALTH_OK, code, Ordering::AcqRel, Ordering::Relaxed);
         // Always update the timestamp so retry probes see a fresh time.
         self.error_ts.store(now_coarse_ns(), Ordering::Release);
     }
@@ -86,7 +83,8 @@ pub fn now_coarse_ns() -> u64 {
     unsafe {
         libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut ts);
     }
-    (ts.tv_sec as u64).saturating_mul(1_000_000_000)
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
         .saturating_add(ts.tv_nsec as u64)
 }
 

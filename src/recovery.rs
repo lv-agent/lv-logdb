@@ -39,14 +39,9 @@ pub enum RecoveryWarning {
         at_offset: u64,
     },
     /// A segment header was corrupted; this and later segments discarded.
-    CorruptedHeader {
-        segment_id: u32,
-        reason: String,
-    },
+    CorruptedHeader { segment_id: u32, reason: String },
     /// A segment file was missing from the expected sequence.
-    MissingSegment {
-        expected_id: u32,
-    },
+    MissingSegment { expected_id: u32 },
     /// A hash chain discontinuity was detected.
     HashChainBreak {
         segment_id: u32,
@@ -283,7 +278,10 @@ fn scan_last_segment(
     encryption_key: Option<[u8; 32]>,
     shard_bits: u32,
 ) -> Result<(u64, [u8; 32], u64, Vec<RecoveryWarning>, u64), String> {
-    let mut file = OpenOptions::new().write(true).read(true).open(path)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .open(path)
         .map_err(|e| format!("open {:?}: {}", path, e))?;
     let file_size = file
         .metadata()
@@ -360,10 +358,15 @@ fn scan_last_segment(
                 torn!(offset);
             }
             let decoded = match crate::reader::decode_frame_payload(
-                &payload, is_compressed, is_encrypted, encryption_key.as_ref(),
+                &payload,
+                is_compressed,
+                is_encrypted,
+                encryption_key.as_ref(),
             ) {
                 Ok(d) => d,
-                Err(_) => { torn!(offset); } // decode failure = torn/corrupt frame
+                Err(_) => {
+                    torn!(offset);
+                } // decode failure = torn/corrupt frame
             };
             // Scan records within the decoded frame.
             let valid_len = dl.min(decoded.len());
@@ -371,15 +374,21 @@ fn scan_last_segment(
             let mut frame_ok = true;
             while doff + MIN_RECORD_SIZE <= valid_len {
                 let total = u32::from_le_bytes([
-                    decoded[doff], decoded[doff + 1], decoded[doff + 2], decoded[doff + 3],
+                    decoded[doff],
+                    decoded[doff + 1],
+                    decoded[doff + 2],
+                    decoded[doff + 3],
                 ]) as usize;
-                if total < MIN_RECORD_SIZE || doff + total > valid_len { break; }
+                if total < MIN_RECORD_SIZE || doff + total > valid_len {
+                    break;
+                }
                 match deserialize_record(&decoded[doff..doff + total]) {
                     Ok((record, _)) => {
                         if record.id.sequence != expected_record_id
                             && !(count == 0 && shard_bits > 0)
                         {
-                            frame_ok = false; break;
+                            frame_ok = false;
+                            break;
                         }
                         last_sequence = record.id.sequence;
                         last_hash = record.hash_n;
@@ -387,7 +396,9 @@ fn scan_last_segment(
                         #[cfg(feature = "hash-chain")]
                         if hash_enabled {
                             let expected = crate::pipeline::sealer::blake3_keyed_chain(
-                                &hash_init, &chain_prev, record.content.as_slice(),
+                                &hash_init,
+                                &chain_prev,
+                                record.content.as_slice(),
                             );
                             if expected != record.hash_n {
                                 warnings.push(RecoveryWarning::HashChainBreak {
@@ -402,7 +413,10 @@ fn scan_last_segment(
                         expected_record_id = record.id.sequence + stride;
                         doff += total;
                     }
-                    Err(_) => { frame_ok = false; break; }
+                    Err(_) => {
+                        frame_ok = false;
+                        break;
+                    }
                 }
             }
             if !frame_ok {
@@ -441,9 +455,7 @@ fn scan_last_segment(
                     // allow that one mismatch and let the stride assignment below
                     // (re)seed the chain. shards=1 (shard_bits==0) never takes the
                     // exemption, so its strict first-record check is unchanged.
-                    if record.id.sequence != expected_record_id
-                        && !(count == 0 && shard_bits > 0)
-                    {
+                    if record.id.sequence != expected_record_id && !(count == 0 && shard_bits > 0) {
                         torn!(offset);
                     }
                     last_sequence = record.id.sequence;
@@ -452,7 +464,9 @@ fn scan_last_segment(
                     #[cfg(feature = "hash-chain")]
                     if hash_enabled {
                         let expected = crate::pipeline::sealer::blake3_keyed_chain(
-                            &hash_init, &chain_prev, record.content.as_slice(),
+                            &hash_init,
+                            &chain_prev,
+                            record.content.as_slice(),
                         );
                         if expected != record.hash_n {
                             warnings.push(RecoveryWarning::HashChainBreak {
@@ -512,9 +526,9 @@ fn list_segment_files(dir: &Path) -> Result<Vec<(u32, PathBuf)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::QueueFullPolicy;
     use crate::config::RetentionPolicy;
     use crate::ring::Ring;
-    use crate::config::QueueFullPolicy;
 
     #[test]
     fn recover_fresh_database_then_recover() {
@@ -525,7 +539,9 @@ mod tests {
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             10 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -536,7 +552,10 @@ mod tests {
         for i in 0..10 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
             let content = format!("recovery-test-{}", i);
-            unsafe { ring.slot(seq).producer_write(seq, i * 100, content.as_bytes()); }
+            unsafe {
+                ring.slot(seq)
+                    .producer_write(seq, i * 100, content.as_bytes());
+            }
             ring.slot(seq).publish(seq);
         }
 

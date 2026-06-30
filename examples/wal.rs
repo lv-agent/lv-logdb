@@ -41,8 +41,10 @@ impl KvStore {
 
         // Phase 1: Recover from WAL (replay records from the replay point).
         let report = db.recovery_report();
-        println!("Recovery report: from={} to={} count={}",
-            report.from_sequence, report.to_sequence, report.count);
+        println!(
+            "Recovery report: from={} to={} count={}",
+            report.from_sequence, report.to_sequence, report.count
+        );
 
         for result in db.replay_from(replay_checkpoint).unwrap() {
             let record = result.unwrap();
@@ -50,14 +52,22 @@ impl KvStore {
             // Parse "PUT key value" or "DEL key"
             let parts: Vec<&str> = content.splitn(3, ' ').collect();
             match parts.as_slice() {
-                ["PUT", key, value] => { data.insert(key.to_string(), value.to_string()); }
-                ["DEL", key] => { data.remove(*key); }
+                ["PUT", key, value] => {
+                    data.insert(key.to_string(), value.to_string());
+                }
+                ["DEL", key] => {
+                    data.remove(*key);
+                }
                 _ => {}
             }
         }
         println!("Recovered {} key(s) from WAL", data.len());
 
-        Self { db, data, replay_from: replay_checkpoint }
+        Self {
+            db,
+            data,
+            replay_from: replay_checkpoint,
+        }
     }
 
     /// Put a key-value pair (durably).
@@ -83,7 +93,8 @@ impl KvStore {
 
     /// Put multiple keys atomically.
     fn put_batch(&mut self, pairs: &[(&str, &str)]) {
-        let wals: Vec<String> = pairs.iter()
+        let wals: Vec<String> = pairs
+            .iter()
             .map(|(k, v)| format!("PUT {} {}", k, v))
             .collect();
         let wal_refs: Vec<&[u8]> = wals.iter().map(|s| s.as_bytes()).collect();
@@ -93,7 +104,11 @@ impl KvStore {
         for (k, v) in pairs {
             self.data.insert(k.to_string(), v.to_string());
         }
-        println!("PUT batch {} pairs (lsn={})", pairs.len(), self.db.durable_cursor());
+        println!(
+            "PUT batch {} pairs (lsn={})",
+            pairs.len(),
+            self.db.durable_cursor()
+        );
     }
 
     /// Create a checkpoint at the session's replay point.
@@ -111,13 +126,22 @@ impl KvStore {
     fn checkpoint(&self) {
         let lsn = self.replay_from;
         self.db.checkpoint(lsn);
-        println!("Checkpoint at lsn={} (durable tail={})", lsn, self.db.durable_cursor());
+        println!(
+            "Checkpoint at lsn={} (durable tail={})",
+            lsn,
+            self.db.durable_cursor()
+        );
     }
 
     /// Show WAL usage.
     fn show_usage(&self) {
         let (used, total) = self.db.wal_usage();
-        println!("WAL: {} / {} bytes ({:.1}%)", used, total, used as f64 / total as f64 * 100.0);
+        println!(
+            "WAL: {} / {} bytes ({:.1}%)",
+            used,
+            total,
+            used as f64 / total as f64 * 100.0
+        );
     }
 
     /// Graceful shutdown.
@@ -142,10 +166,7 @@ fn main() {
         let mut store = KvStore::open(path, 0);
 
         store.put("name", "Alice");
-        store.put_batch(&[
-            ("email", "alice@example.com"),
-            ("role", "admin"),
-        ]);
+        store.put_batch(&[("email", "alice@example.com"), ("role", "admin")]);
         store.delete("role");
 
         // Checkpoint the replay point we resumed from (0). Records written

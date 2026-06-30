@@ -32,11 +32,17 @@ impl RecordId {
     /// Create a new RecordId.
     #[inline]
     pub fn new(partition_id: u32, sequence: u64) -> Self {
-        Self { partition_id, sequence }
+        Self {
+            partition_id,
+            sequence,
+        }
     }
 
     /// The default record ID for single-partition usage (partition 0, sequence 0).
-    pub const ZERO: Self = Self { partition_id: 0, sequence: 0 };
+    pub const ZERO: Self = Self {
+        partition_id: 0,
+        sequence: 0,
+    };
 }
 
 impl fmt::Display for RecordId {
@@ -59,7 +65,10 @@ impl From<RecordId> for u64 {
 impl From<u64> for RecordId {
     #[inline]
     fn from(sequence: u64) -> Self {
-        Self { partition_id: 0, sequence }
+        Self {
+            partition_id: 0,
+            sequence,
+        }
     }
 }
 
@@ -92,7 +101,12 @@ pub struct Record {
 impl Record {
     /// Create a new owned record.
     pub fn new(id: RecordId, timestamp_ns: u64, content: Vec<u8>, hash_n: [u8; 32]) -> Self {
-        Self { id, timestamp_ns, content, hash_n }
+        Self {
+            id,
+            timestamp_ns,
+            content,
+            hash_n,
+        }
     }
 }
 

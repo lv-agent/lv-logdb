@@ -44,9 +44,12 @@ impl FlushSignal {
             let mut cur = self.targets[s].load(Ordering::Acquire);
             loop {
                 let new = if cur == u64::MAX { t } else { cur.max(t) };
-                match self.targets[s]
-                    .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
-                {
+                match self.targets[s].compare_exchange_weak(
+                    cur,
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
                     Ok(_) => break,
                     Err(v) => cur = v,
                 }
@@ -58,9 +61,12 @@ impl FlushSignal {
     pub fn complete(&self, shard: usize, durable: u64) {
         let mut cur = self.completed[shard].load(Ordering::Acquire);
         while cur < durable {
-            match self.completed[shard]
-                .compare_exchange_weak(cur, durable, Ordering::Release, Ordering::Acquire)
-            {
+            match self.completed[shard].compare_exchange_weak(
+                cur,
+                durable,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => break,
                 Err(v) => cur = v,
             }
@@ -69,10 +75,9 @@ impl FlushSignal {
 
     /// True when every shard's `completed >= per_shard[s]`.
     pub fn is_done(&self, per_shard: &[u64]) -> bool {
-        per_shard
-            .iter()
-            .enumerate()
-            .all(|(s, &t)| s >= self.completed.len() || self.completed[s].load(Ordering::Acquire) >= t)
+        per_shard.iter().enumerate().all(|(s, &t)| {
+            s >= self.completed.len() || self.completed[s].load(Ordering::Acquire) >= t
+        })
     }
 
     /// The requested target for `shard` (u64::MAX = none).
@@ -82,7 +87,9 @@ impl FlushSignal {
 
     /// Whether any shard has a pending flush request.
     pub fn any_pending(&self) -> bool {
-        self.targets.iter().any(|t| t.load(Ordering::Acquire) != u64::MAX)
+        self.targets
+            .iter()
+            .any(|t| t.load(Ordering::Acquire) != u64::MAX)
     }
 }
 

@@ -24,17 +24,17 @@
 pub mod config;
 pub mod error;
 pub mod health;
+pub mod pipeline;
 pub mod platform;
+pub mod reader;
 pub mod record;
 pub mod ring;
-pub mod pipeline;
-pub mod storage;
-pub mod reader;
 pub mod shard;
+pub mod storage;
 
+mod pusher;
 pub mod recovery;
 pub mod tailer;
-mod pusher;
 
 pub use config::Config;
 pub use error::{AppendError, FlushError, ReadError, ShutdownError, ShutdownReport};
@@ -225,11 +225,9 @@ impl LogDb {
         #[cfg(feature = "hash-chain")]
         let sealer_handle = if hash_enabled {
             if config.shards > 1 {
-                return Err(
-                    "hash-chain is not supported with shards > 1 in v1.1. \
+                return Err("hash-chain is not supported with shards > 1 in v1.1. \
                      Use shards=1 with hash-chain, or shards>1 without hash."
-                        .to_string(),
-                );
+                    .to_string());
             }
             let sealer_ring = Arc::clone(shards.ring(0));
             let sealer_shutdown = Arc::clone(&shutdown);
@@ -288,26 +286,37 @@ impl LogDb {
     /// [`claim_batch`](crate::ring::Ring::claim_batch) (no partial reservation),
     /// so consecutive batches never overwrite each other's slots.
     pub fn append_batch(&self, contents: &[&[u8]]) -> Result<u64, AppendError> {
-        if contents.is_empty() { return Err(AppendError::ContentTooLarge { size: 0, max: 0 }); }
+        if contents.is_empty() {
+            return Err(AppendError::ContentTooLarge { size: 0, max: 0 });
+        }
         let inner = &self.inner;
         if let Some(code) = inner.health.check() {
-            return Err(match code { health::HEALTH_DISK_FULL => AppendError::DiskFull, _ => AppendError::Io("unhealthy".into()) });
+            return Err(match code {
+                health::HEALTH_DISK_FULL => AppendError::DiskFull,
+                _ => AppendError::Io("unhealthy".into()),
+            });
         }
         // Validate ALL contents BEFORE reserving sequences. A too-large record
         // found after a partial claim_batch would leave reserved-but-unwritten
         // slots (a gap the Committer can't cross).
         for content in contents {
             if content.len() > inner.config.max_content_size {
-                return Err(AppendError::ContentTooLarge { size: content.len(), max: inner.config.max_content_size });
+                return Err(AppendError::ContentTooLarge {
+                    size: content.len(),
+                    max: inner.config.max_content_size,
+                });
             }
         }
-        if !inner.shutdown.enter() { return Err(AppendError::ShuttingDown); }
+        if !inner.shutdown.enter() {
+            return Err(AppendError::ShuttingDown);
+        }
         let _guard = scopeguard::guard((), |_| inner.shutdown.leave());
 
         // Reserve the whole batch atomically (producer_cursor += n).
         let n = contents.len() as u64;
-        let (first_id, shard_id, local_first) =
-            inner.shards.claim_batch(n, inner.config.queue_full_policy)?;
+        let (first_id, shard_id, local_first) = inner
+            .shards
+            .claim_batch(n, inner.config.queue_full_policy)?;
         let ts = platform::clock_realtime_coarse_ns();
         let ring = inner.shards.ring(shard_id);
         let shard_bits = inner.shards.shard_bits();
@@ -316,7 +325,9 @@ impl LogDb {
             let global_id = shard::encode_record_id(shard_id, local_seq, shard_bits);
             // Safety: claim_batch reserved the LOCAL range [local_first, local_first+n)
             // exclusively. Slot is indexed by LOCAL seq; record_id stores the GLOBAL id.
-            unsafe { ring.slot(local_seq).producer_write(global_id, ts, content); }
+            unsafe {
+                ring.slot(local_seq).producer_write(global_id, ts, content);
+            }
             ring.slot(local_seq).publish(local_seq);
         }
         Ok(first_id)
@@ -357,7 +368,9 @@ impl LogDb {
         // works under sharding (shards=1: global == local, behavior unchanged).
         let ts = platform::clock_realtime_coarse_ns();
         let ring = inner.shards.ring(shard_id);
-        unsafe { ring.slot(local_seq).producer_write(global_id, ts, content); }
+        unsafe {
+            ring.slot(local_seq).producer_write(global_id, ts, content);
+        }
 
         // Publish
         ring.slot(local_seq).publish(local_seq);
@@ -442,13 +455,18 @@ impl LogDb {
         // other producer. `sequence` was validated to equal the monotonic
         // cursor, so the slot has not yet been consumed (it is below committed
         // only by the watermark gate above). Mirrors append()'s proof.
-        unsafe { ring.slot(sequence).producer_write(sequence, timestamp_ns, content); }
+        unsafe {
+            ring.slot(sequence)
+                .producer_write(sequence, timestamp_ns, content);
+        }
         ring.slot(sequence).publish(sequence);
 
         // Advance the cursor so flush/shutdown target these records for fsync.
         // Single-writer on the standby (no local appends); a plain Release
         // store is correct and races are prevented by the caller's lock.
-        ring.producer_cursor.inner.store(sequence + 1, Ordering::Release);
+        ring.producer_cursor
+            .inner
+            .store(sequence + 1, Ordering::Release);
 
         Ok(())
     }
@@ -509,8 +527,7 @@ impl LogDb {
             inner.config.encryption_key,
         );
         let r = reader.read(record_id);
-        if matches!(r, Ok(None)) {
-        }
+        if matches!(r, Ok(None)) {}
         r
     }
 
@@ -566,17 +583,8 @@ impl LogDb {
     /// ascending global id. `shards=1` returns a single cross-segment stream;
     /// `shards>1` k-way-merges the per-shard streams. An empty range yields an
     /// empty iterator (no error).
-    pub fn scan(
-        &self,
-        from_id: u64,
-        to_id: u64,
-    ) -> Result<reader::ScanIter, ReadError> {
-        let manifests = self
-            .inner
-            .manifests
-            .iter()
-            .map(Arc::clone)
-            .collect();
+    pub fn scan(&self, from_id: u64, to_id: u64) -> Result<reader::ScanIter, ReadError> {
+        let manifests = self.inner.manifests.iter().map(Arc::clone).collect();
         reader::ScanIter::build(manifests, self.inner.config.encryption_key, from_id, to_id)
     }
 
@@ -588,7 +596,10 @@ impl LogDb {
         let mut cur = self.inner.checkpoint_sequence.load(Ordering::Acquire);
         while sequence > cur {
             match self.inner.checkpoint_sequence.compare_exchange_weak(
-                cur, sequence, Ordering::Release, Ordering::Acquire,
+                cur,
+                sequence,
+                Ordering::Release,
+                Ordering::Acquire,
             ) {
                 Ok(_) => break,
                 Err(v) => cur = v,
@@ -608,9 +619,15 @@ impl LogDb {
         let path = data_dir.join("checkpoint.dat");
         match std::fs::read(&path) {
             Ok(data) if data.len() == 12 => {
-                let seq = u64::from_le_bytes([data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]]);
-                let crc = u32::from_le_bytes([data[8],data[9],data[10],data[11]]);
-                if crc32c::crc32c(&data[..8]) == crc { seq } else { 0 }
+                let seq = u64::from_le_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ]);
+                let crc = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                if crc32c::crc32c(&data[..8]) == crc {
+                    seq
+                } else {
+                    0
+                }
             }
             _ => 0,
         }
@@ -671,10 +688,7 @@ impl LogDb {
 
     /// Replay records from `sequence` (inclusive) to the end of the log, across
     /// all shards, ordered by ascending global id.
-    pub fn replay_from(
-        &self,
-        sequence: u64,
-    ) -> Result<reader::ScanIter, ReadError> {
+    pub fn replay_from(&self, sequence: u64) -> Result<reader::ScanIter, ReadError> {
         self.scan(sequence, u64::MAX)
     }
 
@@ -716,16 +730,15 @@ impl LogDb {
         // drain_target is a single best-effort signal (max across shards); the
         // committer drains per-shard via the FlushSignal targets.
         let max_target = targets.iter().copied().max().unwrap_or(0);
-        inner.shutdown.drain_target.store(max_target, Ordering::Release);
+        inner
+            .shutdown
+            .drain_target
+            .store(max_target, Ordering::Release);
         inner.flush.request(&targets);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let durable_ok = wait_until(
-            &inner.shutdown,
-            || inner.flush.is_done(&targets),
-            remaining,
-        )
-        .is_ok();
+        let durable_ok =
+            wait_until(&inner.shutdown, || inner.flush.is_done(&targets), remaining).is_ok();
 
         Ok(if durable_ok {
             ShutdownReport::Clean
@@ -811,7 +824,10 @@ fn count_log_bytes(dir: &std::path::Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
-            if e.file_name().to_str().map_or(false, |n| n.ends_with(".log")) {
+            if e.file_name()
+                .to_str()
+                .map_or(false, |n| n.ends_with(".log"))
+            {
                 if let Ok(meta) = e.metadata() {
                     total += meta.len();
                 }
@@ -914,15 +930,28 @@ mod tests {
         }
 
         let report = db.drain(Duration::from_secs(5)).unwrap();
-        assert!(matches!(report, ShutdownReport::Clean), "drain must complete clean");
-        assert!(db.durable_cursor() >= 20, "all appended records must be durable after drain");
+        assert!(
+            matches!(report, ShutdownReport::Clean),
+            "drain must complete clean"
+        );
+        assert!(
+            db.durable_cursor() >= 20,
+            "all appended records must be durable after drain"
+        );
         for i in 0..20 {
-            assert!(db.read(i).unwrap().is_some(), "record {} readable after drain", i);
+            assert!(
+                db.read(i).unwrap().is_some(),
+                "record {} readable after drain",
+                i
+            );
         }
 
         // Drain phase rejects new appends.
         let err = db.append(b"after-drain").unwrap_err();
-        assert!(matches!(err, AppendError::ShuttingDown), "append after drain must be rejected");
+        assert!(
+            matches!(err, AppendError::ShuttingDown),
+            "append after drain must be rejected"
+        );
     }
 
     #[test]
@@ -937,13 +966,16 @@ mod tests {
         let db = LogDb::open(config).unwrap();
         // Replicate 5 records at exact sequences 0..5 with arbitrary timestamps.
         for i in 0..5u64 {
-            db.replicate(i, 1_000_000 + i, format!("replica-{}", i).as_bytes()).unwrap();
+            db.replicate(i, 1_000_000 + i, format!("replica-{}", i).as_bytes())
+                .unwrap();
         }
         assert_eq!(db.producer_cursor(), 5, "producer cursor must advance");
         db.flush().unwrap();
         for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(25));
-            if db.durable_cursor() >= 5 { break; }
+            if db.durable_cursor() >= 5 {
+                break;
+            }
         }
         assert!(db.durable_cursor() >= 5);
 
@@ -969,7 +1001,10 @@ mod tests {
         db.replicate(0, 0, b"a").unwrap();
         // Skipping ahead to 2 (gap at 1) must error — caller retries in order.
         let err = db.replicate(2, 0, b"c").unwrap_err();
-        assert!(matches!(err, AppendError::Io(_)), "expected out-of-order error");
+        assert!(
+            matches!(err, AppendError::Io(_)),
+            "expected out-of-order error"
+        );
         // Filling the gap succeeds.
         db.replicate(1, 0, b"b").unwrap();
         // Re-replicating an already-applied sequence is a no-op (idempotent).
@@ -1021,9 +1056,14 @@ mod tests {
             .flat_map(|s| read_all_in_dir(&dir.path().join(format!("s{}", s))))
             .collect();
         got.sort();
-        let mut want: Vec<Vec<u8>> = (0..6u64).map(|i| format!("rec-{}", i).into_bytes()).collect();
+        let mut want: Vec<Vec<u8>> = (0..6u64)
+            .map(|i| format!("rec-{}", i).into_bytes())
+            .collect();
         want.sort();
-        assert_eq!(got, want, "all appended records must be durable per-shard under sharding");
+        assert_eq!(
+            got, want,
+            "all appended records must be durable per-shard under sharding"
+        );
     }
 
     #[test]
@@ -1047,7 +1087,10 @@ mod tests {
         got.sort();
         let mut want: Vec<Vec<u8>> = batch.iter().map(|b| b.to_vec()).collect();
         want.sort();
-        assert_eq!(got, want, "append_batch records must all be durable per-shard under sharding");
+        assert_eq!(
+            got, want,
+            "append_batch records must all be durable per-shard under sharding"
+        );
     }
 
     // ── cr-003 Phase 2: sharded read (point lookup) ──────────────────────
@@ -1095,7 +1138,10 @@ mod tests {
         db.flush().unwrap();
 
         // append_batch returns the first record's global id; read it back.
-        let rec = db.read(first).unwrap().expect("first batch record readable");
+        let rec = db
+            .read(first)
+            .unwrap()
+            .expect("first batch record readable");
         assert_eq!(rec.content, b"alpha");
         assert_eq!(rec.id.sequence, first);
     }
@@ -1154,13 +1200,24 @@ mod tests {
 
         // Every appended record must be visible; ids strictly ascending.
         let scanned: Vec<u64> = db
-            .scan(0, u64::MAX).unwrap()
+            .scan(0, u64::MAX)
+            .unwrap()
             .filter_map(|r| r.ok())
             .map(|r| r.id.sequence)
             .collect();
-        assert_eq!(scanned.len(), all_ids.len(), "scan must see every record across shards");
-        assert!(all_ids.iter().all(|id| scanned.contains(id)), "scan missing some ids");
-        assert!(scanned.windows(2).all(|w| w[0] < w[1]), "scan must be strictly ascending");
+        assert_eq!(
+            scanned.len(),
+            all_ids.len(),
+            "scan must see every record across shards"
+        );
+        assert!(
+            all_ids.iter().all(|id| scanned.contains(id)),
+            "scan missing some ids"
+        );
+        assert!(
+            scanned.windows(2).all(|w| w[0] < w[1]),
+            "scan must be strictly ascending"
+        );
     }
 
     #[test]
@@ -1179,7 +1236,9 @@ mod tests {
         for t in 0..2u64 {
             let db = Arc::clone(&db);
             handles.push(std::thread::spawn(move || {
-                (0..12u64).map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap()).collect::<Vec<_>>()
+                (0..12u64)
+                    .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                    .collect::<Vec<_>>()
             }));
         }
         for h in handles {
@@ -1190,10 +1249,21 @@ mod tests {
         all_ids.sort();
         let from = all_ids[5];
         let to = all_ids[15];
-        let got: Vec<u64> = db.scan(from, to).unwrap()
-            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
-        let want: Vec<u64> = all_ids.iter().copied().filter(|&id| id >= from && id < to).collect();
-        assert_eq!(got, want, "scan([from,to)) must clip to the global-id range");
+        let got: Vec<u64> = db
+            .scan(from, to)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        let want: Vec<u64> = all_ids
+            .iter()
+            .copied()
+            .filter(|&id| id >= from && id < to)
+            .collect();
+        assert_eq!(
+            got, want,
+            "scan([from,to)) must clip to the global-id range"
+        );
     }
 
     #[test]
@@ -1217,16 +1287,33 @@ mod tests {
         db.flush().unwrap();
 
         // More than one segment file must exist (the roll happened).
-        let segs = std::fs::read_dir(dir.path()).unwrap()
+        let segs = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_str().map_or(false, |n| n.ends_with(".log")))
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map_or(false, |n| n.ends_with(".log"))
+            })
             .count();
-        assert!(segs >= 2, "expected a segment roll, found {} segment files", segs);
+        assert!(
+            segs >= 2,
+            "expected a segment roll, found {} segment files",
+            segs
+        );
 
         // scan must return ALL records across both segments, ascending.
-        let scanned: Vec<u64> = db.scan(0, u64::MAX).unwrap()
-            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
-        assert_eq!(scanned.len(), n as usize, "scan must cross the segment boundary");
+        let scanned: Vec<u64> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(
+            scanned.len(),
+            n as usize,
+            "scan must cross the segment boundary"
+        );
         assert!(scanned.windows(2).all(|w| w[0] < w[1]));
         assert_eq!((0..n).collect::<Vec<_>>(), scanned);
     }
@@ -1247,7 +1334,9 @@ mod tests {
         for t in 0..4u64 {
             let db = Arc::clone(&db);
             handles.push(std::thread::spawn(move || {
-                (0..8u64).map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap()).collect::<Vec<_>>()
+                (0..8u64)
+                    .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                    .collect::<Vec<_>>()
             }));
         }
         for h in handles {
@@ -1257,10 +1346,17 @@ mod tests {
 
         all_ids.sort();
         let pivot = all_ids[10];
-        let tail: Vec<u64> = db.replay_from(pivot).unwrap()
-            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
+        let tail: Vec<u64> = db
+            .replay_from(pivot)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
         let want: Vec<u64> = all_ids.iter().copied().filter(|&id| id >= pivot).collect();
-        assert_eq!(tail, want, "replay_from must return the ordered tail across shards");
+        assert_eq!(
+            tail, want,
+            "replay_from must return the ordered tail across shards"
+        );
     }
 
     // ── cr-003 Phase 4: per-shard crash recovery ──────────────────────────
@@ -1299,13 +1395,24 @@ mod tests {
         // Session 2: reopen — recovery must run per shard and preserve every record.
         let db = LogDb::open(config).unwrap();
         let scanned: Vec<u64> = db
-            .scan(0, u64::MAX).unwrap()
+            .scan(0, u64::MAX)
+            .unwrap()
             .filter_map(|r| r.ok())
             .map(|r| r.id.sequence)
             .collect();
-        assert_eq!(scanned.len(), all_ids.len(), "reopen must preserve every record across shards");
-        assert!(all_ids.iter().all(|id| scanned.contains(id)), "reopen lost some ids");
-        assert!(scanned.windows(2).all(|w| w[0] < w[1]), "scanned ids must be strictly ascending");
+        assert_eq!(
+            scanned.len(),
+            all_ids.len(),
+            "reopen must preserve every record across shards"
+        );
+        assert!(
+            all_ids.iter().all(|id| scanned.contains(id)),
+            "reopen lost some ids"
+        );
+        assert!(
+            scanned.windows(2).all(|w| w[0] < w[1]),
+            "scanned ids must be strictly ascending"
+        );
     }
 
     #[test]
@@ -1333,16 +1440,23 @@ mod tests {
 
         let db = LogDb::open(config).unwrap();
         let scanned: Vec<u64> = db
-            .scan(0, u64::MAX).unwrap()
+            .scan(0, u64::MAX)
+            .unwrap()
             .filter_map(|r| r.ok())
             .map(|r| r.id.sequence)
             .collect();
-        assert_eq!(scanned, ids, "empty shards must not lose the written shard's records");
+        assert_eq!(
+            scanned, ids,
+            "empty shards must not lose the written shard's records"
+        );
         // The empty shards resume at local 0; a fresh append must still produce a
         // collision-free global id and be readable.
         let nid = db.append(b"after-reopen").unwrap();
         db.flush().unwrap();
-        assert!(db.read(nid).unwrap().is_some(), "post-reopen append must read back");
+        assert!(
+            db.read(nid).unwrap().is_some(),
+            "post-reopen append must read back"
+        );
     }
 
     #[test]
@@ -1399,7 +1513,11 @@ mod tests {
         }
         // Every old id is still readable after the post-reopen appends.
         for id in &all_ids {
-            assert!(db.read(*id).unwrap().is_some(), "old id {} lost after reopen+append", id);
+            assert!(
+                db.read(*id).unwrap().is_some(),
+                "old id {} lost after reopen+append",
+                id
+            );
         }
     }
 
@@ -1426,7 +1544,11 @@ mod tests {
         // Corrupt the non-empty shard's active segment: chop 5 bytes off the end
         // (mid-record) → the last record becomes a torn tail.
         let victim = (0..2u32)
-            .map(|s| dir.path().join(format!("s{}", s)).join("segment-00000001.log"))
+            .map(|s| {
+                dir.path()
+                    .join(format!("s{}", s))
+                    .join("segment-00000001.log")
+            })
             .find(|p| p.exists() && std::fs::metadata(p).map(|m| m.len() > 200).unwrap_or(false))
             .expect("some shard must have received records");
         let len = std::fs::metadata(&victim).unwrap().len();
@@ -1441,7 +1563,8 @@ mod tests {
         // (The pre-fix stride bug truncated to a single record; this guards that.)
         let db = LogDb::open(config).unwrap();
         let scanned: Vec<Vec<u8>> = db
-            .scan(0, u64::MAX).unwrap()
+            .scan(0, u64::MAX)
+            .unwrap()
             .filter_map(|r| r.ok())
             .map(|r| r.content)
             .collect();
@@ -1470,7 +1593,10 @@ mod tests {
         };
         // shards=1 goes through the same unified per-shard loop (shard_bits=0).
         let db = LogDb::open(config).unwrap();
-        let rec = db.read(id).unwrap().expect("shards=1 record must survive reopen");
+        let rec = db
+            .read(id)
+            .unwrap()
+            .expect("shards=1 record must survive reopen");
         assert_eq!(rec.content, b"shards1-recovery");
         // Resume + append, no collision.
         let nid = db.append(b"after").unwrap();
@@ -1526,12 +1652,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        assert_eq!(got.len(), total as usize, "tailer must see every record across ALL shards");
-        assert!(got.windows(2).all(|w| w[0] < w[1]), "tailer batch must be ascending global id");
-        assert!(all_ids.iter().all(|id| got.contains(id)), "tailer missing some ids: got={:?}", got);
+        assert_eq!(
+            got.len(),
+            total as usize,
+            "tailer must see every record across ALL shards"
+        );
+        assert!(
+            got.windows(2).all(|w| w[0] < w[1]),
+            "tailer batch must be ascending global id"
+        );
+        assert!(
+            all_ids.iter().all(|id| got.contains(id)),
+            "tailer missing some ids: got={:?}",
+            got
+        );
         // Records must come from more than one shard (proves cross-shard merge).
-        let shards_seen: std::collections::HashSet<usize> =
-            got.iter().map(|&g| crate::shard::decode_record_id(g, 2).0).collect();
+        let shards_seen: std::collections::HashSet<usize> = got
+            .iter()
+            .map(|&g| crate::shard::decode_record_id(g, 2).0)
+            .collect();
         assert!(
             shards_seen.len() > 1,
             "tailer should have merged multiple shards, saw {:?}",
@@ -1650,7 +1789,10 @@ mod tests {
         all.extend(rest);
         all.sort();
         all_ids.sort();
-        assert_eq!(all, all_ids, "commit+reopen must deliver every record exactly once");
+        assert_eq!(
+            all, all_ids,
+            "commit+reopen must deliver every record exactly once"
+        );
     }
 
     #[test]
@@ -1924,7 +2066,9 @@ mod tests {
         }
         db.flush().unwrap();
         for _ in 0..50 {
-            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() + more_ids.len() {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count()
+                >= all_ids.len() + more_ids.len()
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1936,7 +2080,11 @@ mod tests {
         // Retry briefly: a read may transiently miss if the per-shard manifest
         // hasn't yet observed a just-deleted segment's dir mtime — a persistent
         // None (real data loss) survives the retries and fails the assert.
-        for id in all_ids.iter().chain(more_ids.iter()).filter(|&&id| id >= cp) {
+        for id in all_ids
+            .iter()
+            .chain(more_ids.iter())
+            .filter(|&&id| id >= cp)
+        {
             let mut ok = false;
             for _ in 0..10 {
                 if db.read(*id).unwrap().is_some() {
@@ -1993,9 +2141,16 @@ mod tests {
         // At least two segment files exist in some shard dir (a roll happened).
         let rolled = (0..2).any(|s| {
             std::fs::read_dir(dir.path().join(format!("s{}", s)))
-                .map(|rd| rd.filter_map(|e| e.ok())
-                    .filter(|e| e.file_name().to_str().map_or(false, |n| n.ends_with(".log")))
-                    .count() >= 2)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .map_or(false, |n| n.ends_with(".log"))
+                        })
+                        .count()
+                        >= 2
+                })
                 .unwrap_or(false)
         });
         assert!(rolled, "test should have triggered a segment roll");
@@ -2003,10 +2158,13 @@ mod tests {
         // Every appended id must be readable by global id, including those in
         // non-first segments (this is what the base_sequence fix preserves).
         for id in &all_ids {
-            assert!(db.read(*id).unwrap().is_some(), "point read of id {} failed across segment roll", id);
+            assert!(
+                db.read(*id).unwrap().is_some(),
+                "point read of id {} failed across segment roll",
+                id
+            );
         }
     }
-
 
     #[test]
     fn retention_maxbytes_applies_per_shard() {
@@ -2050,13 +2208,22 @@ mod tests {
             let bytes: u64 = std::fs::read_dir(&sd)
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_str().map_or(false, |n| n.ends_with(".log")))
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map_or(false, |n| n.ends_with(".log"))
+                })
                 .filter_map(|e| e.metadata().ok())
                 .map(|m| m.len())
                 .sum();
             // Retention evicts whole segments only after a roll; with a 2MB cap
             // and 1MB segments, each shard holds at most a few segments.
-            assert!(bytes <= 4 * 1024 * 1024, "shard {} retained {} bytes (retention not applied)", s, bytes);
+            assert!(
+                bytes <= 4 * 1024 * 1024,
+                "shard {} retained {} bytes (retention not applied)",
+                s,
+                bytes
+            );
         }
     }
 
@@ -2095,20 +2262,35 @@ mod tests {
         // Every id decodes to a valid shard (< 3) and reads back.
         for id in &all_ids {
             let (shard, _local) = crate::shard::decode_record_id(*id, 2);
-            assert!(shard < 3, "non-power-of-2 must not produce shard id >= num_shards");
+            assert!(
+                shard < 3,
+                "non-power-of-2 must not produce shard id >= num_shards"
+            );
             assert!(db.read(*id).unwrap().is_some(), "id {} must read back", id);
         }
-        let scanned: Vec<u64> = db.scan(0, u64::MAX).unwrap()
-            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
+        let scanned: Vec<u64> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
         assert_eq!(scanned.len(), all_ids.len());
         assert!(scanned.windows(2).all(|w| w[0] < w[1]));
 
         // Reopen preserves everything (per-shard recovery).
         drop(db);
         let db = LogDb::open(config).unwrap();
-        let rescanned: Vec<u64> = db.scan(0, u64::MAX).unwrap()
-            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
-        assert_eq!(rescanned.len(), all_ids.len(), "non-power-of-2 shards must survive reopen");
+        let rescanned: Vec<u64> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(
+            rescanned.len(),
+            all_ids.len(),
+            "non-power-of-2 shards must survive reopen"
+        );
     }
 
     #[test]
@@ -2138,7 +2320,11 @@ mod tests {
         let reader = std::thread::spawn(move || {
             let mut last = 0usize;
             for _ in 0..20 {
-                let n = db3.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+                let n = db3
+                    .scan(0, u64::MAX)
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .count();
                 if n > last {
                     last = n;
                 }
@@ -2166,7 +2352,11 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(got.len(), total as usize, "tailer must deliver all under concurrency");
+        assert_eq!(
+            got.len(),
+            total as usize,
+            "tailer must deliver all under concurrency"
+        );
         assert!(ids.iter().all(|id| got.contains(id)));
     }
 
@@ -2243,7 +2433,11 @@ mod tests {
             .filter_map(|r| r.ok())
             .map(|r| r.id.sequence)
             .collect();
-        let want: Vec<u64> = ids.iter().copied().filter(|&id| id >= from && id < to).collect();
+        let want: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|&id| id >= from && id < to)
+            .collect();
         assert_eq!(got, want, "range scan must be exact after buffering");
     }
 
@@ -2319,10 +2513,17 @@ mod tests {
             .filter_map(|r| r.ok())
             .map(|r| r.id.sequence)
             .collect();
-        assert_eq!(scanned.len(), all_ids.len(), "compressed scan must see all shards");
+        assert_eq!(
+            scanned.len(),
+            all_ids.len(),
+            "compressed scan must see all shards"
+        );
         assert!(scanned.windows(2).all(|w| w[0] < w[1]));
         for (id, expected) in &by_id {
-            let rec = db.read(*id).unwrap().expect("compressed point read under shards>1");
+            let rec = db
+                .read(*id)
+                .unwrap()
+                .expect("compressed point read under shards>1");
             assert_eq!(&rec.content, expected, "content mismatch for id {}", id);
         }
 
@@ -2335,7 +2536,11 @@ mod tests {
             .filter_map(|r| r.ok())
             .map(|r| r.id.sequence)
             .collect();
-        assert_eq!(rescanned.len(), all_ids.len(), "compressed shards>1 must survive reopen");
+        assert_eq!(
+            rescanned.len(),
+            all_ids.len(),
+            "compressed shards>1 must survive reopen"
+        );
     }
 
     #[cfg(feature = "encryption")]
@@ -2385,10 +2590,17 @@ mod tests {
             .filter_map(|r| r.ok())
             .map(|r| r.id.sequence)
             .collect();
-        assert_eq!(scanned.len(), all_ids.len(), "encrypted scan must see all shards");
+        assert_eq!(
+            scanned.len(),
+            all_ids.len(),
+            "encrypted scan must see all shards"
+        );
         assert!(scanned.windows(2).all(|w| w[0] < w[1]));
         for (id, expected) in &by_id {
-            let rec = db.read(*id).unwrap().expect("encrypted point read under shards>1");
+            let rec = db
+                .read(*id)
+                .unwrap()
+                .expect("encrypted point read under shards>1");
             assert_eq!(&rec.content, expected, "content mismatch for id {}", id);
         }
 
@@ -2400,7 +2612,11 @@ mod tests {
             .filter_map(|r| r.ok())
             .map(|r| r.id.sequence)
             .collect();
-        assert_eq!(rescanned.len(), all_ids.len(), "encrypted shards>1 must survive reopen");
+        assert_eq!(
+            rescanned.len(),
+            all_ids.len(),
+            "encrypted shards>1 must survive reopen"
+        );
     }
 
     #[cfg(feature = "compression")]
@@ -2457,11 +2673,20 @@ mod tests {
         }
 
         // At least two segment files exist (a roll happened).
-        let segs = std::fs::read_dir(dir.path()).unwrap()
+        let segs = std::fs::read_dir(dir.path())
+            .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_str().map_or(false, |n| n.ends_with(".log")))
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map_or(false, |n| n.ends_with(".log"))
+            })
             .count();
-        assert!(segs >= 2, "expected a frame-mode segment roll, found {}", segs);
+        assert!(
+            segs >= 2,
+            "expected a frame-mode segment roll, found {}",
+            segs
+        );
 
         // Frame-mode RecordIter must cross the roll and return all records,
         // with correct (decrypted/decompressed) content.
@@ -2471,13 +2696,21 @@ mod tests {
             .filter_map(|r| r.ok())
             .map(|r| (r.id.sequence, r.content.clone()))
             .collect();
-        assert_eq!(scanned.len(), n as usize, "frame-mode scan must cross the segment roll");
+        assert_eq!(
+            scanned.len(),
+            n as usize,
+            "frame-mode scan must cross the segment roll"
+        );
         assert_eq!(
             scanned.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             (0..n).collect::<Vec<_>>(),
         );
         for (id, content) in &scanned {
-            assert_eq!(content, &payloads[*id as usize], "content mismatch for id {}", id);
+            assert_eq!(
+                content, &payloads[*id as usize],
+                "content mismatch for id {}",
+                id
+            );
         }
     }
 }

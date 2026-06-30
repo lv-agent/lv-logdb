@@ -84,13 +84,13 @@ impl ShardMap {
     /// Each ring gets `ring_size / num_shards` slots so the total slot count
     /// across all shards equals `ring_size`. `initial_seq` is the per-shard
     /// starting LOCAL sequence (0 for fresh, last_local+1 for recovery).
-    pub fn new(
-        num_shards: usize,
-        ring_size: usize,
-        hash_enabled: bool,
-        initial_seq: u64,
-    ) -> Self {
-        Self::new_with_initial(num_shards, ring_size, hash_enabled, &vec![initial_seq; num_shards])
+    pub fn new(num_shards: usize, ring_size: usize, hash_enabled: bool, initial_seq: u64) -> Self {
+        Self::new_with_initial(
+            num_shards,
+            ring_size,
+            hash_enabled,
+            &vec![initial_seq; num_shards],
+        )
     }
 
     /// Create a ShardMap where each shard's ring resumes from its OWN
@@ -186,7 +186,11 @@ impl ShardMap {
     /// batch append. Returns `(global_first_id, shard_id, local_first_seq)`.
     /// The whole batch is reserved all-or-none (see [`Ring::claim_batch`]).
     #[inline]
-    pub fn claim_batch(&self, n: u64, policy: QueueFullPolicy) -> Result<(u64, usize, u64), AppendError> {
+    pub fn claim_batch(
+        &self,
+        n: u64,
+        policy: QueueFullPolicy,
+    ) -> Result<(u64, usize, u64), AppendError> {
         let shard_id = self.select_shard();
         let ring = &self.rings[shard_id];
         let local_seq = ring.claim_batch(n, policy)?;
@@ -226,13 +230,19 @@ impl ShardMap {
 
     /// Per-shard producer cursors (snapshot for flush/drain).
     pub fn producer_cursors(&self) -> Vec<u64> {
-        self.rings.iter().map(|r| r.producer_cursor_value()).collect()
+        self.rings
+            .iter()
+            .map(|r| r.producer_cursor_value())
+            .collect()
     }
 
     /// Per-shard durable cursors.
     pub fn durable_cursors(&self) -> Vec<u64> {
         use std::sync::atomic::Ordering;
-        self.rings.iter().map(|r| r.durable_cursor.load(Ordering::Acquire)).collect()
+        self.rings
+            .iter()
+            .map(|r| r.durable_cursor.load(Ordering::Acquire))
+            .collect()
     }
 }
 
@@ -277,9 +287,11 @@ mod tests {
                 for seq in [0u64, 1, 100, u32::MAX as u64] {
                     let global = encode_record_id(shard_id, seq, sb);
                     let (decoded_shard, decoded_seq) = decode_record_id(global, sb);
-                    assert_eq!(decoded_shard, shard_id,
+                    assert_eq!(
+                        decoded_shard, shard_id,
                         "shards={} sb={} shard_id={} seq={} global={}",
-                        shards, sb, shard_id, seq, global);
+                        shards, sb, shard_id, seq, global
+                    );
                     assert_eq!(decoded_seq, seq);
                 }
             }
@@ -353,17 +365,17 @@ mod tests {
                 let shard_id = sm.select_shard();
                 // Same thread should always get the same shard
                 for _ in 0..100 {
-                    assert_eq!(sm.select_shard(), shard_id,
-                        "thread shard selection should be stable");
+                    assert_eq!(
+                        sm.select_shard(),
+                        shard_id,
+                        "thread shard selection should be stable"
+                    );
                 }
                 shard_id
             }));
         }
 
-        let shard_ids: Vec<usize> = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect();
+        let shard_ids: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         // Not all threads should go to the same shard
         let unique: HashSet<usize> = shard_ids.iter().copied().collect();

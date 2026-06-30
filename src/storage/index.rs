@@ -36,18 +36,19 @@ impl IndexEntry {
     /// Deserialize from a byte buffer.
     pub fn deserialize(buf: &[u8]) -> Self {
         let record_id = u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3],
-            buf[4], buf[5], buf[6], buf[7],
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         ]);
         let file_offset = u64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11],
-            buf[12], buf[13], buf[14], buf[15],
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ]);
         let timestamp_ns = u64::from_le_bytes([
-            buf[16], buf[17], buf[18], buf[19],
-            buf[20], buf[21], buf[22], buf[23],
+            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
         ]);
-        Self { sequence: record_id, file_offset, timestamp_ns }
+        Self {
+            sequence: record_id,
+            file_offset,
+            timestamp_ns,
+        }
     }
 }
 
@@ -74,7 +75,11 @@ impl SparseIndex {
 
     /// Add an entry to the index.
     pub fn add(&mut self, sequence: u64, file_offset: u64, timestamp_ns: u64) {
-        self.entries.push(IndexEntry { sequence, file_offset, timestamp_ns });
+        self.entries.push(IndexEntry {
+            sequence,
+            file_offset,
+            timestamp_ns,
+        });
     }
 
     /// Check if a record should be indexed based on the stride.
@@ -92,10 +97,13 @@ impl SparseIndex {
             return None;
         }
         // Binary search for the largest entry with record_id <= target
-        let idx = match self.entries.binary_search_by(|e| e.sequence.cmp(&record_id)) {
-            Ok(pos) => pos,        // exact match
+        let idx = match self
+            .entries
+            .binary_search_by(|e| e.sequence.cmp(&record_id))
+        {
+            Ok(pos) => pos,                 // exact match
             Err(pos) if pos > 0 => pos - 1, // insertion point, take previous
-            _ => return None,       // target is before the first entry
+            _ => return None,               // target is before the first entry
         };
         Some((self.entries[idx], idx))
     }
@@ -105,7 +113,10 @@ impl SparseIndex {
     /// Returns the index position for time-based queries.
     /// Returns `0` if the timestamp is before all entries.
     pub fn find_by_time(&self, timestamp_ns: u64) -> usize {
-        match self.entries.binary_search_by(|e| e.timestamp_ns.cmp(&timestamp_ns)) {
+        match self
+            .entries
+            .binary_search_by(|e| e.timestamp_ns.cmp(&timestamp_ns))
+        {
             Ok(pos) => pos,
             Err(pos) => pos.saturating_sub(1), // go one before to ensure coverage
         }
@@ -174,7 +185,11 @@ mod tests {
 
     #[test]
     fn index_entry_round_trip() {
-        let entry = IndexEntry { sequence: 42, file_offset: 1024, timestamp_ns: 5000 };
+        let entry = IndexEntry {
+            sequence: 42,
+            file_offset: 1024,
+            timestamp_ns: 5000,
+        };
         let mut buf = [0u8; IndexEntry::SERIALIZED_SIZE];
         entry.serialize(&mut buf);
         let decoded = IndexEntry::deserialize(&buf);

@@ -18,13 +18,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use format::{
-    record_size, SegmentHeader, FLAG_HASH_ENABLED, FLAG_COMPRESSED_ZSTD,
-    SEGMENT_HEADER_SIZE, FRAME_HEADER_SIZE, HEADER_CRC_END, write_frame_header, ENCRYPTION_NONCE_SIZE,
+    record_size, write_frame_header, SegmentHeader, ENCRYPTION_NONCE_SIZE, FLAG_COMPRESSED_ZSTD,
+    FLAG_HASH_ENABLED, FRAME_HEADER_SIZE, HEADER_CRC_END, SEGMENT_HEADER_SIZE,
 };
 
+use crate::config::RetentionPolicy;
 use crate::platform;
 use crate::ring::Ring;
-use crate::config::RetentionPolicy;
 
 // ── Error type ─────────────────────────────────────────────────────────────
 
@@ -115,11 +115,13 @@ impl ActiveSegment {
     }
 
     /// Open an existing segment file for reading and appending (used during recovery).
-    fn open_existing(path: PathBuf, _segment_id: u32, offset: u64, header: &SegmentHeader) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .open(&path)?;
+    fn open_existing(
+        path: PathBuf,
+        _segment_id: u32,
+        offset: u64,
+        header: &SegmentHeader,
+    ) -> io::Result<Self> {
+        let file = OpenOptions::new().write(true).read(true).open(&path)?;
 
         Ok(Self {
             file,
@@ -283,16 +285,24 @@ pub struct SegmentManager {
 fn encrypt_if_enabled(key: &Option<[u8; 32]>, plaintext: &[u8]) -> Result<Vec<u8>, SegmentError> {
     #[cfg(feature = "encryption")]
     if let Some(k) = key {
-        use aes_gcm::{Aes256Gcm, Key, Nonce};
         use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
         let key = Key::<Aes256Gcm>::from_slice(k);
         let cipher = Aes256Gcm::new(key);
         let mut nonce_bytes = [0u8; ENCRYPTION_NONCE_SIZE];
-        getrandom::getrandom(&mut nonce_bytes)
-            .map_err(|e| SegmentError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+        getrandom::getrandom(&mut nonce_bytes).map_err(|e| {
+            SegmentError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("{:?}", e),
+            ))
+        })?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ct = cipher.encrypt(nonce, plaintext)
-            .map_err(|_| SegmentError::Io(std::io::Error::new(std::io::ErrorKind::Other, "encryption failed")))?;
+        let ct = cipher.encrypt(nonce, plaintext).map_err(|_| {
+            SegmentError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "encryption failed",
+            ))
+        })?;
         let mut result = Vec::with_capacity(ENCRYPTION_NONCE_SIZE + ct.len());
         result.extend_from_slice(&nonce_bytes);
         result.extend_from_slice(&ct);
@@ -336,10 +346,25 @@ impl SegmentManager {
         fs::create_dir_all(&dir)?;
 
         let segment_id = 1;
-        let mut flags = if hash_enabled { format::FLAG_HASH_ENABLED } else { 0 };
-        if compressed { flags |= format::FLAG_COMPRESSED_ZSTD; }
-        if encryption_key.is_some() { flags |= format::FLAG_ENCRYPTED_AES256GCM; }
-        let mut header = SegmentHeader::first_segment(hash_init, base_sequence, 0, segment_id, hash_enabled, format::HASH_ALGO_BLAKE3);
+        let mut flags = if hash_enabled {
+            format::FLAG_HASH_ENABLED
+        } else {
+            0
+        };
+        if compressed {
+            flags |= format::FLAG_COMPRESSED_ZSTD;
+        }
+        if encryption_key.is_some() {
+            flags |= format::FLAG_ENCRYPTED_AES256GCM;
+        }
+        let mut header = SegmentHeader::first_segment(
+            hash_init,
+            base_sequence,
+            0,
+            segment_id,
+            hash_enabled,
+            format::HASH_ALGO_BLAKE3,
+        );
         header.flags = flags;
         let active = ActiveSegment::create(&dir, segment_id, &header, [0u8; 32], compressed)?;
 
@@ -417,12 +442,7 @@ impl SegmentManager {
     /// records have been written yet — the caller should `roll()` and retry.
     /// Partial writes (some records fit, some don't) are handled by stopping
     /// early; the caller advances committed_cursor to the last written seq.
-    pub fn append_batch(
-        &mut self,
-        ring: &Ring,
-        from: u64,
-        to: u64,
-    ) -> Result<u64, SegmentError> {
+    pub fn append_batch(&mut self, ring: &Ring, from: u64, to: u64) -> Result<u64, SegmentError> {
         let start_offset = self.active.offset;
         let mut pos = 0usize;
         let mut last_written = from.wrapping_sub(1);
@@ -433,7 +453,10 @@ impl SegmentManager {
             let need = record_size(view.content.len());
 
             // Check if this record fits
-            if !self.active.has_room(pos as u64 + need as u64, self.segment_size) {
+            if !self
+                .active
+                .has_room(pos as u64 + need as u64, self.segment_size)
+            {
                 if pos == 0 {
                     // Even the first record doesn't fit → roll needed.
                     return Err(SegmentError::Full);
@@ -478,8 +501,9 @@ impl SegmentManager {
                 let payload = if self.active.compressed {
                     #[cfg(feature = "compression")]
                     {
-                        let compressed = zstd::encode_all(raw, 0)
-                            .map_err(|e| SegmentError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                        let compressed = zstd::encode_all(raw, 0).map_err(|e| {
+                            SegmentError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                        })?;
                         encrypt_if_enabled(&self.encryption_key, &compressed)?
                     }
                     #[cfg(not(feature = "compression"))]
@@ -493,7 +517,8 @@ impl SegmentManager {
                 let mut frame_buf = [0u8; FRAME_HEADER_SIZE];
                 write_frame_header(&mut frame_buf, payload.len() as u32, pos as u32);
                 self.active.pwrite_all(start_offset, &frame_buf)?;
-                self.active.pwrite_all(start_offset + FRAME_HEADER_SIZE as u64, &payload)?;
+                self.active
+                    .pwrite_all(start_offset + FRAME_HEADER_SIZE as u64, &payload)?;
                 self.active.offset = start_offset + FRAME_HEADER_SIZE as u64 + payload.len() as u64;
                 self.active.decompressed_offset += pos as u64;
                 self.active.frame_number += 1;
@@ -531,10 +556,19 @@ impl SegmentManager {
         }
 
         let new_id = self.active_id + 1;
-        let base_sequence = crate::shard::encode_record_id(self.shard_id, next_local_seq, self.shard_bits);
-        let mut flags = if self.hash_enabled { FLAG_HASH_ENABLED } else { 0 } | format::FLAG_NOT_FIRST;
-        if self.compressed { flags |= FLAG_COMPRESSED_ZSTD; }
-        if self.encryption_key.is_some() { flags |= format::FLAG_ENCRYPTED_AES256GCM; }
+        let base_sequence =
+            crate::shard::encode_record_id(self.shard_id, next_local_seq, self.shard_bits);
+        let mut flags = if self.hash_enabled {
+            FLAG_HASH_ENABLED
+        } else {
+            0
+        } | format::FLAG_NOT_FIRST;
+        if self.compressed {
+            flags |= FLAG_COMPRESSED_ZSTD;
+        }
+        if self.encryption_key.is_some() {
+            flags |= format::FLAG_ENCRYPTED_AES256GCM;
+        }
         let new_header = SegmentHeader {
             format_version: format::FORMAT_VERSION,
             flags,
@@ -549,7 +583,13 @@ impl SegmentManager {
             record_format: format::RECORD_FORMAT_V1,
         };
 
-        let seg = ActiveSegment::create(&self.dir, new_id, &new_header, self.last_hash, self.compressed)?;
+        let seg = ActiveSegment::create(
+            &self.dir,
+            new_id,
+            &new_header,
+            self.last_hash,
+            self.compressed,
+        )?;
         // We do NOT fsync the pre-allocated header here. The prepared segment
         // only becomes authoritative when roll() swaps it to active, and its
         // header + data are fsynced together by the next `sync_all` (which
@@ -592,9 +632,17 @@ impl SegmentManager {
         } else {
             // Fallback: create new segment inline, fsync old in background.
             let new_id = self.active_id + 1;
-            let mut flags = if self.hash_enabled { FLAG_HASH_ENABLED } else { 0 } | format::FLAG_NOT_FIRST;
-            if self.compressed { flags |= FLAG_COMPRESSED_ZSTD; }
-            if self.encryption_key.is_some() { flags |= format::FLAG_ENCRYPTED_AES256GCM; }
+            let mut flags = if self.hash_enabled {
+                FLAG_HASH_ENABLED
+            } else {
+                0
+            } | format::FLAG_NOT_FIRST;
+            if self.compressed {
+                flags |= FLAG_COMPRESSED_ZSTD;
+            }
+            if self.encryption_key.is_some() {
+                flags |= format::FLAG_ENCRYPTED_AES256GCM;
+            }
             let new_header = SegmentHeader {
                 format_version: format::FORMAT_VERSION,
                 flags,
@@ -609,7 +657,13 @@ impl SegmentManager {
                 record_format: format::RECORD_FORMAT_V1,
             };
 
-            let new_active = ActiveSegment::create(&self.dir, new_id, &new_header, self.last_hash, self.compressed)?;
+            let new_active = ActiveSegment::create(
+                &self.dir,
+                new_id,
+                &new_header,
+                self.last_hash,
+                self.compressed,
+            )?;
             // Fsync new header before swap (small, fast: 128 bytes)
             new_active.fdatasync()?;
             let dir_file = File::open(&self.dir)?;
@@ -783,8 +837,7 @@ impl SegmentManager {
         let mut file = File::open(path)?;
         let mut buf = [0u8; SEGMENT_HEADER_SIZE];
         file.read_exact(&mut buf)?;
-        SegmentHeader::deserialize(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        SegmentHeader::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     fn read_segment_header_by_id(dir: &Path, seg_id: u32) -> io::Result<SegmentHeader> {
@@ -879,8 +932,8 @@ impl SegmentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ring::Ring;
     use crate::config::QueueFullPolicy;
+    use crate::ring::Ring;
 
     fn make_ring() -> Ring {
         Ring::new(64, false, 0)
@@ -895,14 +948,19 @@ mod tests {
         for i in 0..10 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
             let content = format!("record-{}", i);
-            unsafe { ring.slot(seq).producer_write(seq, i * 100, content.as_bytes()); }
+            unsafe {
+                ring.slot(seq)
+                    .producer_write(seq, i * 100, content.as_bytes());
+            }
             ring.slot(seq).publish(seq);
         }
 
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024, // 1MB segment
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -921,7 +979,9 @@ mod tests {
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1024, // tiny segment to force roll
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -950,14 +1010,18 @@ mod tests {
 
         // Publish one record
         let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-        unsafe { ring.slot(seq).producer_write(seq, 0, b"hello"); }
+        unsafe {
+            ring.slot(seq).producer_write(seq, 0, b"hello");
+        }
         ring.slot(seq).publish(seq);
 
         // Create a segment with only header room
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             SEGMENT_HEADER_SIZE as u64 + 10, // barely larger than header
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -974,7 +1038,9 @@ mod tests {
         let mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -990,7 +1056,9 @@ mod tests {
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -1013,7 +1081,9 @@ mod tests {
         SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -1030,7 +1100,9 @@ mod tests {
         let mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             42,
@@ -1048,13 +1120,17 @@ mod tests {
         // Create a large record
         let content = vec![0x42u8; 100_000];
         let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-        unsafe { ring.slot(seq).producer_write(seq, 0, &content); }
+        unsafe {
+            ring.slot(seq).producer_write(seq, 0, &content);
+        }
         ring.slot(seq).publish(seq);
 
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             10 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -1076,14 +1152,18 @@ mod tests {
         let ring = make_ring();
         for i in 0..5 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-            unsafe { ring.slot(seq).producer_write(seq, i * 10, b"roll-test"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, i * 10, b"roll-test");
+            }
             ring.slot(seq).publish(seq);
         }
 
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -1120,14 +1200,18 @@ mod tests {
         let ring = make_ring();
         for i in 0..3u64 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-            unsafe { ring.slot(seq).producer_write(seq, 1000 + i * 100, b"ts"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, 1000 + i * 100, b"ts");
+            }
             ring.slot(seq).publish(seq);
         }
 
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -1141,7 +1225,10 @@ mod tests {
         let path = dir.path().join("segment-00000001.log");
         let header = SegmentManager::read_segment_header(&path)
             .expect("rolled segment header must pass CRC validation");
-        assert_eq!(header.segment_id, 1, "segment_id must not be clobbered by ts backfill");
+        assert_eq!(
+            header.segment_id, 1,
+            "segment_id must not be clobbered by ts backfill"
+        );
         assert_eq!(header.min_timestamp_ns, 1000);
         assert_eq!(header.max_timestamp_ns, 1200);
     }
@@ -1158,13 +1245,17 @@ mod tests {
         let ring = make_ring();
         for i in 0..5u64 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-            unsafe { ring.slot(seq).producer_write(seq, i * 10, b"fd"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, i * 10, b"fd");
+            }
             ring.slot(seq).publish(seq);
         }
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,
@@ -1182,7 +1273,8 @@ mod tests {
         assert!(
             after < before + 32,
             "fd leak: before={} after={} after 200 rolls (paths should hold no fd)",
-            before, after
+            before,
+            after
         );
         // sync_all must still drain the accumulated paths (reopen-by-path works).
         mgr.sync_all().unwrap();
@@ -1199,13 +1291,17 @@ mod tests {
         let ring = make_ring();
         for i in 0..15u64 {
             let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-            unsafe { ring.slot(seq).producer_write(seq, i * 10, b"cp"); }
+            unsafe {
+                ring.slot(seq).producer_write(seq, i * 10, b"cp");
+            }
             ring.slot(seq).publish(seq);
         }
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
             1 * 1024 * 1024,
-            false, false, None,
+            false,
+            false,
+            None,
             [0u8; 32],
             RetentionPolicy::KeepAll,
             0,

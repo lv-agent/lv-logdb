@@ -128,6 +128,8 @@ This material is for two audiences only:
 
 A public push API is a **known gap** and would need a separate design doc (`veps/cr-NNN-…`). Do not expose these types ad hoc; see [Contributing](contributing.md).
 
+> **Sharding:** the Pusher is currently **single-shard** — `run_pusher` takes one `Ring` and one `data_dir`, and tracks a single `push_seq`. `shards > 1` plus remote push is therefore **not supported** today. When a public push API is designed, the Pusher must be made cross-shard (per-shard push positions + merged-batch delivery, matching the tailer's model); do not publicize push without that work.
+
 ## Durability guardrails: do / don't
 
 Any extension that touches cursors, on-disk structures, or the append path must respect these invariants.

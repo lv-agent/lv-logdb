@@ -2,6 +2,8 @@
 
 Sharding splits logdb's write path across multiple independent rings so that appenders on different threads do not contend on a single queue. Set `Config.shards` to the number of rings; each shard has its own ring buffer, cursors, and producer threads. This page covers the sequence-number mapping, the v1.1 hash-chain incompatibility, and when to shard versus staying single-shard.
 
+> **Production readiness:** as of 0.2.0, `shards > 1` is end-to-end functional and durable — append, point read, range scan/replay, crash recovery, and tailers all work correctly across shards (including non-power-of-two shard counts and segment rolls). The one remaining limitation is feature-scoped, not correctness-scoped: `hash-chain` requires `shards == 1` (see below). Remote push (`replicate`/Pusher) is single-shard today.
+
 ## Contents
 
 - [Multiple rings](#multiple-rings)

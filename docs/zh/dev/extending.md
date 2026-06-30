@@ -128,6 +128,8 @@ Pusher 读取 durable 记录，成功后推进 `push_seq`，并按 `config.push_
 
 公开推送 API 是一项**已知缺口**，需要单独的设计文档（`veps/cr-NNN-…`）。切勿随意把这些类型暴露出去；参见 [Contributing](contributing.md)。
 
+> **分片：**Pusher 目前是**单分片**的——`run_pusher` 只接收一个 `Ring` 和一个 `data_dir`，并只跟踪单个 `push_seq`。因此 `shards > 1` 加远程推送**目前不支持**。在设计公开推送 API 时，必须把 Pusher 跨分片化（每分片推送进度 + 合并批次交付，与 tailer 的模型一致）；在此之前不要把推送公开化。
+
 ## 耐久性护栏：宜 / 忌
 
 任何触及游标、盘上结构或 append 路径的扩展，都必须遵守以下不变量。

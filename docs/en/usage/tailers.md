@@ -58,7 +58,7 @@ let mut t2 = db.new_tailer("replicator");
 assert_eq!(t2.position(), 100);
 ```
 
-> The tailer reads from shard 0's ring. The `name` must be a filesystem-safe identifier — it is interpolated directly into the progress filename `tailer_<name>.dat`.
+> Under `shards > 1`, the tailer tracks **per-shard** progress (one local sequence per shard, like Kafka per-partition offsets) and `next_batch` merges every shard's newly-durable records into one batch ordered by ascending global id. A stalled shard never blocks the others; cross-batch ordering is best-effort (a stalled shard's lower-global-id records may arrive in a later batch). The `name` must be a filesystem-safe identifier — it is interpolated directly into the progress filename `tailer_<name>.dat`. The progress file keeps the legacy 12-byte format for `shards == 1` and a `count + seqs + crc32c` vector format for `shards > 1`. `position()` returns the minimum per-shard position (a coarse progress indicator); `positions()` returns the full per-shard vector.
 
 ## The Tailer API
 

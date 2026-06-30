@@ -41,6 +41,8 @@ let (mut seg_mgr, initial_seq, last_hash, hash_init) = if data_dir.exists()
 
 恢复从磁盘上的段文件重建日志（`src/recovery.rs`）。算法步骤（`src/recovery.rs:7-17`，§15）：
 
+> **分片（`shards > 1`）：**恢复**按分片目录独立执行**（`data_dir/s<shard>/`；`shards == 1` 时为扁平的 `data_dir`）。下列步骤对每个分片各跑一遍——每个分片以步长 `1 << shard_bits` 扫描自己的尾段、检测并截断自己的撕裂写、并从自己首条恢复记录重植各自的 ring 续点。某分片 `recovered_count` 为零即得到一个全新的空分片。
+
 1. **列出并按 `segment_id` 升序排序**所有 `segment-*.log` 文件。
 2. **校验每个段头**（magic + header CRC）。段头损坏意味着该段及其后所有段被丢弃——恢复在此停止。
 3. **逐条扫描最后一个段**（对压缩/加密段则按帧扫描）：读长度、读完整记录、校验 CRC、确认 `record_id` 与期望的单调序列一致。

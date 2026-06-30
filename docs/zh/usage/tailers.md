@@ -58,7 +58,7 @@ let mut t2 = db.new_tailer("replicator");
 assert_eq!(t2.position(), 100);
 ```
 
-> tailer 从第 0 个 shard 的 ring 读取。`name` 必须是文件系统安全的标识符——它会直接被插入进度文件名 `tailer_<name>.dat`。
+> 在 `shards > 1` 时，tailer 维护**每分片进度**（每个分片一个本地序列，类似 Kafka 的每分区 offset），`next_batch` 把所有分片新持久化的记录按全局 id 升序合并成一个批次。停滞的分片不会阻塞其它分片；跨批次顺序是尽力而为（停滞分片中较小的全局 id 记录可能出现在更晚的批次里）。`name` 必须是文件系统安全的标识符——它会直接被插入进度文件名 `tailer_<name>.dat`。进度文件在 `shards == 1` 时沿用 12 字节旧格式，在 `shards > 1` 时存储每分片向量（`count + seqs + crc32c`）。`position()` 返回各分片进度的最小值（粗略进度指标）；`positions()` 返回完整的每分片向量。
 
 ## Tailer API
 

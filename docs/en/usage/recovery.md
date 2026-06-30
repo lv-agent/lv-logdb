@@ -41,6 +41,8 @@ You must open the database with the **same `encryption_key`** you wrote it with:
 
 Recovery reconstructs the log from segment files on disk (`src/recovery.rs`). The algorithm (`src/recovery.rs:7-17`, §15):
 
+> **Sharding (`shards > 1`):** recovery runs **independently per shard directory** (`data_dir/s<shard>/`; the flat `data_dir` for `shards == 1`). The steps below execute once per shard — each scans its own last segment with stride `1 << shard_bits`, detects and truncates its own torn write, and re-seeds its own ring resume point from its first recovered record. A per-shard `recovered_count` of zero yields a fresh empty shard.
+
 1. **List and sort** all `segment-*.log` files by `segment_id` ascending.
 2. **Validate each segment header** (magic + header CRC). A bad header means that segment and every later one are discarded — recovery stops there.
 3. **Scan the last segment record-by-record** (or frame-by-frame for compressed/encrypted segments): read length, read the full record, check the CRC, verify the `record_id` matches the expected monotonic sequence.

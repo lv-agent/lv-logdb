@@ -38,7 +38,7 @@ assert_eq!(format!("{}", RecordId::new(0, 42)),  "42");
 assert_eq!(format!("{}", RecordId::new(3, 42)),  "3/42");
 ```
 
-Shard IDs and node IDs are **not** encoded in `RecordId` — they are internal implementation details that may change during rebalancing. The public `append` API returns a `u64` (the sequence), which is what you pass back to `read`.
+The shard id **is** bit-packed into the global sequence (and thus into `RecordId.sequence`) when `shards > 1` — `read`/`scan`/`tailer` decode it to route to the right shard. The exact bit layout is an internal detail (see [Sharding](sharding.md)); applications treat the `u64` returned by `append` as an opaque, comparable handle and pass it back to `read`.
 
 ## The Record struct
 
@@ -62,13 +62,14 @@ A borrowed, zero-copy view (`ReadView<'a>`) exists for internal hot paths; appli
 
 Sequences are **strictly monotonic** within a partition. Each successful `append` returns a sequence one greater than the previous one (no gaps from the writer's perspective; gaps only appear if the writer sees an `AppendError`).
 
-With **sharded rings** (`config.shards > 1`), each shard owns a strided sub-space of the global sequence. Records from different shards interleave globally:
+With **sharded rings** (`config.shards > 1`), each shard owns a strided sub-space of the global sequence. Records from different shards interleave globally. The encoding is bit-packed:
 
 ```
-global_seq = local_seq * num_shards + shard_id
+shard_bits = ceil(log2(num_shards))
+global_id  = (local_seq << shard_bits) | shard_id
 ```
 
-So with `shards = 4`, the first record on each shard has global sequences `0, 1, 2, 3`, the second round `4, 5, 6, 7`, and so on. The mapping is a pure function — you can recover `(local_seq, shard_id)` from a global sequence with `shard_id = global_seq % num_shards` and `local_seq = global_seq / num_shards`. See [Sharding](sharding.md) for the full discussion.
+So with `shards = 4` (`shard_bits = 2`), the first record on each shard has global ids `0, 1, 2, 3`, the second round `4, 5, 6, 7`, and so on. The mapping is a pure function: `shard_id = global_id & ((1 << shard_bits) - 1)` and `local_seq = global_id >> shard_bits`. (The simpler `local_seq * num_shards + shard_id` form is exact only when `num_shards` is a power of two.) See [Sharding](sharding.md) for the full discussion.
 
 `RecordId.sequence` always stores the **global** sequence. `read(global_seq)` works regardless of shard count because segments index by global sequence.
 

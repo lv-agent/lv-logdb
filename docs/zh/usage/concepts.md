@@ -38,7 +38,7 @@ assert_eq!(format!("{}", RecordId::new(0, 42)),  "42");
 assert_eq!(format!("{}", RecordId::new(3, 42)),  "3/42");
 ```
 
-分片 ID 和节点 ID **不会**编码进 `RecordId` —— 它们是内部实现细节，可能在再均衡过程中变化。公开的 `append` API 返回一个 `u64`（即序号），也就是你回传给 `read` 的值。
+在 `shards > 1` 时，分片 ID **会**按位编码进全局序列（即 `RecordId.sequence`）——`read`/`scan`/`tailer` 据此解码并路由到正确的分片。具体的位布局是内部细节（见[分片](sharding.md)）；应用层把 `append` 返回的 `u64` 当作不透明、可比较的句柄，回传给 `read` 即可。
 
 ## Record 结构体
 
@@ -62,13 +62,14 @@ pub struct Record {
 
 序列号在分区内**严格单调**。每次成功的 `append` 返回的序列号比上一次大 1（从写者视角看没有空隙；只有当写者收到 `AppendError` 时才会出现空隙）。
 
-当使用**分片环形**（`config.shards > 1`）时，每个分片拥有全局序列的一个跨步子空间。来自不同分片的记录在全局上交错：
+当使用**分片环形**（`config.shards > 1`）时，每个分片拥有全局序列的一个跨步子空间。来自不同分片的记录在全局上交错。编码采用按位打包：
 
 ```
-global_seq = local_seq * num_shards + shard_id
+shard_bits = ceil(log2(num_shards))
+global_id  = (local_seq << shard_bits) | shard_id
 ```
 
-因此当 `shards = 4` 时，每个分片的第一条记录的全局序列为 `0, 1, 2, 3`，第二轮为 `4, 5, 6, 7`，依此类推。这一映射是纯函数——你可以从全局序列还原 `(local_seq, shard_id)`：`shard_id = global_seq % num_shards`，`local_seq = global_seq / num_shards`。完整讨论见[分片](sharding.md)。
+因此当 `shards = 4`（`shard_bits = 2`）时，每个分片的第一条记录的全局 id 为 `0, 1, 2, 3`，第二轮为 `4, 5, 6, 7`，依此类推。这一映射是纯函数：`shard_id = global_id & ((1 << shard_bits) - 1)`，`local_seq = global_id >> shard_bits`。（更简单的 `local_seq * num_shards + shard_id` 形式仅在 `num_shards` 为 2 的幂时才精确相等。）完整讨论见[分片](sharding.md)。
 
 `RecordId.sequence` 始终保存的是**全局**序列。无论分片数为多少，`read(global_seq)` 都能正常工作，因为段是按全局序列索引的。
 

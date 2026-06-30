@@ -22,11 +22,11 @@ use super::{iter_for_segment, ManifestEntry, SegmentManifest};
 
 /// Single-shard, cross-segment ascending iterator over `[from_id, to_id)`.
 struct ShardScanner {
-    manifest: Arc<Mutex<SegmentManifest>>,
     key: Option<[u8; 32]>,
     from_id: u64,
     to_id: u64,
-    /// Candidate segments, from the one containing `from_id` onward.
+    /// Candidate segments, from the one containing `from_id` onward. Fetched
+    /// up front from the manifest; the manifest is not needed after this.
     segments: Vec<ManifestEntry>,
     seg_idx: usize,
     /// Current single-segment iterator (`None` before first load / after the
@@ -43,7 +43,6 @@ impl ShardScanner {
     ) -> Result<Self, ReadError> {
         let segments = manifest.lock().unwrap().segments_from(from_id)?;
         Ok(Self {
-            manifest,
             key,
             from_id,
             to_id,

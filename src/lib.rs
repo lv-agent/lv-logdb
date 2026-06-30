@@ -525,21 +525,22 @@ impl LogDb {
         Arc::clone(self.inner.shards.ring(0))
     }
 
-    /// Scan records in range `[from_id, to_id)`.
-    ///
-    /// NOTE: cross-shard scan merge is Phase 3. Until then this reads
-    /// shard 0 — correct for `shards=1` (the only fully-supported scan
-    /// config). `shards>1` scan is intentionally limited here.
+    /// Scan records in range `[from_id, to_id)` across ALL shards, ordered by
+    /// ascending global id. `shards=1` returns a single cross-segment stream;
+    /// `shards>1` k-way-merges the per-shard streams. An empty range yields an
+    /// empty iterator (no error).
     pub fn scan(
         &self,
         from_id: u64,
         to_id: u64,
-    ) -> Result<reader::iter::RecordIter, ReadError> {
-        let reader = reader::Reader::new(
-            Arc::clone(&self.inner.manifests[0]),
-            self.inner.config.encryption_key,
-        );
-        reader.scan(from_id, to_id)
+    ) -> Result<reader::ScanIter, ReadError> {
+        let manifests = self
+            .inner
+            .manifests
+            .iter()
+            .map(Arc::clone)
+            .collect();
+        reader::ScanIter::build(manifests, self.inner.config.encryption_key, from_id, to_id)
     }
 
     /// Mark `sequence` as the WAL checkpoint.
@@ -605,11 +606,12 @@ impl LogDb {
         }
     }
 
-    /// Replay records from `sequence` (inclusive) to the end of the log.
+    /// Replay records from `sequence` (inclusive) to the end of the log, across
+    /// all shards, ordered by ascending global id.
     pub fn replay_from(
         &self,
         sequence: u64,
-    ) -> Result<reader::iter::RecordIter, ReadError> {
+    ) -> Result<reader::ScanIter, ReadError> {
         self.scan(sequence, u64::MAX)
     }
 

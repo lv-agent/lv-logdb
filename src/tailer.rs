@@ -79,7 +79,7 @@ pub struct Tailer {
 
 impl Tailer {
     /// Open or create a named tailer. Restores progress from disk.
-    pub fn open(
+    pub(crate) fn open(
         manifest: Arc<std::sync::Mutex<crate::reader::SegmentManifest>>,
         ring: Arc<Ring>,
         name: &str,

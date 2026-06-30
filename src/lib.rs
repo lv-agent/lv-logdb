@@ -631,13 +631,37 @@ impl LogDb {
     }
 
     /// Recovery report for database WAL replay.
+    ///
+    /// `from_sequence` is the WAL checkpoint (global id). `count` is the number
+    /// of durable records with global id `>= from_sequence`, summed across ALL
+    /// shards. `to_sequence` is the global durable watermark (the smallest
+    /// not-yet-durable global id — an informational lower bound). For
+    /// `shards == 1` this reduces exactly to the legacy `durable - checkpoint`.
     pub fn recovery_report(&self) -> RecoveryReport {
         let cp = self.checkpoint_sequence();
-        let durable = self.durable_cursor();
+        let shards = &self.inner.shards;
+        let bits = shards.shard_bits();
+        let stride: u64 = 1u64 << bits;
+        let mut count: u64 = 0;
+        let mut watermark = u64::MAX;
+        for s in 0..shards.num_shards() {
+            let durable_s = shards.ring(s).durable_cursor.load(Ordering::Acquire);
+            // First local seq in shard s whose global id (local*stride + s) >= cp.
+            let first_local: u64 = if cp <= s as u64 {
+                0
+            } else {
+                (cp - s as u64 + stride - 1) / stride // ceil((cp - s) / stride)
+            };
+            count += durable_s.saturating_sub(first_local);
+            let wm = (durable_s << bits) | s as u64; // first not-yet-durable gid of shard s
+            if wm < watermark {
+                watermark = wm;
+            }
+        }
         RecoveryReport {
             from_sequence: cp,
-            to_sequence: durable,
-            count: if durable > cp { durable - cp } else { 0 },
+            to_sequence: if watermark == u64::MAX { 0 } else { watermark },
+            count,
         }
     }
 

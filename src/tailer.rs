@@ -58,10 +58,14 @@ fn save_progress(dir: &Path, name: &str, seq: u64) -> io::Result<()> {
 /// at its own pace. Progress is persisted to disk on explicit `commit()`.
 ///
 /// ```rust,no_run
-/// let mut t = db.new_tailer("replicator")?;
-/// while let Some(batch) = t.next_batch(1000)? {
-///     send_to_replica(&batch);
-///     t.commit()?;
+/// # use logdb::{Config, LogDb};
+/// # let mut config = Config::default();
+/// # config.data_dir = std::path::PathBuf::from("/tmp/logdb-tailer-example");
+/// # let db = LogDb::open(config).unwrap();
+/// let mut t = db.new_tailer("replicator"); // returns Tailer, not a Result
+/// while let Some(batch) = t.next_batch(1000).unwrap() {
+///     // ...deliver `batch` to the downstream consumer...
+///     t.commit().unwrap(); // persist progress
 /// }
 /// ```
 pub struct Tailer {

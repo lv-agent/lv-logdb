@@ -262,6 +262,12 @@ pub struct SegmentManager {
     /// Pre-allocated next segment (D1 fix: eliminates roll-time file creation).
     /// Created when active segment exceeds 80% utilization.
     prepared_segment: Option<(u32, ActiveSegment)>,
+    /// This manager's shard id and shard-bit width (0/0 for shards==1, i.e.
+    /// identity encoding). Used to write the correct GLOBAL base_sequence into
+    /// pre-allocated segment headers (local seq would break point reads,
+    /// checkpoint truncation, and recovery under shards>1).
+    shard_id: usize,
+    shard_bits: u32,
     /// Paths of old (rolled-over) segments awaiting a deferred fdatasync.
     ///
     /// We store **paths**, not open file handles: the rolled segment's `File`
@@ -358,6 +364,8 @@ impl SegmentManager {
             active_index_count: 0,
             prepared_segment: None,
             pending_fsync: Vec::new(),
+            shard_id: 0,
+            shard_bits: 0,
         })
     }
 
@@ -395,6 +403,8 @@ impl SegmentManager {
             active_index_count: 0,
             prepared_segment: None,
             pending_fsync: Vec::new(),
+            shard_id: 0,
+            shard_bits: 0,
         })
     }
 
@@ -504,7 +514,14 @@ impl SegmentManager {
     ///
     /// This eliminates file creation + header fsync from the roll() hot path.
     /// See design doc D1 decision.
-    fn maybe_prepare_next(&mut self, next_base: u64) -> Result<(), SegmentError> {
+    ///
+    /// `next_local_seq` is the LOCAL ring sequence of the first record that will
+    /// land in the new segment; it is encoded to a GLOBAL record id for the
+    /// segment header `base_sequence` (point reads, truncation, and recovery all
+    /// key off the global id; a local seq would silently break them under
+    /// `shards > 1`). For `shards == 1` (`shard_bits == 0`) the encoding is the
+    /// identity, so behavior is unchanged.
+    fn maybe_prepare_next(&mut self, next_local_seq: u64) -> Result<(), SegmentError> {
         if self.prepared_segment.is_some() {
             return Ok(());
         }
@@ -514,6 +531,7 @@ impl SegmentManager {
         }
 
         let new_id = self.active_id + 1;
+        let base_sequence = crate::shard::encode_record_id(self.shard_id, next_local_seq, self.shard_bits);
         let mut flags = if self.hash_enabled { FLAG_HASH_ENABLED } else { 0 } | format::FLAG_NOT_FIRST;
         if self.compressed { flags |= FLAG_COMPRESSED_ZSTD; }
         let new_header = SegmentHeader {
@@ -521,7 +539,7 @@ impl SegmentManager {
             flags,
             hash_algo: format::HASH_ALGO_BLAKE3,
             hash_init: self.hash_init,
-            base_sequence: next_base,
+            base_sequence,
             partition_id: 0,
             segment_id: new_id,
             min_timestamp_ns: u64::MAX,
@@ -677,6 +695,16 @@ impl SegmentManager {
         if self.active_index.is_some() {
             self.active_index = Some(index::SparseIndex::new(stride));
         }
+    }
+
+    /// Record this manager's shard id and shard-bit width, so that segment
+    /// `base_sequence` headers are written as GLOBAL record ids (not local ring
+    /// seqs). Called once per shard during `LogDb::open` before the Committer
+    /// starts. Defaults to `0/0` (identity encoding) for `shards == 1` and for
+    /// standalone/test construction.
+    pub fn set_shard(&mut self, shard_id: usize, shard_bits: u32) {
+        self.shard_id = shard_id;
+        self.shard_bits = shard_bits;
     }
 
     /// Persist the active segment's sparse index to `<segment>.idx`.

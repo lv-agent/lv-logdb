@@ -168,9 +168,13 @@ impl LogDb {
         let _ = last_hash;
 
         // Apply the configured sparse-index stride before the Committer starts
-        // appending (active index is still empty here).
-        for m in seg_mgrs.iter_mut() {
+        // appending (active index is still empty here). Also tag each manager
+        // with its shard id/bits so segment base_sequence headers are written as
+        // global record ids (required for correct point reads / truncation /
+        // recovery under shards>1).
+        for (s, m) in seg_mgrs.iter_mut().enumerate() {
             m.set_index_stride(config.index_stride);
+            m.set_shard(s, shard_bits);
         }
 
         // Create shared state
@@ -1867,5 +1871,302 @@ mod tests {
             "recovery_report.count must equal total durable records across shards (got {}, scan={})",
             report.count, scan_count
         );
+    }
+
+    #[test]
+    fn checkpoint_truncation_under_sharding_preserves_post_checkpoint_data() {
+        // Truncation removes only fully-checkpointed segments, per shard. After
+        // a roll past a checkpoint, every record with gid >= checkpoint must
+        // still be readable (no over-truncation, no data loss).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
+        config.ring_size = 8192;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(10);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let payload = vec![0xA5u8; 64 * 1024];
+        let mut all_ids = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..2u64 {
+            let db = Arc::clone(&db);
+            let p = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                for _ in 0..20u64 {
+                    ids.push(db.append(&p).unwrap());
+                }
+                ids
+            }));
+        }
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        all_ids.sort();
+        // Checkpoint past the first segment of every shard, then append more to
+        // force rolls that trigger per-shard truncation.
+        let cp = all_ids[all_ids.len() / 2];
+        db.checkpoint(cp);
+        let mut more_ids = Vec::new();
+        for _ in 0..20u64 {
+            more_ids.push(db.append(&payload).unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() + more_ids.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Let any in-flight rolls/truncations and manifest refreshes settle.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Every record at/after the checkpoint (old and new) must survive.
+        // Retry briefly: a read may transiently miss if the per-shard manifest
+        // hasn't yet observed a just-deleted segment's dir mtime — a persistent
+        // None (real data loss) survives the retries and fails the assert.
+        for id in all_ids.iter().chain(more_ids.iter()).filter(|&&id| id >= cp) {
+            let mut ok = false;
+            for _ in 0..10 {
+                if db.read(*id).unwrap().is_some() {
+                    ok = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ok, "post-checkpoint id {} lost after truncation", id);
+        }
+    }
+
+    #[test]
+    fn point_read_across_segment_roll_under_sharding() {
+        // Directly exercises the base_sequence fix: under shards>1, a point read
+        // by GLOBAL id must route to the correct segment even after a roll.
+        // Before the fix, pre-allocated segment headers stored the LOCAL ring
+        // seq as base_sequence, so SegmentManifest::find misrouted reads.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
+        config.ring_size = 8192;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(10);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let payload = vec![0xA5u8; 64 * 1024];
+        let mut all_ids = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..2u64 {
+            let db = Arc::clone(&db);
+            let p = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut ids = Vec::new();
+                for _ in 0..20u64 {
+                    ids.push(db.append(&p).unwrap());
+                }
+                ids
+            }));
+        }
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // At least two segment files exist in some shard dir (a roll happened).
+        let rolled = (0..2).any(|s| {
+            std::fs::read_dir(dir.path().join(format!("s{}", s)))
+                .map(|rd| rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_str().map_or(false, |n| n.ends_with(".log")))
+                    .count() >= 2)
+                .unwrap_or(false)
+        });
+        assert!(rolled, "test should have triggered a segment roll");
+
+        // Every appended id must be readable by global id, including those in
+        // non-first segments (this is what the base_sequence fix preserves).
+        for id in &all_ids {
+            assert!(db.read(*id).unwrap().is_some(), "point read of id {} failed across segment roll", id);
+        }
+    }
+
+
+    #[test]
+    fn retention_maxbytes_applies_per_shard() {
+        use crate::config::RetentionPolicy;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.segment_size = 1 * 1024 * 1024;
+        config.ring_size = 8192;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(10);
+        config.retention = RetentionPolicy::MaxBytes(2 * 1024 * 1024); // 2MB cap
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let payload = vec![0xA5u8; 64 * 1024];
+        let mut handles = Vec::new();
+        for _ in 0..2u64 {
+            let db = Arc::clone(&db);
+            let p = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..40u64 {
+                    db.append(&p).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= 40 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Each shard dir is retained independently; neither grows unbounded.
+        for s in 0..2 {
+            let sd = dir.path().join(format!("s{}", s));
+            let bytes: u64 = std::fs::read_dir(&sd)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_str().map_or(false, |n| n.ends_with(".log")))
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+            // Retention evicts whole segments only after a roll; with a 2MB cap
+            // and 1MB segments, each shard holds at most a few segments.
+            assert!(bytes <= 4 * 1024 * 1024, "shard {} retained {} bytes (retention not applied)", s, bytes);
+        }
+    }
+
+    #[test]
+    fn non_power_of_two_shards_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 3; // non-power-of-two → shard_bits=2, shard id 3 unused
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config.clone()).unwrap());
+
+        let mut all_ids = Vec::new();
+        let mut handles = Vec::new();
+        for t in 0..6u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                (0..5u64)
+                    .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Every id decodes to a valid shard (< 3) and reads back.
+        for id in &all_ids {
+            let (shard, _local) = crate::shard::decode_record_id(*id, 2);
+            assert!(shard < 3, "non-power-of-2 must not produce shard id >= num_shards");
+            assert!(db.read(*id).unwrap().is_some(), "id {} must read back", id);
+        }
+        let scanned: Vec<u64> = db.scan(0, u64::MAX).unwrap()
+            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
+        assert_eq!(scanned.len(), all_ids.len());
+        assert!(scanned.windows(2).all(|w| w[0] < w[1]));
+
+        // Reopen preserves everything (per-shard recovery).
+        drop(db);
+        let db = LogDb::open(config).unwrap();
+        let rescanned: Vec<u64> = db.scan(0, u64::MAX).unwrap()
+            .filter_map(|r| r.ok()).map(|r| r.id.sequence).collect();
+        assert_eq!(rescanned.len(), all_ids.len(), "non-power-of-2 shards must survive reopen");
+    }
+
+    #[test]
+    fn concurrent_append_scan_tailer_under_sharding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 512;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let total = 80u64;
+        let db2 = Arc::clone(&db);
+        let writer = std::thread::spawn(move || {
+            let mut ids = Vec::new();
+            for i in 0..total {
+                ids.push(db2.append(format!("x-{}", i).as_bytes()).unwrap());
+            }
+            db2.flush().unwrap();
+            ids
+        });
+
+        // Concurrent reader: scan repeatedly while writing; must never panic.
+        let db3 = Arc::clone(&db);
+        let reader = std::thread::spawn(move || {
+            let mut last = 0usize;
+            for _ in 0..20 {
+                let n = db3.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+                if n > last {
+                    last = n;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            last
+        });
+
+        let ids = writer.join().unwrap();
+        let _seen = reader.join().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= total as usize {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Tailer must eventually deliver every record (lossless).
+        let mut t = db.new_tailer("stress");
+        let mut got: Vec<u64> = Vec::new();
+        for _ in 0..400 {
+            match t.next_batch(1000).unwrap() {
+                Some(b) => got.extend(b.iter().map(|r| r.id.sequence)),
+                None => break,
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(got.len(), total as usize, "tailer must deliver all under concurrency");
+        assert!(ids.iter().all(|id| got.contains(id)));
     }
 }

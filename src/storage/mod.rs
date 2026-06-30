@@ -15,10 +15,10 @@ pub mod index;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use format::{
-    record_size, SegmentHeader, FLAG_HASH_ENABLED, FLAG_COMPRESSED_ZSTD, FLAG_ENCRYPTED_AES256GCM,
+    record_size, SegmentHeader, FLAG_HASH_ENABLED, FLAG_COMPRESSED_ZSTD,
     SEGMENT_HEADER_SIZE, FRAME_HEADER_SIZE, HEADER_CRC_END, write_frame_header, ENCRYPTION_NONCE_SIZE,
 };
 
@@ -65,7 +65,6 @@ impl From<io::Error> for SegmentError {
 struct ActiveSegment {
     file: File,
     path: PathBuf,
-    segment_id: u32,
     /// Current write offset within the file (after the header).
     offset: u64,
     /// Base record_id for this segment.
@@ -105,7 +104,6 @@ impl ActiveSegment {
         Ok(Self {
             file,
             path,
-            segment_id,
             offset: SEGMENT_HEADER_SIZE as u64,
             base_sequence: header.base_sequence,
             min_ts: u64::MAX,
@@ -117,7 +115,7 @@ impl ActiveSegment {
     }
 
     /// Open an existing segment file for reading and appending (used during recovery).
-    fn open_existing(path: PathBuf, segment_id: u32, offset: u64, header: &SegmentHeader) -> io::Result<Self> {
+    fn open_existing(path: PathBuf, _segment_id: u32, offset: u64, header: &SegmentHeader) -> io::Result<Self> {
         let file = OpenOptions::new()
             .write(true)
             .read(true)
@@ -126,7 +124,6 @@ impl ActiveSegment {
         Ok(Self {
             file,
             path,
-            segment_id,
             offset,
             base_sequence: header.base_sequence,
             min_ts: header.min_timestamp_ns,
@@ -256,8 +253,6 @@ pub struct SegmentManager {
     encryption_key: Option<[u8; 32]>,
     retention: RetentionPolicy,
     write_buf: Vec<u8>,
-    /// Timestamp when the first record was added to the current pending batch.
-    first_record_ts: Option<Instant>,
     /// Sparse index being built for the active segment (raw segments only —
     /// compressed/encrypted segments store records inside frames, so per-record
     /// file offsets aren't independently seekable). None for frame segments.
@@ -359,7 +354,6 @@ impl SegmentManager {
             encryption_key,
             retention,
             write_buf: Vec::with_capacity(1024 * 1024),
-            first_record_ts: None,
             active_index,
             active_index_count: 0,
             prepared_segment: None,
@@ -397,7 +391,6 @@ impl SegmentManager {
             encryption_key,
             retention,
             write_buf: Vec::with_capacity(1024 * 1024),
-            first_record_ts: None,
             active_index,
             active_index_count: 0,
             prepared_segment: None,

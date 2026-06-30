@@ -5,13 +5,18 @@
 //! uses exponential backoff on failure.  Remote failures never back-pressure
 //! local appends (principle ⑥).
 
+// The Pusher is a daemon-level building block for remote push. It is not yet
+// wired into LogDb's public API (tracked as a known gap; a public push API
+// needs its own design cr). Silence dead-code until it is exposed.
+#![allow(dead_code)]
+
 use std::fs;
 use std::io;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::record::Record;
@@ -254,7 +259,6 @@ impl PusherHandle {
         shutdown: Arc<ShutdownState>,
     ) -> Self {
         let push_seq = Arc::new(AtomicU64::new(0));
-        let ps = Arc::clone(&push_seq);
         let handle = std::thread::Builder::new()
             .name("logdb-pusher".into())
             .spawn(move || {

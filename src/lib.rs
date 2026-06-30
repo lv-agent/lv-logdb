@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use health::HealthState;
 use pipeline::signal::{FlushSignal, ShutdownState};
-use pipeline::trigger::{CommitTrigger, WaitStrategy};
+use pipeline::trigger::CommitTrigger;
 use ring::Ring;
 use shard::ShardMap;
 use storage::SegmentManager;
@@ -77,14 +77,11 @@ struct LogDbInner {
     #[cfg(feature = "hash-chain")]
     sealer_handle: Option<std::thread::JoinHandle<()>>,
     data_dir: std::path::PathBuf,
-    hash_init: [u8; 32],
     /// WAL checkpoint: records with sequence < this are safe to truncate.
     checkpoint_sequence: Arc<AtomicU64>,
     /// Cached segment directory listing shared by all readers (P2-1: avoids
     /// re-readdir + re-reading every segment header on each read/scan).
     manifest: Arc<Mutex<reader::SegmentManifest>>,
-    #[cfg(feature = "remote-push")]
-    pusher_handle: Option<crate::pusher::PusherHandle>,
 }
 
 impl LogDb {
@@ -214,11 +211,8 @@ impl LogDb {
                 #[cfg(feature = "hash-chain")]
                 sealer_handle,
                 data_dir,
-                hash_init,
                 checkpoint_sequence: checkpoint,
                 manifest,
-                #[cfg(feature = "remote-push")]
-                pusher_handle: None,
             }),
         })
     }

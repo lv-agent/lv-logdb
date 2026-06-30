@@ -8,8 +8,7 @@
 //! The index is a derived/rebuildable artifact. If missing or corrupted, it can
 //! be reconstructed by scanning the segment file.
 
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// An entry in the sparse index.

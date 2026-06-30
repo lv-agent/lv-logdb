@@ -15,7 +15,7 @@
 pub mod iter;
 
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -26,7 +26,7 @@ use crate::storage::format::{
     deserialize_record, SegmentHeader, MIN_RECORD_SIZE, SEGMENT_HEADER_SIZE,
     FRAME_HEADER_SIZE, read_frame_header,
 };
-use crate::storage::index::{SparseIndex, IndexEntry};
+use crate::storage::index::SparseIndex;
 
 use iter::RecordIter;
 
@@ -86,7 +86,7 @@ pub(crate) fn decode_frame_payload(
 // ── Segment manifest (cached directory listing) ─────────────────────────────
 
 #[derive(Clone)]
-struct ManifestEntry {
+pub(crate) struct ManifestEntry {
     segment_id: u32,
     path: PathBuf,
     base_sequence: u64,
@@ -154,7 +154,7 @@ impl SegmentManifest {
     /// `base_sequence <= seq`. Returns a clone so callers don't hold the lock
     /// during file I/O. `base_sequence` is monotonic with `segment_id`, so a
     /// partition_point (binary search) locates it in O(log N).
-    pub fn find(&mut self, seq: u64) -> Result<Option<ManifestEntry>, ReadError> {
+    pub(crate) fn find(&mut self, seq: u64) -> Result<Option<ManifestEntry>, ReadError> {
         self.refresh_if_needed()?;
         let idx = self.entries.partition_point(|e| e.base_sequence <= seq);
         Ok(if idx == 0 { None } else { Some(self.entries[idx - 1].clone()) })
@@ -184,7 +184,7 @@ pub struct Reader {
 
 impl Reader {
     /// Create a new reader sharing a segment manifest (cached dir listing).
-    pub fn new(manifest: Arc<Mutex<SegmentManifest>>, encryption_key: Option<[u8; 32]>) -> Self {
+    pub(crate) fn new(manifest: Arc<Mutex<SegmentManifest>>, encryption_key: Option<[u8; 32]>) -> Self {
         Self { manifest, encryption_key }
     }
 

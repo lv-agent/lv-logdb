@@ -226,6 +226,19 @@ pub struct WaitStrategy {
 
 The defaults (spin 64 / yield 16 / park 500 µs) are a balanced middle ground. Tune only if profiling shows the Committer either burning CPU idle or adding visible tail latency.
 
+## Diagnostics
+
+Two read-only accessors help with monitoring and capacity planning:
+
+- `wal_usage() -> (u64, u64)` — `(used_bytes, segment_size)`. `used_bytes` is the total size of all segment files across the data directory (flat for `shards == 1`, summed across every `s<shard>/` subdir for `shards > 1`). `segment_size` is the configured per-segment roll threshold.
+- `ring_size() -> usize` — total in-memory ring capacity across all shards (`num_shards * per_shard_slots`). Useful for sizing memory and reasoning about backpressure.
+
+```rust
+let (used, seg_size) = db.wal_usage();
+println!("WAL on disk: {} bytes (segment size {})", used, seg_size);
+println!("ring capacity: {} slots", db.ring_size());
+```
+
 ## See also
 
 - [Usage guide](README.md)

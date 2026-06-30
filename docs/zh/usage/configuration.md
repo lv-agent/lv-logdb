@@ -226,6 +226,19 @@ pub struct WaitStrategy {
 
 默认值（spin 64 / yield 16 / park 500 µs）是均衡的中间路线。仅当 profiling 显示 Committer 要么在空闲时烧 CPU、要么给尾部延迟加了可见负担时，再去调它。
 
+## 诊断
+
+两个只读访问器用于监控与容量规划：
+
+- `wal_usage() -> (u64, u64)` —— `(已用字节, segment_size)`。`已用字节` 是数据目录下所有段文件的总大小（`shards == 1` 为扁平目录，`shards > 1` 为各 `s<shard>/` 子目录之和）。`segment_size` 是配置的单段滚动阈值。
+- `ring_size() -> usize` —— 所有分片的内存 ring 总容量（`num_shards * 每分片槽位`）。用于估算内存与反压行为。
+
+```rust
+let (used, seg_size) = db.wal_usage();
+println!("WAL on disk: {} bytes (segment size {})", used, seg_size);
+println!("ring capacity: {} slots", db.ring_size());
+```
+
 ## 相关链接
 
 - [使用指南](README.md)

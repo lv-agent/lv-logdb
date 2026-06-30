@@ -14,7 +14,7 @@ cargo test --lib                   # 仅库单元测试
 cargo test storage::format         # 按模块路径过滤
 ```
 
-README 的 "Testing" 章节在默认构建下引用约 103 个单元测试；具体数字视为近似，以 `cargo test` 输出为准。
+README 的 "Testing" 章节在默认构建下引用约 140+ 个单元测试；具体数字视为近似，以 `cargo test` 输出为准。
 
 ## 集成测试
 

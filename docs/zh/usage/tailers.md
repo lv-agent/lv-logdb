@@ -66,7 +66,8 @@ assert_eq!(t2.position(), 100);
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `position` | `(&self) -> u64` | 当前读取位置——下一个待读序列号。 |
+| `position` | `(&self) -> u64` | 各分片进度的最小值（粗略进度）；`shards == 1` 时即下一个待读序列号。 |
+| `positions` | `(&self) -> &[u64]` | 完整的每分片进度向量（每分片一个本地序列号）。 |
 | `next_batch` | `(&mut self, max_count: usize) -> Result<Option<Vec<Record>>, String>` | 读取至多 `max_count` 条**已持久化**记录；无可用记录时返回 `Ok(None)`。 |
 | `commit` | `(&self) -> std::io::Result<()>` | 将当前位置持久化到 `tailer_<name>.dat`。 |
 | `seek` | `(&mut self, seq: u64)` | 把位置移到 `seq`（仅在内存中；`commit` 之前不会落盘）。 |

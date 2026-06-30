@@ -22,7 +22,7 @@ assert_eq!(record.content, b"hello");
 
 ## 核心特性
 
-- **无锁写入**：多生产者 CAS 环形缓冲区，p50 < 60ns
+- **无锁写入**：多生产者 CAS 环形缓冲区，p50 < 100ns
 - **三种持久化模式**：
   - `Sync`：每次提交后 fdatasync
   - `Batch`：达到字节数/条数/时间阈值后 fdatasync
@@ -97,7 +97,7 @@ logdb = { features = ["compression", "encryption"] }
 ## 测试
 
 ```bash
-cargo test                          # 103 个单元测试
+cargo test                          # 140+ 个单元测试（默认特性）
 cargo test --features compression   # 含压缩测试
 cargo test --test fuzz              # 基于属性的随机测试 (proptest)
 cargo +nightly fuzz run <target>    # libfuzzer + AddressSanitizer
@@ -114,6 +114,7 @@ cargo +nightly fuzz run <target>    # libfuzzer + AddressSanitizer
 | append(256B) 4 线程吞吐 | 4.48M rec/s |
 | 端到端持久化延迟 p99 | 10.4ms (NVMe 预期 <2ms) |
 | 段滚动停顿 | 0ms（预分配 + idle drain） |
+| 范围扫描（cr-004，64B 记录） | ~90 ns/rec（相较每记录一次 syscall 的路径约 12×） |
 
 ## 许可证
 

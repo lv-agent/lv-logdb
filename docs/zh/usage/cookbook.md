@@ -112,7 +112,7 @@ let id = db.append(b"{\"level\":\"info\",\"msg\":\"hello\"}").unwrap();
 // 历史重放：从头迭代所有内容。
 for result in db.replay_from(0).unwrap() {
     let record = result.unwrap();
-    println!("seq={} ts={} {}", record.record_id, record.timestamp_ns,
+    println!("seq={} ts={} {}", record.id.sequence, record.timestamp_ns,
              String::from_utf8_lossy(&record.content));
 }
 

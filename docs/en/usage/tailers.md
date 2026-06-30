@@ -66,7 +66,8 @@ The full surface (`src/tailer.rs`):
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `position` | `(&self) -> u64` | Current read position — the next sequence to read. |
+| `position` | `(&self) -> u64` | Minimum per-shard position (coarse progress); the next sequence to read for `shards == 1`. |
+| `positions` | `(&self) -> &[u64]` | Full per-shard progress vector (one local sequence per shard). |
 | `next_batch` | `(&mut self, max_count: usize) -> Result<Option<Vec<Record>>, String>` | Read up to `max_count` **durable** records; `Ok(None)` when none are available. |
 | `commit` | `(&self) -> std::io::Result<()>` | Persist the current position to `tailer_<name>.dat`. |
 | `seek` | `(&mut self, seq: u64)` | Move the position to `seq` (in-memory; not persisted until `commit`). |

@@ -113,7 +113,7 @@ let id = db.append(b"{\"level\":\"info\",\"msg\":\"hello\"}").unwrap();
 // Historical replay: iterate everything from the beginning.
 for result in db.replay_from(0).unwrap() {
     let record = result.unwrap();
-    println!("seq={} ts={} {}", record.record_id, record.timestamp_ns,
+    println!("seq={} ts={} {}", record.id.sequence, record.timestamp_ns,
              String::from_utf8_lossy(&record.content));
 }
 

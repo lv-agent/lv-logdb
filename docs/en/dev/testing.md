@@ -14,7 +14,7 @@ cargo test --lib                   # library unit tests only
 cargo test storage::format         # filter to a module path
 ```
 
-The README's "Testing" section cites roughly 103 unit tests on a default build; treat the exact count as approximate and confirm with `cargo test` output.
+The README's "Testing" section cites roughly 140+ unit tests on a default build; treat the exact count as approximate and confirm with `cargo test` output.
 
 ## Integration tests
 

@@ -444,7 +444,11 @@ impl SegmentManager {
             // segment header (P2-1b).
             if let Some(idx) = self.active_index.as_mut() {
                 if idx.should_index(self.active_index_count) {
-                    idx.add(seq, start_offset + pos as u64, view.timestamp_ns);
+                    // Key by the GLOBAL record id (view.record_id), not the local
+                    // ring seq: readers and recovery look up by global id, and under
+                    // sharding local seq != global id. shards=1: the two are equal,
+                    // so this is unchanged.
+                    idx.add(view.record_id, start_offset + pos as u64, view.timestamp_ns);
                 }
                 self.active_index_count += 1;
             }

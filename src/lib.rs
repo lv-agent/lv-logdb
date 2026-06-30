@@ -160,8 +160,12 @@ impl LogDb {
             }
         }
 
-        // initial_seq is shard 0's resume point (used by the Sealer for shards=1).
-        let initial_seq = *initial_seqs.first().unwrap_or(&0);
+        // initial_seq (shard 0's resume point) is consumed by the Sealer for
+        // shards=1; read inline from initial_seqs there to avoid a dead binding
+        // when the hash-chain feature is disabled. Likewise `last_hash` is only
+        // read by the Sealer, so silence its unused assignment without the feature.
+        #[cfg(not(feature = "hash-chain"))]
+        let _ = last_hash;
 
         // Apply the configured sparse-index stride before the Committer starts
         // appending (active index is still empty here).
@@ -233,7 +237,7 @@ impl LogDb {
                             sealer_ring,
                             hash_init,
                             last_hash,
-                            initial_seq,
+                            initial_seqs[0],
                             sealer_shutdown,
                             wait,
                         );
@@ -500,7 +504,10 @@ impl LogDb {
             Arc::clone(&inner.manifests[shard]),
             inner.config.encryption_key,
         );
-        reader.read(record_id)
+        let r = reader.read(record_id);
+        if matches!(r, Ok(None)) {
+        }
+        r
     }
 
     // ── Internal state accessors (for diagnostics/benchmarking) ─────────
@@ -1245,5 +1252,175 @@ mod tests {
         assert_eq!(scanned.len(), all_ids.len(), "reopen must preserve every record across shards");
         assert!(all_ids.iter().all(|id| scanned.contains(id)), "reopen lost some ids");
         assert!(scanned.windows(2).all(|w| w[0] < w[1]), "scanned ids must be strictly ascending");
+    }
+
+    #[test]
+    fn reopen_under_sharding_single_thread_handles_empty_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        let ids: Vec<u64> = {
+            let db = LogDb::open(config.clone()).unwrap();
+            // Single-threaded appends are thread-affine → all land on ONE shard;
+            // the other three shards get only an empty first segment.
+            let mut ids = Vec::new();
+            for i in 0..6u64 {
+                ids.push(db.append(format!("r-{}", i).as_bytes()).unwrap());
+            }
+            db.flush().unwrap();
+            db.shutdown(Duration::from_secs(5)).unwrap();
+            ids
+        };
+
+        let db = LogDb::open(config).unwrap();
+        let scanned: Vec<u64> = db
+            .scan(0, u64::MAX).unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        assert_eq!(scanned, ids, "empty shards must not lose the written shard's records");
+        // The empty shards resume at local 0; a fresh append must still produce a
+        // collision-free global id and be readable.
+        let nid = db.append(b"after-reopen").unwrap();
+        db.flush().unwrap();
+        assert!(db.read(nid).unwrap().is_some(), "post-reopen append must read back");
+    }
+
+    #[test]
+    fn reopen_under_sharding_then_append_no_id_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        let mut all_ids = Vec::new();
+        {
+            let db = Arc::new(LogDb::open(config.clone()).unwrap());
+            let mut handles = Vec::new();
+            for t in 0..4u64 {
+                let db = Arc::clone(&db);
+                handles.push(std::thread::spawn(move || {
+                    (0..8u64)
+                        .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                        .collect::<Vec<_>>()
+                }));
+            }
+            for h in handles {
+                all_ids.extend(h.join().unwrap());
+            }
+            db.flush().unwrap();
+            let db = Arc::try_unwrap(db).ok().unwrap();
+            db.shutdown(Duration::from_secs(5)).unwrap();
+        }
+
+        let db = Arc::new(LogDb::open(config).unwrap());
+        // Append more from multiple threads after reopen — per-shard resume points
+        // must keep the global id space collision-free.
+        let mut new_ids = Vec::new();
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                (0..5u64)
+                    .map(|i| db.append(format!("n{}-{}", t, i).as_bytes()).unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for h in handles {
+            new_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for id in all_ids.iter().chain(new_ids.iter()) {
+            assert!(seen.insert(*id), "global id collision after reopen: {}", id);
+        }
+        // Every old id is still readable after the post-reopen appends.
+        for id in &all_ids {
+            assert!(db.read(*id).unwrap().is_some(), "old id {} lost after reopen+append", id);
+        }
+    }
+
+    #[test]
+    fn reopen_under_sharding_detects_torn_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.ring_size = 128;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        // Single-threaded → all 20 records land on ONE shard; the other is empty.
+        {
+            let db = LogDb::open(config.clone()).unwrap();
+            for i in 0..20u64 {
+                db.append(format!("r-{}", i).as_bytes()).unwrap();
+            }
+            db.flush().unwrap();
+            db.shutdown(Duration::from_secs(5)).unwrap();
+        }
+
+        // Corrupt the non-empty shard's active segment: chop 5 bytes off the end
+        // (mid-record) → the last record becomes a torn tail.
+        let victim = (0..2u32)
+            .map(|s| dir.path().join(format!("s{}", s)).join("segment-00000001.log"))
+            .find(|p| p.exists() && std::fs::metadata(p).map(|m| m.len() > 200).unwrap_or(false))
+            .expect("some shard must have received records");
+        let len = std::fs::metadata(&victim).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&victim)
+            .unwrap()
+            .set_len(len - 5)
+            .unwrap();
+
+        // Recovery must succeed: the torn tail is truncated, the rest survives.
+        // (The pre-fix stride bug truncated to a single record; this guards that.)
+        let db = LogDb::open(config).unwrap();
+        let scanned: Vec<Vec<u8>> = db
+            .scan(0, u64::MAX).unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.content)
+            .collect();
+        assert!(
+            scanned.len() >= 18,
+            "torn-write recovery lost too many records: {}",
+            scanned.len()
+        );
+    }
+
+    #[test]
+    fn reopen_shards1_still_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+
+        let id = {
+            let db = LogDb::open(config.clone()).unwrap();
+            let id = db.append(b"shards1-recovery").unwrap();
+            db.flush().unwrap();
+            db.shutdown(Duration::from_secs(5)).unwrap();
+            id
+        };
+        // shards=1 goes through the same unified per-shard loop (shard_bits=0).
+        let db = LogDb::open(config).unwrap();
+        let rec = db.read(id).unwrap().expect("shards=1 record must survive reopen");
+        assert_eq!(rec.content, b"shards1-recovery");
+        // Resume + append, no collision.
+        let nid = db.append(b"after").unwrap();
+        db.flush().unwrap();
+        assert!(db.read(nid).unwrap().is_some());
     }
 }

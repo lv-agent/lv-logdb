@@ -233,12 +233,6 @@ impl Slot {
     pub unsafe fn write_hash(&self, hash_n: [u8; 32]) {
         (&mut *self.inner.get()).hash_n = hash_n;
     }
-
-    /// Get the current sequence value (for debugging/testing).
-    #[inline]
-    pub(crate) fn sequence_value(&self) -> u64 {
-        self.sequence.load(Ordering::Relaxed)
-    }
 }
 
 // SlotInner does not need to be Send (it doesn't own heap data directly),
@@ -330,12 +324,6 @@ mod tests {
     fn empty_slot_not_published() {
         let slot = Slot::new();
         assert!(!slot.is_published(0)); // sequence starts at 0
-    }
-
-    #[test]
-    fn sequence_value_new_is_zero() {
-        let slot = Slot::new();
-        assert_eq!(slot.sequence_value(), 0);
     }
 
     #[test]

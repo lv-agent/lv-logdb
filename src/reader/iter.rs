@@ -20,7 +20,6 @@ use super::decode_frame_payload;
 
 /// A lazy iterator over records from a single segment file.
 pub struct RecordIter {
-    segment_path: PathBuf,
     /// File offset of the next frame (frame mode) or next record (raw mode).
     offset: u64,
     file_size: u64,
@@ -66,7 +65,6 @@ impl RecordIter {
         })?;
 
         Ok(Self {
-            segment_path,
             offset: start_offset,
             file_size,
             from_id,

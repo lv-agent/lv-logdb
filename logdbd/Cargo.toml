@@ -3,6 +3,7 @@ name = "logdbd"
 version = "0.1.0"
 edition = "2021"
 description = "Clustered log service built on logdb"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 logdb = { path = "../logdb", features = ["compression", "encryption"] }

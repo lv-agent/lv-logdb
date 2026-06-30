@@ -1493,4 +1493,250 @@ mod tests {
             shards_seen
         );
     }
+
+    #[test]
+    fn tailer_under_sharding_single_shard_is_delivered() {
+        // Single-thread appends all land on ONE shard (thread-affine routing).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        let n = 60u64;
+        let mut ids = Vec::new();
+        for i in 0..n {
+            ids.push(db.append(format!("s-{}", i).as_bytes()).unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.durable_cursor() >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut t = db.new_tailer("one-shard");
+        let mut got: Vec<u64> = Vec::new();
+        for _ in 0..200 {
+            match t.next_batch(1000).unwrap() {
+                Some(b) => got.extend(b.iter().map(|r| r.id.sequence)),
+                None => break,
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            got.len(),
+            n as usize,
+            "single-thread writes (one shard) must all be delivered"
+        );
+        assert!(ids.iter().all(|id| got.contains(id)));
+    }
+
+    #[test]
+    fn tailer_under_sharding_persists_per_shard_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let mut all_ids = Vec::new();
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                (0..10u64)
+                    .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.durable_cursor() >= 10 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Drain 12 records, commit, then reopen.
+        let mut delivered = Vec::new();
+        {
+            let mut t = db.new_tailer("persist");
+            while delivered.len() < 12 {
+                match t.next_batch(12).unwrap() {
+                    Some(b) => delivered.extend(b.iter().map(|r| r.id.sequence)),
+                    None => break,
+                }
+            }
+            t.commit().unwrap();
+        }
+        let saved_positions = db.new_tailer("persist").positions().to_vec();
+        assert!(
+            saved_positions.iter().any(|&p| p > 0),
+            "some shard progress must have persisted"
+        );
+
+        // Reopen and drain the rest; total must be all 40, exactly once.
+        let mut t = db.new_tailer("persist");
+        assert_eq!(
+            t.positions(),
+            saved_positions.as_slice(),
+            "reopened tailer must restore per-shard positions"
+        );
+        let mut rest = Vec::new();
+        for _ in 0..200 {
+            match t.next_batch(1000).unwrap() {
+                Some(b) => rest.extend(b.iter().map(|r| r.id.sequence)),
+                None => break,
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut all = delivered.clone();
+        all.extend(rest);
+        all.sort();
+        all_ids.sort();
+        assert_eq!(all, all_ids, "commit+reopen must deliver every record exactly once");
+    }
+
+    #[test]
+    fn tailer_under_sharding_resumes_without_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let spawn = |db: &Arc<LogDb>| -> Vec<u64> {
+            let mut handles = Vec::new();
+            for t in 0..4u64 {
+                let db = Arc::clone(db);
+                handles.push(std::thread::spawn(move || {
+                    (0..8u64)
+                        .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut ids = Vec::new();
+            for h in handles {
+                ids.extend(h.join().unwrap());
+            }
+            ids
+        };
+
+        let first = spawn(&db);
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.durable_cursor() >= 8 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Drain the first wave fully and commit.
+        {
+            let mut t = db.new_tailer("resume");
+            let mut got = Vec::new();
+            for _ in 0..200 {
+                match t.next_batch(1000).unwrap() {
+                    Some(b) => got.extend(b.iter().map(|r| r.id.sequence)),
+                    None => break,
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(got.len(), first.len());
+            t.commit().unwrap();
+        }
+
+        // Append a second wave.
+        let second = spawn(&db);
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.durable_cursor() >= 8 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Reopen: must deliver ONLY the second wave (no re-delivery, no loss).
+        let mut t = db.new_tailer("resume");
+        let mut got = Vec::new();
+        for _ in 0..200 {
+            match t.next_batch(1000).unwrap() {
+                Some(b) => got.extend(b.iter().map(|r| r.id.sequence)),
+                None => break,
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut want = second.clone();
+        let mut got_sorted = got.clone();
+        want.sort();
+        got_sorted.sort();
+        assert_eq!(
+            got_sorted, want,
+            "reopened tailer must deliver only the newly-appended records"
+        );
+    }
+
+    #[test]
+    fn tailer_crosses_segment_under_sharding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.segment_size = 1 * 1024 * 1024; // 1MB → rolls quickly with big payloads
+        config.ring_size = 8192;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(10);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        // Spread big records across both shards so at least one shard rolls.
+        let mut handles = Vec::new();
+        for t in 0..2u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                let payload = vec![0xA5u8 + t as u8; 64 * 1024]; // 64KB each
+                for _ in 0..20u64 {
+                    db.append(&payload).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.durable_cursor() >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut t = db.new_tailer("xseg");
+        let mut count = 0usize;
+        for _ in 0..300 {
+            match t.next_batch(1000).unwrap() {
+                Some(b) => count += b.len(),
+                None => break,
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            count,
+            2 * 20,
+            "tailer must cross segment boundaries within each shard"
+        );
+    }
 }

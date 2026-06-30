@@ -832,4 +832,75 @@ mod tests {
         // unchanged by the idempotent replay.
         assert_eq!(db.producer_cursor(), 2);
     }
+
+    // ── cr-003 Phase 1: sharded write/durability ─────────────────────────
+
+    // Read back every durable record from a single shard's directory by pointing
+    // the existing single-shard Reader at it. Within one shard, global ids are
+    // monotonic, so the existing reader works (cross-shard routing is Phase 2).
+    fn read_all_in_dir(dir: &std::path::Path) -> Vec<Vec<u8>> {
+        use std::sync::{Arc, Mutex};
+        let manifest = Arc::new(Mutex::new(reader::SegmentManifest::new(dir.to_path_buf())));
+        let reader = reader::Reader::new(manifest, None);
+        let mut out = Vec::new();
+        if let Ok(iter) = reader.scan(0, u64::MAX) {
+            for r in iter {
+                if let Ok(rec) = r {
+                    out.push(rec.content);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn append_under_sharding_is_durable_per_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        // Single-threaded appends are thread-affine → all land on one shard
+        // (uneven load). flush must still complete and every record be durable.
+        for i in 0..6u64 {
+            db.append(format!("rec-{}", i).as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+
+        let mut got: Vec<Vec<u8>> = (0..2u32)
+            .flat_map(|s| read_all_in_dir(&dir.path().join(format!("s{}", s))))
+            .collect();
+        got.sort();
+        let mut want: Vec<Vec<u8>> = (0..6u64).map(|i| format!("rec-{}", i).into_bytes()).collect();
+        want.sort();
+        assert_eq!(got, want, "all appended records must be durable per-shard under sharding");
+    }
+
+    #[test]
+    fn append_batch_under_sharding_is_durable_per_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        let batch: Vec<&[u8]> = vec![b"alpha", b"beta", b"gamma", b"delta"];
+        db.append_batch(&batch).unwrap();
+        db.flush().unwrap(); // cr-003: previously timed out / lost the batch
+
+        let mut got: Vec<Vec<u8>> = (0..2u32)
+            .flat_map(|s| read_all_in_dir(&dir.path().join(format!("s{}", s))))
+            .collect();
+        got.sort();
+        let mut want: Vec<Vec<u8>> = batch.iter().map(|b| b.to_vec()).collect();
+        want.sort();
+        assert_eq!(got, want, "append_batch records must all be durable per-shard under sharding");
+    }
 }

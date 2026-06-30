@@ -23,7 +23,7 @@ use logdb::storage::format::{
     MIN_RECORD_SIZE, record_size, serialize_record, deserialize_record,
 };
 use logdb::storage::index::{SparseIndex, IndexEntry};
-use logdb::reader::Reader;
+use logdb::LogDb;
 
 macro_rules! check {
     ($cond:expr, $msg:expr) => {
@@ -602,7 +602,7 @@ fn test_recover_after_write() -> i32 {
     drop(mgr);
     drop(ring);
 
-    let state = logdb::recovery::recover(dir.path(), 10_000_000, RetentionPolicy::KeepAll).unwrap();
+    let state = logdb::recovery::recover(dir.path(), 10_000_000, RetentionPolicy::KeepAll, None).unwrap();
     check!(state.last_sequence == 9, "recovered last sequence");
     0
 }
@@ -611,36 +611,47 @@ fn test_recover_after_write() -> i32 {
 
 fn test_reader_read_by_id() -> i32 {
     let dir = tempfile::tempdir().unwrap();
-    let ring = Ring::new(64, false, 0);
-    let mut mgr = SegmentManager::create(dir.path().to_path_buf(), 10_000_000, false, false, None, [0u8; 32], RetentionPolicy::KeepAll, 0).unwrap();
+    let mut config = Config::default();
+    config.data_dir = dir.path().to_path_buf();
+    config.ring_size = 64;
+    config.durability_mode = DurabilityMode::Sync;
+    config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(config).unwrap();
     for i in 0..5u64 {
-        let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-        unsafe { ring.slot(seq).producer_write(seq, i * 100, format!("rec-{}", i).as_bytes()); }
-        ring.slot(seq).publish(seq);
+        db.append(format!("rec-{}", i).as_bytes()).unwrap();
     }
-    mgr.append_batch(&ring, 0, 4).unwrap();
-    mgr.fdatasync().unwrap();
-    drop(mgr);
-
-    let reader = Reader::new(dir.path().to_path_buf());
-    let rec = reader.read(3).unwrap().unwrap();
+    db.flush().unwrap();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        if db.durable_cursor() >= 5 {
+            break;
+        }
+    }
+    check!(db.durable_cursor() >= 5, "records durable");
+    let rec = db.read(3).unwrap().unwrap();
     check!(rec.id.sequence == 3, "read seq");
     check!(rec.content == b"rec-3", "read content");
+    db.shutdown(Duration::from_secs(5)).unwrap();
     0
 }
 
 fn test_reader_nonexistent() -> i32 {
     let dir = tempfile::tempdir().unwrap();
-    let ring = Ring::new(64, false, 0);
-    let mut mgr = SegmentManager::create(dir.path().to_path_buf(), 10_000_000, false, false, None, [0u8; 32], RetentionPolicy::KeepAll, 0).unwrap();
-    let seq = ring.claim(QueueFullPolicy::Block).unwrap();
-    unsafe { ring.slot(seq).producer_write(seq, 0, b"only"); }
-    ring.slot(seq).publish(seq);
-    mgr.append_batch(&ring, 0, 0).unwrap();
-    mgr.fdatasync().unwrap();
-    drop(mgr);
-
-    let reader = Reader::new(dir.path().to_path_buf());
-    check!(reader.read(999).unwrap().is_none(), "nonexistent");
+    let mut config = Config::default();
+    config.data_dir = dir.path().to_path_buf();
+    config.ring_size = 64;
+    config.durability_mode = DurabilityMode::Sync;
+    config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(config).unwrap();
+    db.append(b"only").unwrap();
+    db.flush().unwrap();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        if db.durable_cursor() >= 1 {
+            break;
+        }
+    }
+    check!(db.read(999).unwrap().is_none(), "nonexistent");
+    db.shutdown(Duration::from_secs(5)).unwrap();
     0
 }

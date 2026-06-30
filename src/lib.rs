@@ -2169,4 +2169,81 @@ mod tests {
         assert_eq!(got.len(), total as usize, "tailer must deliver all under concurrency");
         assert!(ids.iter().all(|id| got.contains(id)));
     }
+
+    // ── cr-004: scan optimization characterization tests ─────────────────
+
+    #[test]
+    fn scan_raw_large_records_across_chunk_boundary() {
+        // Records larger than the read chunk force the buffer to compact/grow.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 1;
+        config.ring_size = 4096;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        let big = vec![0xA5u8; 80 * 1024]; // 80KB each — > 64KB chunk
+        let n = 40u64;
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            ids.push(db.append(&big).unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= n as usize {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let scanned: Vec<(u64, Vec<u8>)> = db
+            .scan(0, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| (r.id.sequence, r.content.clone()))
+            .collect();
+        assert_eq!(scanned.len(), n as usize);
+        for (id, content) in &scanned {
+            assert_eq!(content, &big, "large-record content must survive buffering");
+            assert!(ids.contains(id));
+        }
+    }
+
+    #[test]
+    fn scan_raw_respects_range_after_buffering() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 1;
+        config.ring_size = 4096;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..200u64 {
+            ids.push(db.append(format!("r-{}", i).as_bytes()).unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= 200 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        ids.sort();
+        let from = ids[50];
+        let to = ids[150];
+        let got: Vec<u64> = db
+            .scan(from, to)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .map(|r| r.id.sequence)
+            .collect();
+        let want: Vec<u64> = ids.iter().copied().filter(|&id| id >= from && id < to).collect();
+        assert_eq!(got, want, "range scan must be exact after buffering");
+    }
 }

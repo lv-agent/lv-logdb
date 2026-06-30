@@ -13,6 +13,8 @@
 //!    scan forward to the target record_id.
 
 pub mod iter;
+pub mod scan;
+pub use scan::ScanIter;
 
 use std::fs::{self, File};
 use std::io::{Read, Seek};

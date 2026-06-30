@@ -1423,4 +1423,65 @@ mod tests {
         db.flush().unwrap();
         assert!(db.read(nid).unwrap().is_some());
     }
+
+    // ── cr-003 Phase 5: cross-shard tailer (per-shard progress + merge) ───
+
+    #[test]
+    fn tailer_under_sharding_reads_all_shards_merged() {
+        // Multi-thread appends spread across shards (thread-affine routing).
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let total = 40u64; // 4 threads × 10
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                (0..10u64)
+                    .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut all_ids = Vec::new();
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+        // Wait until every shard is durable (min durable cursor advances).
+        for _ in 0..50 {
+            if db.durable_cursor() >= 10 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut t = db.new_tailer("merge");
+        let mut got: Vec<u64> = Vec::new();
+        // Drain in batches; bound the wait so the test fails fast if broken.
+        for _ in 0..200 {
+            match t.next_batch(1000).unwrap() {
+                Some(batch) => got.extend(batch.iter().map(|r| r.id.sequence)),
+                None => break,
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(got.len(), total as usize, "tailer must see every record across ALL shards");
+        assert!(got.windows(2).all(|w| w[0] < w[1]), "tailer batch must be ascending global id");
+        assert!(all_ids.iter().all(|id| got.contains(id)), "tailer missing some ids: got={:?}", got);
+        // Records must come from more than one shard (proves cross-shard merge).
+        let shards_seen: std::collections::HashSet<usize> =
+            got.iter().map(|&g| crate::shard::decode_record_id(g, 2).0).collect();
+        assert!(
+            shards_seen.len() > 1,
+            "tailer should have merged multiple shards, saw {:?}",
+            shards_seen
+        );
+    }
 }

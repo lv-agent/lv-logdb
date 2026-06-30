@@ -534,6 +534,7 @@ impl SegmentManager {
         let base_sequence = crate::shard::encode_record_id(self.shard_id, next_local_seq, self.shard_bits);
         let mut flags = if self.hash_enabled { FLAG_HASH_ENABLED } else { 0 } | format::FLAG_NOT_FIRST;
         if self.compressed { flags |= FLAG_COMPRESSED_ZSTD; }
+        if self.encryption_key.is_some() { flags |= format::FLAG_ENCRYPTED_AES256GCM; }
         let new_header = SegmentHeader {
             format_version: format::FORMAT_VERSION,
             flags,
@@ -593,6 +594,7 @@ impl SegmentManager {
             let new_id = self.active_id + 1;
             let mut flags = if self.hash_enabled { FLAG_HASH_ENABLED } else { 0 } | format::FLAG_NOT_FIRST;
             if self.compressed { flags |= FLAG_COMPRESSED_ZSTD; }
+            if self.encryption_key.is_some() { flags |= format::FLAG_ENCRYPTED_AES256GCM; }
             let new_header = SegmentHeader {
                 format_version: format::FORMAT_VERSION,
                 flags,

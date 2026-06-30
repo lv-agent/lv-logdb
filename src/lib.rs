@@ -2405,14 +2405,12 @@ mod tests {
 
     #[cfg(feature = "compression")]
     #[test]
-    #[ignore = "BUG: frame-mode scan across a segment roll miscounts/hangs — see cr-005 notes; fix in a follow-up"]
     fn compressed_scan_crosses_segment_roll() {
         compressed_or_encrypted_scan_crosses_roll(true, None);
     }
 
     #[cfg(feature = "encryption")]
     #[test]
-    #[ignore = "BUG: frame-mode scan across a segment roll hangs — see cr-005 notes; fix in a follow-up"]
     fn encrypted_scan_crosses_segment_roll() {
         compressed_or_encrypted_scan_crosses_roll(false, Some([0x99u8; 32]));
     }
@@ -2432,24 +2430,23 @@ mod tests {
         config.flush_timeout = Duration::from_secs(10);
         let db = LogDb::open(config).unwrap();
 
-        // Incompressible payload: zstd can't shrink it, so a compressed
-        // segment still fills and rolls (a constant payload would compress to
-        // almost nothing and never roll). Encryption is size-preserving so this
-        // works for the encrypted path too.
-        let payload: Vec<u8> = (0..64 * 1024)
-            .map(|i: usize| {
-                // splitmix64 finalizer — strong mixing so zstd cannot compress
-                // the payload (a constant/periodic payload would shrink below
-                // one segment and never roll).
-                let mut z = i as u64;
-                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-                (z ^ (z >> 31)) as u8
-            })
-            .collect();
-        let n = 25u64; // 25 × 64KB > 1MB → at least one roll
-        for _ in 0..n {
-            db.append(&payload).unwrap();
+        // Each record gets a UNIQUE incompressible payload (splitmix64 over
+        // record_index*65536 + byte_index). Uniqueness matters under compression:
+        // reusing one payload would let zstd deduplicate the 40 records to almost
+        // nothing and never roll. Size-preserving for the encrypted path.
+        let smix = |x: u64| -> u8 {
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            (z ^ (z >> 31)) as u8
+        };
+        let n = 40u64; // 40 × 64KB = 2.5MB > 1MB → at least one roll (even with compression)
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
+        for r in 0..n {
+            let base = r * (64 * 1024) as u64;
+            let p: Vec<u8> = (0..64 * 1024).map(|j| smix(base + j as u64)).collect();
+            db.append(&p).unwrap();
+            payloads.push(p);
         }
         db.flush().unwrap();
         for _ in 0..50 {
@@ -2466,14 +2463,21 @@ mod tests {
             .count();
         assert!(segs >= 2, "expected a frame-mode segment roll, found {}", segs);
 
-        // Frame-mode RecordIter must cross the roll and return all records.
-        let scanned: Vec<u64> = db
+        // Frame-mode RecordIter must cross the roll and return all records,
+        // with correct (decrypted/decompressed) content.
+        let scanned: Vec<(u64, Vec<u8>)> = db
             .scan(0, u64::MAX)
             .unwrap()
             .filter_map(|r| r.ok())
-            .map(|r| r.id.sequence)
+            .map(|r| (r.id.sequence, r.content.clone()))
             .collect();
         assert_eq!(scanned.len(), n as usize, "frame-mode scan must cross the segment roll");
-        assert_eq!((0..n).collect::<Vec<_>>(), scanned);
+        assert_eq!(
+            scanned.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            (0..n).collect::<Vec<_>>(),
+        );
+        for (id, content) in &scanned {
+            assert_eq!(content, &payloads[*id as usize], "content mismatch for id {}", id);
+        }
     }
 }

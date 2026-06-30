@@ -27,7 +27,8 @@ use super::trigger::{Backoff, CommitTrigger, WaitStrategy};
 /// Bit-encoded record_ids ensure global uniqueness regardless of write order.
 pub fn run_committer(
     rings: Vec<Arc<Ring>>,
-    mut seg_mgr: SegmentManager,
+    mut seg_mgrs: Vec<SegmentManager>,
+    shard_bits: u32,
     trigger: CommitTrigger,
     flush: Arc<FlushSignal>,
     shutdown: Arc<ShutdownState>,
@@ -63,11 +64,11 @@ pub fn run_committer(
 
         let has_any_unsynced = (0..num_shards).any(|s| committed[s] > durable[s]);
 
-        let flush_target = flush.target.load(std::sync::atomic::Ordering::Acquire);
+        let flush_pending = flush.any_pending();
         let need_commit_for_flush =
-            flush_target != u64::MAX && min_durable(&committed) < flush_target;
+            flush_pending && (0..num_shards).any(|s| committed[s] < flush.target(s));
         let need_sync_for_flush =
-            flush_target != u64::MAX && min_durable(&durable) < flush_target;
+            flush_pending && (0..num_shards).any(|s| durable[s] < flush.target(s));
 
         // ── Idle check ───────────────────────────────────────────────
         // Check if we should stop: draining + no work left
@@ -82,7 +83,9 @@ pub fn run_committer(
                 return;
             }
             pending_since = None;
-            seg_mgr.drain_pending_fsyncs();
+            for m in seg_mgrs.iter_mut() {
+                m.drain_pending_fsyncs();
+            }
             backoff.step();
             continue;
         }
@@ -111,7 +114,9 @@ pub fn run_committer(
             {
                 return;
             }
-            seg_mgr.drain_pending_fsyncs();
+            for m in seg_mgrs.iter_mut() {
+                m.drain_pending_fsyncs();
+            }
             backoff.step();
             continue;
         }
@@ -133,9 +138,9 @@ pub fn run_committer(
                 || shutdown.draining());
 
         if should_commit {
-            let to = choose_batch_end(committed[si], avail, seg_mgr.buf_cap());
+            let to = choose_batch_end(committed[si], avail, seg_mgrs[si].buf_cap());
 
-            match seg_mgr.append_batch(&rings[si], committed[si], to) {
+            match seg_mgrs[si].append_batch(&rings[si], committed[si], to) {
                 Ok(last_written) => {
                     committed[si] = last_written.wrapping_add(1);
                     rings[si]
@@ -150,8 +155,8 @@ pub fn run_committer(
                     health.clear_if_recovered();
                 }
                 Err(SegmentError::Full) => {
-                    let next_base = committed[si];
-                    match seg_mgr.roll(next_base, checkpoint.load(std::sync::atomic::Ordering::Acquire)) {
+                    let next_base = crate::shard::encode_record_id(si, committed[si], shard_bits);
+                    match seg_mgrs[si].roll(next_base, checkpoint.load(std::sync::atomic::Ordering::Acquire)) {
                         Ok(()) => continue,
                         Err(e) => {
                             health.set_error(match &e {
@@ -195,33 +200,33 @@ pub fn run_committer(
         };
 
         if sync_due {
-            // Fsync if any shard has un-fsynced data
+            // Fsync if any shard has un-fsynced data.
             let max_committed = committed.iter().max().copied().unwrap_or(0);
             let min_durable_val = min_durable(&durable);
             if max_committed > min_durable_val {
                 // P0-5: fsync pending (rolled) segments too, so durable_cursor
                 // never advances past un-fsynced data across a segment roll.
-                match seg_mgr.sync_all() {
-                    Ok(()) => {
-                        // Advance all shards' durable cursors to their committed values
+                // Sync every per-shard manager, then advance all durable cursors.
+                let mut sync_err: Option<std::io::Error> = None;
+                for m in seg_mgrs.iter_mut() {
+                    if let Err(e) = m.sync_all() {
+                        sync_err = Some(e);
+                        break;
+                    }
+                }
+                match sync_err {
+                    None => {
                         for s in 0..num_shards {
                             durable[s] = committed[s];
                             rings[s]
                                 .durable_cursor
                                 .store(durable[s], std::sync::atomic::Ordering::Release);
-                        }
-                        // Persist the active segment's sparse index alongside
-                        // each fsync so reads of the active segment can use it
-                        // (P2-1b). Best-effort.
-                        let _ = seg_mgr.save_active_index();
-
-                        // Complete flush if target reached
-                        let new_min = min_durable(&durable);
-                        if flush_target != u64::MAX && new_min >= flush_target {
-                            flush.complete(flush_target);
+                            // Per-shard flush completion + best-effort index save.
+                            flush.complete(s, durable[s]);
+                            let _ = seg_mgrs[s].save_active_index();
                         }
                     }
-                    Err(e) => {
+                    Some(e) => {
                         health.set_error(if platform::is_enospc(&e) {
                             HEALTH_DISK_FULL
                         } else {
@@ -242,7 +247,9 @@ pub fn run_committer(
         }
 
         if !should_commit && !sync_due {
-            seg_mgr.drain_pending_fsyncs();
+            for m in seg_mgrs.iter_mut() {
+                m.drain_pending_fsyncs();
+            }
             backoff.step();
         }
     }
@@ -294,8 +301,9 @@ mod tests {
             ring1.slot(seq).publish(seq);
         }
 
-        let seg_mgr = SegmentManager::create(
-            dir.path().to_path_buf(),
+        // One SegmentManager per shard, each in its own subdir.
+        let seg_mgr0 = SegmentManager::create(
+            dir.path().join("s0"),
             10 * 1024 * 1024,
             false, false, None,
             [0u8; 32],
@@ -303,8 +311,18 @@ mod tests {
             0,
         )
         .unwrap();
+        let seg_mgr1 = SegmentManager::create(
+            dir.path().join("s1"),
+            10 * 1024 * 1024,
+            false, false, None,
+            [0u8; 32],
+            RetentionPolicy::KeepAll,
+            0,
+        )
+        .unwrap();
+        let seg_mgrs = vec![seg_mgr0, seg_mgr1];
 
-        let flush = Arc::new(FlushSignal::new());
+        let flush = Arc::new(FlushSignal::new(2));
         let shutdown = Arc::new(ShutdownState::new());
         let health = Arc::new(HealthState::new());
         let trigger = CommitTrigger {
@@ -319,7 +337,7 @@ mod tests {
         let s = Arc::clone(&shutdown);
 
         let handle = std::thread::spawn(move || {
-            run_committer(rings, seg_mgr, trigger, flush, s, health, Arc::new(std::sync::atomic::AtomicU64::new(0)), wait);
+            run_committer(rings, seg_mgrs, 1, trigger, flush, s, health, Arc::new(std::sync::atomic::AtomicU64::new(0)), wait);
         });
 
         std::thread::sleep(Duration::from_millis(200));
@@ -355,7 +373,7 @@ mod tests {
         )
         .unwrap();
 
-        let flush = Arc::new(FlushSignal::new());
+        let flush = Arc::new(FlushSignal::new(1));
         let shutdown = Arc::new(ShutdownState::new());
         let health = Arc::new(HealthState::new());
         let trigger = CommitTrigger {
@@ -370,7 +388,7 @@ mod tests {
         let s = Arc::clone(&shutdown);
 
         let handle = std::thread::spawn(move || {
-            run_committer(rings, seg_mgr, trigger, flush, s, health, Arc::new(std::sync::atomic::AtomicU64::new(0)), wait);
+            run_committer(rings, vec![seg_mgr], 0, trigger, flush, s, health, Arc::new(std::sync::atomic::AtomicU64::new(0)), wait);
         });
 
         std::thread::sleep(Duration::from_millis(200));

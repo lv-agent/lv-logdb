@@ -33,7 +33,7 @@ use crate::ring::Ring;
 // ── RecordId encoding ──────────────────────────────────────────────────────
 
 /// Compute the number of bits needed to represent `shards - 1`.
-fn shard_bits(num_shards: usize) -> u32 {
+pub fn shard_bits(num_shards: usize) -> u32 {
     if num_shards <= 1 {
         return 0;
     }
@@ -202,6 +202,17 @@ impl ShardMap {
             .map(|r| r.durable_cursor.load(Ordering::Acquire))
             .min()
             .unwrap_or(0)
+    }
+
+    /// Per-shard producer cursors (snapshot for flush/drain).
+    pub fn producer_cursors(&self) -> Vec<u64> {
+        self.rings.iter().map(|r| r.producer_cursor_value()).collect()
+    }
+
+    /// Per-shard durable cursors.
+    pub fn durable_cursors(&self) -> Vec<u64> {
+        use std::sync::atomic::Ordering;
+        self.rings.iter().map(|r| r.durable_cursor.load(Ordering::Acquire)).collect()
     }
 }
 

@@ -92,37 +92,66 @@ impl LogDb {
         let data_dir = config.data_dir.clone();
         let hash_enabled = config.hash_enabled;
 
-        // Recover or create fresh
-        let (mut seg_mgr, initial_seq, last_hash, hash_init) = if data_dir.exists()
-            && data_dir.join("segment-00000001.log").exists()
-        {
-            let state = recovery::recover(
-                &data_dir,
-                config.segment_size,
-                config.retention.clone(),
-                config.encryption_key,
-            )?;
-            let initial = state.last_sequence.wrapping_add(1);
-            (state.segment_manager, initial, state.last_hash, state.hash_init)
+        let num_shards = config.shards;
+        let shard_bits = shard::shard_bits(num_shards);
+
+        // Build per-shard SegmentManagers.
+        // - shards=1: flat data_dir, recovery-aware (existing path).
+        // - shards>1: per-shard dir data_dir/s<shard>/; fresh create only for
+        //   now (per-shard recovery is Phase 4 — TODO).
+        let (mut seg_mgrs, initial_seq, last_hash, hash_init) = if num_shards == 1 {
+            if data_dir.exists() && data_dir.join("segment-00000001.log").exists() {
+                let state = recovery::recover(
+                    &data_dir,
+                    config.segment_size,
+                    config.retention.clone(),
+                    config.encryption_key,
+                )?;
+                let initial = state.last_sequence.wrapping_add(1);
+                (vec![state.segment_manager], initial, state.last_hash, state.hash_init)
+            } else {
+                let hi = generate_hash_init();
+                let sm = SegmentManager::create(
+                    data_dir.clone(),
+                    config.segment_size,
+                    hash_enabled,
+                    config.compression_enabled,  // compressed
+                    config.encryption_key,        // encryption
+                    hi,
+                    config.retention.clone(),
+                    0,
+                )
+                .map_err(|e| format!("create segment manager: {}", e))?;
+                (vec![sm], 0, [0u8; 32], hi)
+            }
         } else {
+            // Multi-shard: one SegmentManager per shard under s<shard>/.
+            // Fresh create only — per-shard recovery is Phase 4 (TODO).
             let hi = generate_hash_init();
-            let sm = SegmentManager::create(
-                data_dir.clone(),
-                config.segment_size,
-                hash_enabled,
-                config.compression_enabled,  // compressed
-                config.encryption_key,        // encryption
-                hi,
-                config.retention.clone(),
-                0,
-            )
-            .map_err(|e| format!("create segment manager: {}", e))?;
-            (sm, 0, [0u8; 32], hi)
+            let mut mgrs = Vec::with_capacity(num_shards);
+            for s in 0..num_shards {
+                let sdir = data_dir.join(format!("s{}", s));
+                let sm = SegmentManager::create(
+                    sdir,
+                    config.segment_size,
+                    hash_enabled,
+                    config.compression_enabled,
+                    config.encryption_key,
+                    hi,
+                    config.retention.clone(),
+                    0,
+                )
+                .map_err(|e| format!("create segment manager: {}", e))?;
+                mgrs.push(sm);
+            }
+            (mgrs, 0, [0u8; 32], hi)
         };
 
         // Apply the configured sparse-index stride before the Committer starts
         // appending (active index is still empty here).
-        seg_mgr.set_index_stride(config.index_stride);
+        for m in seg_mgrs.iter_mut() {
+            m.set_index_stride(config.index_stride);
+        }
 
         // Create shared state
         let shards = ShardMap::new(
@@ -132,7 +161,7 @@ impl LogDb {
             initial_seq,
         );
         let health = Arc::new(HealthState::new());
-        let flush = Arc::new(FlushSignal::new());
+        let flush = Arc::new(FlushSignal::new(num_shards));
         let shutdown = Arc::new(ShutdownState::new());
 
         let trigger = CommitTrigger {
@@ -143,7 +172,7 @@ impl LogDb {
         };
         let wait = config.wait_strategy;
 
-        // Spawn Committer — passes all rings for multi-shard polling
+        // Spawn Committer — passes all rings + per-shard managers for multi-shard polling
         let committer_rings = shards.all_rings().to_vec();
         let committer_flush = Arc::clone(&flush);
         let committer_shutdown = Arc::clone(&shutdown);
@@ -155,7 +184,8 @@ impl LogDb {
             .spawn(move || {
                 pipeline::committer::run_committer(
                     committer_rings,
-                    seg_mgr,
+                    seg_mgrs,
+                    shard_bits,
                     trigger,
                     committer_flush,
                     committer_shutdown,
@@ -243,14 +273,18 @@ impl LogDb {
 
         // Reserve the whole batch atomically (producer_cursor += n).
         let n = contents.len() as u64;
-        let (first_id, shard_id, _) = inner.shards.claim_batch(n, inner.config.queue_full_policy)?;
+        let (first_id, shard_id, local_first) =
+            inner.shards.claim_batch(n, inner.config.queue_full_policy)?;
         let ts = platform::clock_realtime_coarse_ns();
         let ring = inner.shards.ring(shard_id);
+        let shard_bits = inner.shards.shard_bits();
         for (i, content) in contents.iter().enumerate() {
-            let seq = first_id + i as u64;
-            // Safety: claim_batch reserved [first_id, first_id+n) exclusively.
-            unsafe { ring.slot(seq).producer_write(seq, ts, content); }
-            ring.slot(seq).publish(seq);
+            let local_seq = local_first + i as u64;
+            let global_id = shard::encode_record_id(shard_id, local_seq, shard_bits);
+            // Safety: claim_batch reserved the LOCAL range [local_first, local_first+n)
+            // exclusively. Slot is indexed by LOCAL seq; record_id stores the GLOBAL id.
+            unsafe { ring.slot(local_seq).producer_write(global_id, ts, content); }
+            ring.slot(local_seq).publish(local_seq);
         }
         Ok(first_id)
     }
@@ -285,10 +319,12 @@ impl LogDb {
         let (global_id, shard_id, local_seq) =
             inner.shards.claim(inner.config.queue_full_policy)?;
 
-        // Write slot (safety: claim guarantees exclusive access)
+        // Write slot (safety: claim guarantees exclusive access). Slot is indexed
+        // by LOCAL seq; record_id stores the GLOBAL id so read-back by global id
+        // works under sharding (shards=1: global == local, behavior unchanged).
         let ts = platform::clock_realtime_coarse_ns();
         let ring = inner.shards.ring(shard_id);
-        unsafe { ring.slot(local_seq).producer_write(local_seq, ts, content); }
+        unsafe { ring.slot(local_seq).producer_write(global_id, ts, content); }
 
         // Publish
         ring.slot(local_seq).publish(local_seq);
@@ -390,25 +426,28 @@ impl LogDb {
     pub fn flush(&self) -> Result<(), FlushError> {
         let inner = &self.inner;
 
-        let target = inner.shards.max_producer_cursor();
-        if target == 0 {
+        // Per-shard snapshot: flush completes when EVERY shard's durable reaches
+        // its own producer-cursor snapshot (handles uneven sharded loads).
+        let targets = inner.shards.producer_cursors();
+        if targets.iter().all(|&t| t == 0) {
             return Ok(());
         }
 
-        // If hash enabled, wait for Sealer first
+        // If hash enabled (shards=1 only), wait for Sealer first.
         #[cfg(feature = "hash-chain")]
         if inner.config.hash_enabled {
+            let target0 = targets[0];
             wait_until(
                 &inner.shutdown,
-                || inner.shards.ring(0).sealed_cursor.load(Ordering::Acquire) >= target,
+                || inner.shards.ring(0).sealed_cursor.load(Ordering::Acquire) >= target0,
                 inner.config.flush_timeout,
             )?;
         }
 
-        inner.flush.request(target);
+        inner.flush.request(&targets);
         wait_until(
             &inner.shutdown,
-            || inner.flush.is_done(target),
+            || inner.flush.is_done(&targets),
             inner.config.flush_timeout,
         )?;
 
@@ -584,15 +623,18 @@ impl LogDb {
             std::hint::spin_loop();
         }
 
-        // Phase 2: flush everything published up to the producer cursor.
-        let target = inner.shards.max_producer_cursor();
-        inner.shutdown.drain_target.store(target, Ordering::Release);
-        inner.flush.request(target);
+        // Phase 2: flush everything published up to each shard's producer cursor.
+        let targets = inner.shards.producer_cursors();
+        // drain_target is a single best-effort signal (max across shards); the
+        // committer drains per-shard via the FlushSignal targets.
+        let max_target = targets.iter().copied().max().unwrap_or(0);
+        inner.shutdown.drain_target.store(max_target, Ordering::Release);
+        inner.flush.request(&targets);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         let durable_ok = wait_until(
             &inner.shutdown,
-            || inner.flush.is_done(target),
+            || inner.flush.is_done(&targets),
             remaining,
         )
         .is_ok();

@@ -7,46 +7,59 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 // ── FlushSignal ────────────────────────────────────────────────────────────
 
-/// A signal mechanism for requesting and waiting for durability.
+/// Per-shard flush coordination.
 ///
-/// Multiple callers can concurrently request a flush. The `target` field
-/// stores the maximum requested target (CAS-max). The `completed` field
-/// stores the highest durable record_id+1 that has been fsynced.
-///
-/// `u64::MAX` is used as the "no request" sentinel.
+/// `targets[s]` holds the requested durability target for shard `s` (CAS-max;
+/// `u64::MAX` = no request). `completed[s]` holds the highest durable seq+1
+/// fsynced for shard `s` (CAS-max). A flush is satisfied when every shard's
+/// `completed[s] >= targets[s]`. This handles uneven sharded loads (each shard
+/// flushed to its own producer-cursor snapshot), unlike a single cross-shard
+/// min/max target which stalls when shards advance unevenly.
 pub struct FlushSignal {
-    /// Requested durability target (record_id+1); u64::MAX = no request.
-    pub(crate) target: AtomicU64,
-    /// Completed durability target (record_id+1).
-    pub(crate) completed: AtomicU64,
-}
-
-impl Default for FlushSignal {
-    fn default() -> Self {
-        Self {
-            target: AtomicU64::new(u64::MAX),
-            completed: AtomicU64::new(0),
-        }
-    }
+    targets: Box<[AtomicU64]>,
+    completed: Box<[AtomicU64]>,
 }
 
 impl FlushSignal {
-    /// Create a new flush signal.
-    pub fn new() -> Self {
-        Self::default()
+    /// Create a flush signal for `num_shards` shards.
+    pub fn new(num_shards: usize) -> Self {
+        Self {
+            targets: (0..num_shards)
+                .map(|_| AtomicU64::new(u64::MAX))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            completed: (0..num_shards)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
     }
 
-    /// Request durability up to `target` (record_id+1).
-    ///
-    /// Uses CAS-max: if multiple threads request different targets,
-    /// the maximum target is retained.
-    pub fn request(&self, target: u64) {
-        let mut cur = self.target.load(Ordering::Acquire);
-        loop {
-            let new = if cur == u64::MAX { target } else { cur.max(target) };
-            match self
-                .target
-                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+    /// Request durability up to `per_shard[s]` for each shard (CAS-max per shard).
+    pub fn request(&self, per_shard: &[u64]) {
+        for (s, &t) in per_shard.iter().enumerate() {
+            if s >= self.targets.len() {
+                break;
+            }
+            let mut cur = self.targets[s].load(Ordering::Acquire);
+            loop {
+                let new = if cur == u64::MAX { t } else { cur.max(t) };
+                match self.targets[s]
+                    .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => break,
+                    Err(v) => cur = v,
+                }
+            }
+        }
+    }
+
+    /// Mark shard `shard` as durable up to `durable` (CAS-max per shard).
+    pub fn complete(&self, shard: usize, durable: u64) {
+        let mut cur = self.completed[shard].load(Ordering::Acquire);
+        while cur < durable {
+            match self.completed[shard]
+                .compare_exchange_weak(cur, durable, Ordering::Release, Ordering::Acquire)
             {
                 Ok(_) => break,
                 Err(v) => cur = v,
@@ -54,30 +67,22 @@ impl FlushSignal {
         }
     }
 
-    /// Mark durability as completed up to `target` (record_id+1).
-    ///
-    /// Uses CAS-max to ensure monotonic progress.
-    pub fn complete(&self, target: u64) {
-        let mut cur = self.completed.load(Ordering::Acquire);
-        while cur < target {
-            match self
-                .completed
-                .compare_exchange_weak(cur, target, Ordering::Release, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                Err(v) => cur = v,
-            }
-        }
+    /// True when every shard's `completed >= per_shard[s]`.
+    pub fn is_done(&self, per_shard: &[u64]) -> bool {
+        per_shard
+            .iter()
+            .enumerate()
+            .all(|(s, &t)| s >= self.completed.len() || self.completed[s].load(Ordering::Acquire) >= t)
     }
 
-    /// Check whether the requested flush target has been reached.
-    pub fn is_done(&self, target: u64) -> bool {
-        self.completed.load(Ordering::Acquire) >= target
+    /// The requested target for `shard` (u64::MAX = none).
+    pub fn target(&self, shard: usize) -> u64 {
+        self.targets[shard].load(Ordering::Acquire)
     }
 
-    /// Get the current requested target (u64::MAX if none).
-    pub fn current_target(&self) -> u64 {
-        self.target.load(Ordering::Acquire)
+    /// Whether any shard has a pending flush request.
+    pub fn any_pending(&self) -> bool {
+        self.targets.iter().any(|t| t.load(Ordering::Acquire) != u64::MAX)
     }
 }
 
@@ -197,39 +202,53 @@ mod tests {
 
     #[test]
     fn flush_signal_initial_state() {
-        let sig = FlushSignal::new();
-        assert_eq!(sig.current_target(), u64::MAX);
-        assert!(!sig.is_done(1));
+        let sig = FlushSignal::new(1);
+        assert_eq!(sig.target(0), u64::MAX);
+        assert!(!sig.any_pending());
+        assert!(!sig.is_done(&[1]));
     }
 
     #[test]
     fn flush_signal_request_and_complete() {
-        let sig = FlushSignal::new();
-        sig.request(10);
-        assert_eq!(sig.current_target(), 10);
-        assert!(!sig.is_done(10));
+        let sig = FlushSignal::new(1);
+        sig.request(&[10]);
+        assert_eq!(sig.target(0), 10);
+        assert!(sig.any_pending());
+        assert!(!sig.is_done(&[10]));
 
-        sig.complete(10);
-        assert!(sig.is_done(10));
-        assert!(!sig.is_done(11));
+        sig.complete(0, 10);
+        assert!(sig.is_done(&[10]));
+        assert!(!sig.is_done(&[11]));
     }
 
     #[test]
     fn flush_signal_cas_max_request() {
-        let sig = FlushSignal::new();
-        sig.request(5);
-        sig.request(15); // higher target should win
-        sig.request(10); // lower target should not reduce
-        assert_eq!(sig.current_target(), 15);
+        let sig = FlushSignal::new(1);
+        sig.request(&[5]);
+        sig.request(&[15]); // higher target should win
+        sig.request(&[10]); // lower target should not reduce
+        assert_eq!(sig.target(0), 15);
     }
 
     #[test]
     fn flush_signal_complete_is_monotonic() {
-        let sig = FlushSignal::new();
-        sig.complete(20);
-        sig.complete(10); // should not regress
-        assert!(sig.is_done(10));
-        assert!(sig.is_done(20));
+        let sig = FlushSignal::new(1);
+        sig.complete(0, 20);
+        sig.complete(0, 10); // should not regress
+        assert!(sig.is_done(&[10]));
+        assert!(sig.is_done(&[20]));
+    }
+
+    #[test]
+    fn flush_signal_multi_shard_all_must_reach() {
+        // Two shards: done only when BOTH reach their per-shard target.
+        let sig = FlushSignal::new(2);
+        sig.request(&[10, 20]);
+        assert!(!sig.is_done(&[10, 20]));
+        sig.complete(0, 10); // shard 0 done
+        assert!(!sig.is_done(&[10, 20])); // shard 1 not yet
+        sig.complete(1, 20); // shard 1 done
+        assert!(sig.is_done(&[10, 20]));
     }
 
     // ── ShutdownState tests ────────────────────────────────────────────

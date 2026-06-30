@@ -554,20 +554,20 @@ fn test_health_set_clear() -> i32 {
 // ── Signal tests ───────────────────────────────────────────────────────────
 
 fn test_flush_signal_request_complete() -> i32 {
-    let sig = FlushSignal::new();
-    sig.request(10);
-    check!(!sig.is_done(10), "not done yet");
-    sig.complete(10);
-    check!(sig.is_done(10), "done");
+    let sig = FlushSignal::new(1);
+    sig.request(&[10]);
+    check!(!sig.is_done(&[10]), "not done yet");
+    sig.complete(0, 10);
+    check!(sig.is_done(&[10]), "done");
     0
 }
 
 fn test_flush_signal_cas_max() -> i32 {
-    let sig = FlushSignal::new();
-    sig.request(5);
-    sig.request(15);
-    sig.request(10);
-    check!(sig.current_target() == 15, "cas max");
+    let sig = FlushSignal::new(1);
+    sig.request(&[5]);
+    sig.request(&[15]);
+    sig.request(&[10]);
+    check!(sig.target(0) == 15, "cas max");
     0
 }
 

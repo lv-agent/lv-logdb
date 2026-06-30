@@ -77,24 +77,44 @@ pub struct ShardMap {
 }
 
 impl ShardMap {
-    /// Create a new ShardMap with `num_shards` rings.
+    /// Create a new ShardMap with `num_shards` rings, all resuming from the same
+    /// `initial_seq` (fresh create, or single-shard recovery). Equivalent to
+    /// [`new_with_initial`](Self::new_with_initial) with a uniform sequence.
     ///
-    /// Each ring is initialized with `ring_size / num_shards` slots so that
-    /// the total slot count across all shards equals `ring_size`.
-    /// `initial_seq` is the per-shard starting sequence number (0 for fresh,
-    /// last_record_id+1 for recovery).
+    /// Each ring gets `ring_size / num_shards` slots so the total slot count
+    /// across all shards equals `ring_size`. `initial_seq` is the per-shard
+    /// starting LOCAL sequence (0 for fresh, last_local+1 for recovery).
     pub fn new(
         num_shards: usize,
         ring_size: usize,
         hash_enabled: bool,
         initial_seq: u64,
     ) -> Self {
+        Self::new_with_initial(num_shards, ring_size, hash_enabled, &vec![initial_seq; num_shards])
+    }
+
+    /// Create a ShardMap where each shard's ring resumes from its OWN
+    /// `initial_seqs[s]` (per-shard recovery: each shard may have recovered a
+    /// different last-local sequence). `initial_seqs.len()` must equal
+    /// `num_shards`; each value is the LOCAL sequence at which that shard's ring
+    /// resumes (0 for a fresh/empty shard).
+    pub fn new_with_initial(
+        num_shards: usize,
+        ring_size: usize,
+        hash_enabled: bool,
+        initial_seqs: &[u64],
+    ) -> Self {
         assert!(num_shards >= 1, "num_shards must be >= 1");
+        assert_eq!(
+            initial_seqs.len(),
+            num_shards,
+            "initial_seqs length must match num_shards"
+        );
         let per_shard_slots: usize = (ring_size / num_shards).next_power_of_two().max(16);
 
         let sb = shard_bits(num_shards);
         let rings: Vec<Arc<Ring>> = (0..num_shards)
-            .map(|_| Arc::new(Ring::new(per_shard_slots, hash_enabled, initial_seq)))
+            .map(|s| Arc::new(Ring::new(per_shard_slots, hash_enabled, initial_seqs[s])))
             .collect();
 
         Self {

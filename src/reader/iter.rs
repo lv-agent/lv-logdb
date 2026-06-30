@@ -18,9 +18,15 @@ use crate::storage::format::{
 
 use super::decode_frame_payload;
 
+/// Read-chunk size for raw-mode scanning: amortizes per-record syscalls to
+/// roughly one `read` per chunk (≈ one per 1000 small records). Larger than
+/// any inline record; records above this trigger a buffer grow.
+const READ_CHUNK: usize = 64 * 1024;
+
 /// A lazy iterator over records from a single segment file.
 pub struct RecordIter {
-    /// File offset of the next frame (frame mode) or next record (raw mode).
+    /// File offset of the next frame (frame mode). (Raw mode uses the chunk
+    /// buffer below instead.)
     offset: u64,
     file_size: u64,
     /// First record_id to yield (skip anything below this).
@@ -42,6 +48,15 @@ pub struct RecordIter {
     /// Number of valid record bytes in `frame_data` (the frame's stored
     /// decompressed length, clamped to the actual decoded length).
     frame_len: usize,
+
+    // ── Raw mode only: chunked read buffer ──
+    /// Sliding window of file bytes (`buf.len()` == capacity; valid bytes are
+    /// `buf[0..buf_len]`; cursor is `buf_pos`).
+    buf: Vec<u8>,
+    buf_len: usize,
+    buf_pos: usize,
+    /// File offset corresponding to `buf[0]`.
+    base_offset: u64,
 }
 
 impl RecordIter {
@@ -76,6 +91,10 @@ impl RecordIter {
             frame_data: Vec::new(),
             frame_pos: 0,
             frame_len: 0,
+            buf: vec![0u8; READ_CHUNK],
+            buf_len: 0,
+            buf_pos: 0,
+            base_offset: start_offset,
         })
     }
 
@@ -124,16 +143,72 @@ impl RecordIter {
         self.offset += FRAME_HEADER_SIZE as u64 + cl as u64;
         true
     }
+
+    /// Ensure at least `n` bytes are available from the cursor (`buf_pos`)
+    /// onward, compacting and refilling from the file as needed. Returns
+    /// false at the file-size bound (torn tail / EOF) or on read error.
+    fn ensure_raw(&mut self, n: usize) -> bool {
+        // Fast path: already buffered.
+        if self.buf_pos + n <= self.buf_len {
+            return true;
+        }
+        // Compact unconsumed bytes to the front.
+        if self.buf_pos > 0 {
+            self.buf.copy_within(self.buf_pos..self.buf_len, 0);
+            self.buf_len -= self.buf_pos;
+            self.base_offset += self.buf_pos as u64;
+            self.buf_pos = 0;
+        }
+        // Grow if a single record exceeds the buffer (records may be up to
+        // max_content_size; the chunk is only READ_CHUNK).
+        if n > self.buf.len() {
+            let new_cap = n.next_power_of_two().max(READ_CHUNK);
+            self.buf.resize(new_cap, 0);
+        }
+        // Refill. `file` borrows `self.file`; the buffer accesses borrow
+        // `self.buf` — disjoint fields, allowed by the borrow checker.
+        let file = match self.file.as_mut() {
+            Some(f) => f,
+            None => return false,
+        };
+        while self.buf_len < n {
+            let remaining_in_file = self
+                .file_size
+                .saturating_sub(self.base_offset + self.buf_len as u64);
+            if remaining_in_file == 0 {
+                return false; // file bound reached without n bytes (torn tail)
+            }
+            let read_start = self.buf_len;
+            let space = self.buf.len() - read_start;
+            let want = (space as u64).min(remaining_in_file) as usize;
+            if want == 0 {
+                return false; // buffer full but still short (guard)
+            }
+            let file_pos = self.base_offset + read_start as u64;
+            if file.seek(SeekFrom::Start(file_pos)).is_err() {
+                self.file = None;
+                return false;
+            }
+            match file.read(&mut self.buf[read_start..read_start + want]) {
+                Ok(0) => return false,
+                Ok(k) => self.buf_len += k,
+                Err(_) => {
+                    self.file = None;
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 impl Iterator for RecordIter {
     type Item = Result<Record, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let file = match &mut self.file {
-            Some(f) => f,
-            None => return None,
-        };
+        if self.file.is_none() {
+            return None;
+        }
 
         if self.is_compressed || self.is_encrypted {
             // ── Frame mode ──
@@ -181,45 +256,39 @@ impl Iterator for RecordIter {
             }
         }
 
-        // ── Raw mode (uncompressed, unencrypted) ──
+        // ── Raw mode (uncompressed, unencrypted): chunked buffer scan ──
+        //
+        // The file is read in READ_CHUNK-sized windows into `buf`; records are
+        // parsed from the buffer via `buf_pos`. This amortizes syscalls to
+        // ~one read per chunk (vs the old seek+read+seek+read per record) and
+        // drops the per-record heap allocation. `ensure_raw` compacts/refills
+        // (and grows for records larger than the chunk) as needed.
         loop {
-            if self.offset >= self.file_size {
+            if !self.ensure_raw(4) {
                 self.file = None;
                 return None;
             }
-            if self.offset + 4 > self.file_size {
-                self.file = None;
-                return None;
-            }
-            let mut len_buf = [0u8; 4];
-            if let Err(e) = file.seek(SeekFrom::Start(self.offset)) {
-                self.file = None;
-                return Some(Err(ReadError::Io(format!("seek: {}", e))));
-            }
-            if let Err(e) = file.read_exact(&mut len_buf) {
-                self.file = None;
-                return Some(Err(ReadError::Io(format!("read len: {}", e))));
-            }
-            let total = u32::from_le_bytes(len_buf) as usize;
+            let p = self.buf_pos;
+            let total = u32::from_le_bytes([
+                self.buf[p],
+                self.buf[p + 1],
+                self.buf[p + 2],
+                self.buf[p + 3],
+            ]) as usize;
             if total < MIN_RECORD_SIZE {
-                self.offset += 1;
+                // Corrupt length — resync by advancing one byte (matches the
+                // legacy `offset += 1` byte-scan behavior).
+                self.buf_pos += 1;
                 continue;
             }
-            if self.offset + total as u64 > self.file_size {
+            if !self.ensure_raw(total) {
                 self.file = None;
-                return None;
+                return None; // torn tail
             }
-            let mut record_buf = vec![0u8; total];
-            if let Err(e) = file.seek(SeekFrom::Start(self.offset)) {
-                self.file = None;
-                return Some(Err(ReadError::Io(format!("seek record: {}", e))));
-            }
-            if let Err(e) = file.read_exact(&mut record_buf) {
-                self.file = None;
-                return Some(Err(ReadError::Io(format!("read record: {}", e))));
-            }
-            self.offset += total as u64;
-            match deserialize_record(&record_buf) {
+            let p = self.buf_pos;
+            let rec_bytes = &self.buf[p..p + total];
+            self.buf_pos += total;
+            match deserialize_record(rec_bytes) {
                 Ok((record, _)) => {
                     if record.id.sequence < self.from_id {
                         continue;

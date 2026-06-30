@@ -945,4 +945,74 @@ mod tests {
         want.sort();
         assert_eq!(got, want, "append_batch records must all be durable per-shard under sharding");
     }
+
+    // ── cr-003 Phase 2: sharded read (point lookup) ──────────────────────
+
+    #[test]
+    fn read_under_sharding_returns_record_by_global_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        // Single-threaded appends are thread-affine → one shard. Capture each
+        // returned global id and read it back by that id.
+        let mut ids = Vec::new();
+        for i in 0..6u64 {
+            let id = db.append(format!("rec-{}", i).as_bytes()).unwrap();
+            ids.push((id, format!("rec-{}", i).into_bytes()));
+        }
+        db.flush().unwrap();
+
+        for (id, want) in &ids {
+            let rec = db.read(*id).unwrap().expect("readable by global id");
+            assert_eq!(&rec.content, want);
+            assert_eq!(rec.id.sequence, *id);
+        }
+    }
+
+    #[test]
+    fn read_under_sharding_append_batch_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        let batch: Vec<&[u8]> = vec![b"alpha", b"beta", b"gamma", b"delta"];
+        let first = db.append_batch(&batch).unwrap();
+        db.flush().unwrap();
+
+        // append_batch returns the first record's global id; read it back.
+        let rec = db.read(first).unwrap().expect("first batch record readable");
+        assert_eq!(rec.content, b"alpha");
+        assert_eq!(rec.id.sequence, first);
+    }
+
+    #[test]
+    fn read_under_sharding_not_visible_before_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 2;
+        config.ring_size = 64;
+        config.durability_mode = DurabilityMode::Async; // fsync only on explicit flush
+        config.flush_timeout = Duration::from_secs(5);
+        let db = LogDb::open(config).unwrap();
+
+        let id = db.append(b"not-yet-durable").unwrap();
+        // In Async mode the committer does not fsync without a flush, so the
+        // per-shard durable cursor has not advanced → read returns None.
+        assert!(db.read(id).unwrap().is_none(), "not visible before durable");
+        db.flush().unwrap();
+        let rec = db.read(id).unwrap().expect("visible after flush");
+        assert_eq!(rec.content, b"not-yet-durable");
+    }
 }

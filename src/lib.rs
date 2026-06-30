@@ -94,57 +94,74 @@ impl LogDb {
         let num_shards = config.shards;
         let shard_bits = shard::shard_bits(num_shards);
 
-        // Build per-shard SegmentManagers.
-        // - shards=1: flat data_dir, recovery-aware (existing path).
-        // - shards>1: per-shard dir data_dir/s<shard>/; fresh create only for
-        //   now (per-shard recovery is Phase 4 — TODO).
-        let (mut seg_mgrs, initial_seq, last_hash, hash_init) = if num_shards == 1 {
-            if data_dir.exists() && data_dir.join("segment-00000001.log").exists() {
-                let state = recovery::recover(
-                    &data_dir,
+        // Build per-shard SegmentManagers, recovering each shard dir independently.
+        // Each shard is an independent recoverable log; within a shard, record ids
+        // are monotonic with stride `1 << shard_bits`. shards=1: flat data_dir,
+        // shard_bits=0 (identity encoding, stride 1). shards>1: data_dir/s<shard>/.
+        let mut seg_mgrs: Vec<SegmentManager> = Vec::with_capacity(num_shards);
+        let mut initial_seqs: Vec<u64> = Vec::with_capacity(num_shards);
+        let mut hash_init = [0u8; 32];
+        let mut last_hash = [0u8; 32];
+        let mut hash_init_known = false;
+
+        for s in 0..num_shards {
+            let sdir = if num_shards == 1 {
+                data_dir.clone()
+            } else {
+                data_dir.join(format!("s{}", s))
+            };
+            let has_data = sdir.exists() && sdir.join("segment-00000001.log").exists();
+
+            if has_data {
+                let st = recovery::recover_shard(
+                    &sdir,
+                    shard_bits,
                     config.segment_size,
                     config.retention.clone(),
                     config.encryption_key,
                 )?;
-                let initial = state.last_sequence.wrapping_add(1);
-                (vec![state.segment_manager], initial, state.last_hash, state.hash_init)
+                // Resume this shard's ring at the LOCAL seq after the last recovered
+                // record. An empty shard (recovered_count == 0) resumes at 0.
+                let initial_local = if st.recovered_count == 0 {
+                    0
+                } else {
+                    shard::decode_record_id(st.last_sequence, shard_bits).1 + 1
+                };
+                if !hash_init_known {
+                    hash_init = st.hash_init;
+                    last_hash = st.last_hash;
+                    hash_init_known = true;
+                }
+                seg_mgrs.push(st.segment_manager);
+                initial_seqs.push(initial_local);
             } else {
-                let hi = generate_hash_init();
-                let sm = SegmentManager::create(
-                    data_dir.clone(),
-                    config.segment_size,
-                    hash_enabled,
-                    config.compression_enabled,  // compressed
-                    config.encryption_key,        // encryption
-                    hi,
-                    config.retention.clone(),
-                    0,
-                )
-                .map_err(|e| format!("create segment manager: {}", e))?;
-                (vec![sm], 0, [0u8; 32], hi)
-            }
-        } else {
-            // Multi-shard: one SegmentManager per shard under s<shard>/.
-            // Fresh create only — per-shard recovery is Phase 4 (TODO).
-            let hi = generate_hash_init();
-            let mut mgrs = Vec::with_capacity(num_shards);
-            for s in 0..num_shards {
-                let sdir = data_dir.join(format!("s{}", s));
+                // Fresh shard. base_sequence stays 0 (the reader's `find`/
+                // `segments_from` rely on `base <= first_id`, which holds for 0
+                // across all shards). The first record's GLOBAL id carries the
+                // shard id in its low bits, so recovery re-seeds its stride chain
+                // from that first record rather than from base_sequence.
+                if !hash_init_known {
+                    hash_init = generate_hash_init();
+                    hash_init_known = true;
+                }
                 let sm = SegmentManager::create(
                     sdir,
                     config.segment_size,
                     hash_enabled,
                     config.compression_enabled,
                     config.encryption_key,
-                    hi,
+                    hash_init,
                     config.retention.clone(),
                     0,
                 )
                 .map_err(|e| format!("create segment manager: {}", e))?;
-                mgrs.push(sm);
+                seg_mgrs.push(sm);
+                initial_seqs.push(0);
             }
-            (mgrs, 0, [0u8; 32], hi)
-        };
+        }
+
+        // initial_seq is shard 0's resume point (used by the Sealer for shards=1).
+        let initial_seq = *initial_seqs.first().unwrap_or(&0);
 
         // Apply the configured sparse-index stride before the Committer starts
         // appending (active index is still empty here).
@@ -153,11 +170,11 @@ impl LogDb {
         }
 
         // Create shared state
-        let shards = ShardMap::new(
+        let shards = ShardMap::new_with_initial(
             config.shards,
             config.ring_size,
             hash_enabled,
-            initial_seq,
+            &initial_seqs,
         );
         let health = Arc::new(HealthState::new());
         let flush = Arc::new(FlushSignal::new(num_shards));

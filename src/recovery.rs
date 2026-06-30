@@ -376,7 +376,9 @@ fn scan_last_segment(
                 if total < MIN_RECORD_SIZE || doff + total > valid_len { break; }
                 match deserialize_record(&decoded[doff..doff + total]) {
                     Ok((record, _)) => {
-                        if record.id.sequence != expected_record_id {
+                        if record.id.sequence != expected_record_id
+                            && !(count == 0 && shard_bits > 0)
+                        {
                             frame_ok = false; break;
                         }
                         last_sequence = record.id.sequence;
@@ -434,7 +436,14 @@ fn scan_last_segment(
                 .map_err(|e| format!("read record at {}: {}", offset, e))?;
             match deserialize_record(&record_buf) {
                 Ok((record, _)) => {
-                    if record.id.sequence != expected_record_id {
+                    // The first record's global id may exceed base_sequence under
+                    // sharding (the shard id occupies the low bits, and base is 0):
+                    // allow that one mismatch and let the stride assignment below
+                    // (re)seed the chain. shards=1 (shard_bits==0) never takes the
+                    // exemption, so its strict first-record check is unchanged.
+                    if record.id.sequence != expected_record_id
+                        && !(count == 0 && shard_bits > 0)
+                    {
                         torn!(offset);
                     }
                     last_sequence = record.id.sequence;
@@ -456,7 +465,7 @@ fn scan_last_segment(
                         chain_prev = record.hash_n;
                     }
                     last_valid_offset = offset + total as u64;
-                    expected_record_id = record.id.sequence + 1;
+                    expected_record_id = record.id.sequence + stride;
                     offset = last_valid_offset;
                 }
                 Err(_) => {

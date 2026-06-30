@@ -34,4 +34,12 @@ lv-logdb/
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0. Dependency licenses are vetted with `cargo-deny`
+([`deny.toml`](deny.toml)); the library's attributions are in
+[`logdb/THIRDPARTY.md`](logdb/THIRDPARTY.md).
+
+## Security
+
+Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md). For the
+encryption/hash-chain threat model and key management, see
+[`logdb/docs/en/security/`](logdb/docs/en/security/).

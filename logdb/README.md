@@ -108,4 +108,11 @@ Many producer threads
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0. Third-party attributions: [`THIRDPARTY.md`](THIRDPARTY.md).
+
+## Security
+
+Using the `encryption` or `hash-chain` features? Read the
+[threat model](docs/en/security/threat-model.md) and
+[key management](docs/en/security/key-management.md) first. To report a
+vulnerability, see [`../SECURITY.md`](../SECURITY.md).

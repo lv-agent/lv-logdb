@@ -36,6 +36,14 @@ Read this if you are extending, debugging, or contributing to logdb itself.
   - [Extending](dev/extending.md)
   - [Contributing](dev/contributing.md)
 
+## Security
+
+Read this if you use the `encryption` or `hash-chain` features.
+
+- [Security overview](security/README.md)
+  - [Threat model](security/threat-model.md)
+  - [Key management](security/key-management.md)
+
 ## API reference
 
 API reference: run `cargo doc --open` (or docs.rs once published).
@@ -49,4 +57,4 @@ Language: English. ↔ [中文](../zh/README.md)
 - [Usage Guide](usage/README.md)
 - [Development Guide](dev/README.md)
 
-> logdb 0.2.0
+> logdb 0.3.0

@@ -39,6 +39,18 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   supported public API.
 - Crate-root re-exports: `RecordId`, `ScanIter`, `Tailer`, and the shard-id
   helpers (`encode_record_id` / `decode_record_id` / `shard_bits`).
+- **Security deliverables:** root [`SECURITY.md`](https://github.com/lv-agent/lv-logdb/blob/main/SECURITY.md)
+  (private vulnerability disclosure + SLA), a documented
+  [threat model](docs/en/security/threat-model.md) (what `encryption` /
+  `hash-chain` protect against — and what they do **not**, including the
+  caveat that the hash-chain key is derived from non-secret entropy and
+  persisted in cleartext, so the chain is tamper-evidence not authenticity),
+  and [key-management](docs/en/security/key-management.md) guidance (CSPRNG
+  generation, envelope encryption, rotation).
+- **License compliance:** `cargo-deny` config (`deny.toml`) enforcing a
+  permissive-only allow-list (no copyleft anywhere in the graph, enforced in
+  CI) and a [`THIRDPARTY.md`](THIRDPARTY.md) inventory of the 29 runtime
+  dependencies.
 - Cargo manifest metadata for crates.io publishing: `repository`, `homepage`,
   `documentation`, `readme`, `keywords`, `categories`, and `rust-version`
   (MSRV = 1.74, dictated by `thiserror` 2).

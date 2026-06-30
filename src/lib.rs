@@ -613,15 +613,17 @@ impl LogDb {
     }
 
     /// Get WAL space usage: (used_bytes, total_bytes_configured).
-    /// used_bytes = sum of all segment file sizes.
+    ///
+    /// `used_bytes` is the sum of all segment file sizes — flat in `data_dir`
+    /// for `shards == 1`, and across every `s<shard>/` subdir for `shards > 1`.
     pub fn wal_usage(&self) -> (u64, u64) {
-        let mut total = 0u64;
+        let mut total = count_log_bytes(&self.inner.data_dir);
+        // shards>1 lays segments under data_dir/s<shard>/ — sum those too.
         if let Ok(entries) = std::fs::read_dir(&self.inner.data_dir) {
             for e in entries.flatten() {
-                if let Ok(meta) = e.metadata() {
-                    if e.file_name().to_str().map_or(false, |n| n.ends_with(".log")) {
-                        total += meta.len();
-                    }
+                let path = e.path();
+                if path.is_dir() {
+                    total += count_log_bytes(&path);
                 }
             }
         }
@@ -774,6 +776,21 @@ fn save_checkpoint(dir: &std::path::Path, seq: u64) -> std::io::Result<()> {
     let d = std::fs::File::open(dir)?;
     platform::sync_dir(&d)?;
     Ok(())
+}
+
+/// Sum the sizes of all `*.log` files directly in `dir` (non-recursive).
+fn count_log_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_str().map_or(false, |n| n.ends_with(".log")) {
+                if let Ok(meta) = e.metadata() {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    total
 }
 
 fn generate_hash_init() -> [u8; 32] {

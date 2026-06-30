@@ -1798,4 +1798,50 @@ mod tests {
             used
         );
     }
+
+    #[test]
+    fn recovery_report_under_sharding_counts_across_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4;
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        let total = 40u64;
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..10u64 {
+                    db.append(format!("t{}-{}", t, i).as_bytes()).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        db.flush().unwrap();
+        // flush() is the durability sync point; wait until every record is on disk.
+        let scan_count = loop {
+            let n = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+            if n >= total as usize {
+                break n;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        // checkpoint defaults to 0 → every durable record (gid >= 0) counts.
+        // count must equal the full-scan ground truth (sum across ALL shards),
+        // not the min per-shard durable cursor.
+        let report = db.recovery_report();
+        assert_eq!(report.from_sequence, 0);
+        assert_eq!(
+            report.count as usize, scan_count,
+            "recovery_report.count must equal total durable records across shards (got {}, scan={})",
+            report.count, scan_count
+        );
+    }
 }

@@ -70,3 +70,16 @@ jobs:
       # Run without -D warnings: surface lints across both crates without
       # failing the pipeline.
       - run: cargo clippy --workspace --all-features
+
+  licenses:
+    name: cargo-deny (licenses, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Enforce the permissive license allow-list in deny.toml. A copyleft
+      # (GPL/AGPL/LGPL/MPL) or unknown-license dependency fails this job.
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check licenses

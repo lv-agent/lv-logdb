@@ -1,0 +1,61 @@
+# cargo-deny configuration.
+#
+# Run: cargo deny check
+# (CI runs this as a non-blocking job; failures surface but do not fail the build.)
+#
+# logdb and logdbd depend only on permissively-licensed crates. This config
+# enforces that: a copyleft / proprietary dependency would fail `licenses`.
+
+[graph]
+# Check the full workspace graph (both crates + dev-deps).
+all-features = true
+
+[advisories]
+# db-aware vulnerability advisories (RUSTSEC). `cargo deny check advisories`
+# fails on an unfixed advisory for a crate in the graph.
+version = 2
+ignore = [
+  # RUSTSEC-2025-0134: rustls-pemfile is unmaintained (archived 2025-08). It is
+  # a transitive dependency of tonic 0.12 (logdbd only — NOT in the logdb
+  # library's graph). No safe upgrade exists within tonic 0.12.x; the fix is a
+  # tonic 0.13+ upgrade, tracked separately for logdbd. Unmaintained (not an
+  # exploit); PEM parsing it provides is available via rustls-pki-types.
+  "RUSTSEC-2025-0134",
+]
+
+[bans]
+# Favor few, well-known deps. Not strictly enforced (warn-only would need
+# multiple-versions = "warn"); left at defaults to surface duplicate versions
+# without failing.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[licenses]
+version = 2
+# Allow only permissive licenses. Anything copyleft (GPL/AGPL/LGPL/MPL/CDDL/EPL)
+# or "unknown" fails the check.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unlicense",
+  "Unicode-3.0",
+]
+# Confidence threshold for license detection from crate metadata.
+confidence-threshold = 0.93
+
+# Crates whose license expression is an OR including a non-allowlisted option
+# (e.g. r-efi: "MIT OR Apache-2.0 OR LGPL-2.1-or-later") resolve to the first
+# *allowed* disjunct, so no exception is needed. If a crate legitimately
+# requires an exception, document why here:
+exceptions = []
+
+[sources]
+# Disallow crates not from crates.io / our own path deps.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

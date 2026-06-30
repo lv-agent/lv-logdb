@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::error::ConfigError;
+
 /// Policy when the ring buffer is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueFullPolicy {
@@ -185,32 +187,33 @@ impl Default for Config {
 impl Config {
     /// Validate the configuration.
     ///
-    /// Returns `Ok(())` if all constraints are satisfied, or an error describing
-    /// the first violation.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Returns `Ok(())` if all constraints are satisfied, or a structured
+    /// [`ConfigError`] describing the first violation. Callers can match on the
+    /// variant to react to a specific misconfiguration.
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.ring_size.is_power_of_two() || self.ring_size < 16 {
-            return Err(format!(
-                "ring_size must be a power of two >= 16, got {}",
-                self.ring_size
-            ));
+            return Err(ConfigError::InvalidRingSize(self.ring_size));
         }
         if self.shards < 1 || self.shards > 256 {
-            return Err(format!("shards must be in [1, 256], got {}", self.shards));
+            return Err(ConfigError::InvalidShardCount(self.shards));
         }
         if self.segment_size < 1 * 1024 * 1024 {
-            return Err(format!(
-                "segment_size must be >= 1MB, got {}",
-                self.segment_size
-            ));
+            return Err(ConfigError::SegmentTooSmall(self.segment_size));
         }
         if self.max_content_size > 64 * 1024 * 1024 {
-            return Err(format!(
-                "max_content_size must be <= 64MB, got {}",
-                self.max_content_size
-            ));
+            return Err(ConfigError::ContentTooLarge(self.max_content_size));
         }
         if self.index_stride == 0 {
-            return Err("index_stride must be >= 1".to_string());
+            return Err(ConfigError::ZeroIndexStride);
+        }
+        // hash-chain needs single-shard global ordering. Feature-gated to mirror
+        // exactly the constraint open() enforced on the sealer path; without the
+        // feature, hash_enabled has no effect and is not rejected here.
+        #[cfg(feature = "hash-chain")]
+        if self.hash_enabled && self.shards > 1 {
+            return Err(ConfigError::HashChainRequiresSingleShard {
+                shards: self.shards,
+            });
         }
         // Note: no arena_size constraint — ContentArena has been eliminated.
         // Content lives in Slot (inline or spill), gated by the single
@@ -233,35 +236,79 @@ mod tests {
     fn rejects_non_power_of_two_ring() {
         let mut c = Config::default();
         c.ring_size = 100;
-        assert!(c.validate().is_err());
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::InvalidRingSize(100))
+        ));
     }
 
     #[test]
     fn rejects_small_ring() {
         let mut c = Config::default();
         c.ring_size = 8;
-        assert!(c.validate().is_err());
+        assert!(matches!(c.validate(), Err(ConfigError::InvalidRingSize(8))));
     }
 
     #[test]
     fn rejects_zero_shards() {
         let mut c = Config::default();
         c.shards = 0;
-        assert!(c.validate().is_err());
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::InvalidShardCount(0))
+        ));
+    }
+
+    #[test]
+    fn rejects_too_many_shards() {
+        let mut c = Config::default();
+        c.shards = 257;
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::InvalidShardCount(257))
+        ));
     }
 
     #[test]
     fn rejects_small_segment() {
         let mut c = Config::default();
         c.segment_size = 512 * 1024; // 512KB
-        assert!(c.validate().is_err());
+        assert!(matches!(c.validate(), Err(ConfigError::SegmentTooSmall(_))));
     }
 
     #[test]
     fn rejects_huge_content() {
         let mut c = Config::default();
         c.max_content_size = 128 * 1024 * 1024; // 128MB
-        assert!(c.validate().is_err());
+        assert!(matches!(c.validate(), Err(ConfigError::ContentTooLarge(_))));
+    }
+
+    #[test]
+    fn rejects_zero_index_stride() {
+        let mut c = Config::default();
+        c.index_stride = 0;
+        assert!(matches!(c.validate(), Err(ConfigError::ZeroIndexStride)));
+    }
+
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn rejects_hash_chain_with_multiple_shards() {
+        let mut c = Config::default();
+        c.hash_enabled = true;
+        c.shards = 2;
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::HashChainRequiresSingleShard { shards: 2 })
+        ));
+    }
+
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn accepts_hash_chain_with_single_shard() {
+        let mut c = Config::default();
+        c.hash_enabled = true;
+        c.shards = 1;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

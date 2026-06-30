@@ -37,7 +37,9 @@ pub mod recovery;
 pub mod tailer;
 
 pub use config::Config;
-pub use error::{AppendError, FlushError, ReadError, ShutdownError, ShutdownReport};
+pub use error::{
+    AppendError, ConfigError, FlushError, OpenError, ReadError, ShutdownError, ShutdownReport,
+};
 pub use record::Record;
 
 /// Recovery report returned by [`LogDb::recovery_report`].
@@ -85,7 +87,12 @@ struct LogDbInner {
 
 impl LogDb {
     /// Open or create a logdb instance.
-    pub fn open(config: Config) -> Result<Self, String> {
+    ///
+    /// Validates `config`, recovers each shard's on-disk state (or creates a
+    /// fresh log), and spawns the background Committer (and Sealer, under
+    /// `hash-chain`). Returns a structured [`OpenError`] on failure so callers
+    /// can match on the category (invalid config, recovery, segment, thread).
+    pub fn open(config: Config) -> Result<Self, OpenError> {
         config.validate()?;
 
         let data_dir = config.data_dir.clone();
@@ -119,7 +126,8 @@ impl LogDb {
                     config.segment_size,
                     config.retention.clone(),
                     config.encryption_key,
-                )?;
+                )
+                .map_err(|reason| OpenError::Recovery { shard: s, reason })?;
                 // Resume this shard's ring at the LOCAL seq after the last recovered
                 // record. An empty shard (recovered_count == 0) resumes at 0.
                 let initial_local = if st.recovered_count == 0 {
@@ -154,7 +162,7 @@ impl LogDb {
                     config.retention.clone(),
                     0,
                 )
-                .map_err(|e| format!("create segment manager: {}", e))?;
+                .map_err(OpenError::SegmentCreate)?;
                 seg_mgrs.push(sm);
                 initial_seqs.push(0);
             }
@@ -218,17 +226,15 @@ impl LogDb {
                     wait,
                 );
             })
-            .map_err(|e| format!("spawn committer: {}", e))?;
+            .map_err(OpenError::ThreadSpawn)?;
 
-        // Spawn Sealer (if hash enabled, single-shard only in v1.1)
-        // Multi-shard hash chain requires global merge ordering — deferred to v1.2.
+        // Spawn Sealer (only when hash-chain is enabled). A global hash chain
+        // needs single-shard ordering, so validate() rejects hash_enabled with
+        // shards > 1 (ConfigError::HashChainRequiresSingleShard); by this point
+        // shards == 1 is guaranteed on this path. Multi-shard hashing remains
+        // deferred.
         #[cfg(feature = "hash-chain")]
         let sealer_handle = if hash_enabled {
-            if config.shards > 1 {
-                return Err("hash-chain is not supported with shards > 1 in v1.1. \
-                     Use shards=1 with hash-chain, or shards>1 without hash."
-                    .to_string());
-            }
             let sealer_ring = Arc::clone(shards.ring(0));
             let sealer_shutdown = Arc::clone(&shutdown);
             Some(
@@ -244,7 +250,7 @@ impl LogDb {
                             wait,
                         );
                     })
-                    .map_err(|e| format!("spawn sealer: {}", e))?,
+                    .map_err(OpenError::ThreadSpawn)?,
             )
         } else {
             None
@@ -287,7 +293,7 @@ impl LogDb {
     /// so consecutive batches never overwrite each other's slots.
     pub fn append_batch(&self, contents: &[&[u8]]) -> Result<u64, AppendError> {
         if contents.is_empty() {
-            return Err(AppendError::ContentTooLarge { size: 0, max: 0 });
+            return Err(AppendError::EmptyBatch);
         }
         let inner = &self.inner;
         if let Some(code) = inner.health.check() {
@@ -526,9 +532,7 @@ impl LogDb {
             Arc::clone(&inner.manifests[shard]),
             inner.config.encryption_key,
         );
-        let r = reader.read(record_id);
-        if matches!(r, Ok(None)) {}
-        r
+        reader.read(record_id)
     }
 
     // ── Internal state accessors (for diagnostics/benchmarking) ─────────
@@ -894,6 +898,28 @@ mod tests {
         let db = LogDb::open(config).unwrap();
         let err = db.append(&vec![0u8; 200]).unwrap_err();
         assert!(matches!(err, AppendError::ContentTooLarge { .. }));
+    }
+
+    #[test]
+    fn open_rejects_invalid_config_with_structured_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.ring_size = 8; // below the power-of-two >= 16 floor
+        assert!(matches!(
+            LogDb::open(config),
+            Err(OpenError::InvalidConfig(ConfigError::InvalidRingSize(8)))
+        ));
+    }
+
+    #[test]
+    fn append_batch_rejects_empty_with_structured_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        let db = LogDb::open(config).unwrap();
+        let err = db.append_batch(&[]).unwrap_err();
+        assert!(matches!(err, AppendError::EmptyBatch));
     }
 
     #[test]

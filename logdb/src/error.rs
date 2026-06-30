@@ -11,6 +11,10 @@ pub enum AppendError {
     #[error("ring buffer full")]
     QueueFull,
 
+    /// `append_batch` was called with an empty slice. Nothing was reserved.
+    #[error("append_batch called with an empty batch")]
+    EmptyBatch,
+
     /// Content exceeds `max_content_size` in config.
     #[error("content size {size} exceeds maximum {max}")]
     ContentTooLarge {
@@ -82,4 +86,67 @@ pub enum ShutdownReport {
     PartialDurable,
     /// Shutdown timed out; some data may be lost.
     TimedOut,
+}
+
+/// Errors that can occur while validating a [`Config`](crate::Config).
+///
+/// Returned by [`Config::validate`](crate::Config::validate). Structured (rather
+/// than a `String`) so callers can react to a specific misconfiguration. Each
+/// variant carries the offending value.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    /// `ring_size` is not a power of two or is below 16.
+    #[error("ring_size must be a power of two >= 16, got {0}")]
+    InvalidRingSize(usize),
+    /// `shards` is outside `[1, 256]`.
+    #[error("shards must be in [1, 256], got {0}")]
+    InvalidShardCount(usize),
+    /// `segment_size` is below the 1MB minimum.
+    #[error("segment_size must be >= 1MB, got {0}")]
+    SegmentTooSmall(u64),
+    /// `max_content_size` is above the 64MB ceiling.
+    #[error("max_content_size must be <= 64MB, got {0}")]
+    ContentTooLarge(usize),
+    /// `index_stride` is zero.
+    #[error("index_stride must be >= 1")]
+    ZeroIndexStride,
+    /// `hash-chain` requires a single shard (a global chain needs single-shard
+    /// order). Only present under the `hash-chain` feature.
+    #[cfg(feature = "hash-chain")]
+    #[error("hash-chain requires shards == 1, got shards = {shards}")]
+    HashChainRequiresSingleShard {
+        /// The offending shard count.
+        shards: usize,
+    },
+}
+
+/// Errors that can occur while opening a [`LogDb`](crate::LogDb).
+///
+/// Returned by [`LogDb::open`](crate::LogDb::open). Replaces the previous
+/// `Result<_, String>` so callers can match on the failure category and forward
+/// it through their own error types via `?`.
+///
+/// Only `Debug` is derived: some variants wrap an `io::Error` (not `Clone`).
+#[derive(Error, Debug)]
+pub enum OpenError {
+    /// The provided [`Config`](crate::Config) failed validation.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(#[from] ConfigError),
+    /// Crash recovery failed for one shard. `reason` is the underlying detail
+    /// (recovery currently returns a `String`; full structuring is tracked
+    /// separately).
+    #[error("recovery failed for shard {shard}: {reason}")]
+    Recovery {
+        /// The shard index that failed recovery.
+        shard: usize,
+        /// The underlying failure detail.
+        reason: String,
+    },
+    /// A segment manager could not be created (`SegmentManager::create`
+    /// returned an I/O error while creating the directory / first segment).
+    #[error("failed to create segment manager: {0}")]
+    SegmentCreate(#[source] std::io::Error),
+    /// A background thread (Committer or Sealer) could not be spawned.
+    #[error("failed to spawn background thread: {0}")]
+    ThreadSpawn(#[source] std::io::Error),
 }

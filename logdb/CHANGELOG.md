@@ -3,6 +3,40 @@
 All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] — Unreleased
+
+### Changed (BREAKING)
+
+- `LogDb::open` now returns `Result<Self, OpenError>` instead of
+  `Result<Self, String>`. `OpenError` is a structured enum
+  (`InvalidConfig` / `Recovery` / `SegmentCreate` / `ThreadSpawn`) so callers
+  can match on the failure category and forward it via `?`. Migration: replace
+  any `String`-matching on `open`'s error with `OpenError` (`.unwrap()` /
+  `.map_err(|e| format!(..))` callers are unaffected — `OpenError` implements
+  `Display`).
+- `Config::validate` now returns `Result<(), ConfigError>` instead of
+  `Result<(), String>`, with one variant per constraint
+  (`InvalidRingSize` / `InvalidShardCount` / `SegmentTooSmall` /
+  `ContentTooLarge` / `ZeroIndexStride` / `HashChainRequiresSingleShard`).
+- `append_batch(&[])` now returns `AppendError::EmptyBatch` instead of the
+  misleading `AppendError::ContentTooLarge { size: 0, max: 0 }`.
+
+### Added
+
+- `OpenError`, `ConfigError`, and `AppendError::EmptyBatch` error types.
+- Cargo manifest metadata for crates.io publishing: `repository`, `homepage`,
+  `documentation`, `readme`, `keywords`, `categories`, and `rust-version`
+  (MSRV = 1.74, dictated by `thiserror` 2).
+- `LICENSE` is now packaged inside the crate directory (it previously lived
+  only at the workspace root, so `cargo package` omitted it).
+
+### Known limitations (unchanged)
+
+- `recovery::recover_shard` still returns `Result<_, String>` (18 internal
+  error sites). It is captured by `OpenError::Recovery { shard, reason }`.
+  Full structuring is deferred to a follow-up that also narrows the `recovery`
+  module's visibility.
+
 ## [0.2.0] — 2026-06-30
 
 First tagged release. logdb is an embedded, append-only, crash-recoverable,
@@ -71,4 +105,5 @@ log database.
   make it cross-shard).
 - `replicate` (standby write-in) requires `shards == 1`.
 
-[0.2.0]: https://keepachangelog.com/en/1.1.0/
+[0.3.0]: https://github.com/lv-agent/lv-logdb/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/lv-agent/lv-logdb/releases/tag/v0.2.0

@@ -79,9 +79,8 @@ struct LogDbInner {
     data_dir: std::path::PathBuf,
     /// WAL checkpoint: records with sequence < this are safe to truncate.
     checkpoint_sequence: Arc<AtomicU64>,
-    /// Cached segment directory listing shared by all readers (P2-1: avoids
-    /// re-readdir + re-reading every segment header on each read/scan).
-    manifest: Arc<Mutex<reader::SegmentManifest>>,
+    /// Per-shard cached segment listings (one per shard dir).
+    manifests: Vec<Arc<Mutex<reader::SegmentManifest>>>,
 }
 
 impl LogDb {
@@ -228,7 +227,16 @@ impl LogDb {
             None
         };
 
-        let manifest = Arc::new(Mutex::new(reader::SegmentManifest::new(data_dir.clone())));
+        let manifests: Vec<Arc<Mutex<reader::SegmentManifest>>> = (0..num_shards)
+            .map(|s| {
+                let dir = if num_shards == 1 {
+                    data_dir.clone()
+                } else {
+                    data_dir.join(format!("s{}", s))
+                };
+                Arc::new(Mutex::new(reader::SegmentManifest::new(dir)))
+            })
+            .collect();
 
         Ok(Self {
             inner: Arc::new(LogDbInner {
@@ -242,7 +250,7 @@ impl LogDb {
                 sealer_handle,
                 data_dir,
                 checkpoint_sequence: checkpoint,
-                manifest,
+                manifests,
             }),
         })
     }
@@ -454,15 +462,26 @@ impl LogDb {
         Ok(())
     }
 
-    /// Read a single record by `record_id`.
+    /// Read a single record by `record_id` (a global id).
+    ///
+    /// Decodes the global id to its owning shard, gates on that shard's
+    /// durable cursor (per-shard visibility), and reads from that shard's
+    /// manifest. shards=1: shard 0, local == record_id (zero-regression).
     pub fn read(&self, record_id: u64) -> Result<Option<Record>, ReadError> {
-        let durable = self.inner.shards.min_durable_cursor();
-        if record_id >= durable {
+        let inner = &self.inner;
+        let (shard, local) = shard::decode_record_id(record_id, inner.shards.shard_bits());
+        let durable_s = inner
+            .shards
+            .durable_cursors()
+            .get(shard)
+            .copied()
+            .unwrap_or(0);
+        if local >= durable_s {
             return Ok(None);
         }
         let reader = reader::Reader::new(
-            Arc::clone(&self.inner.manifest),
-            self.inner.config.encryption_key,
+            Arc::clone(&inner.manifests[shard]),
+            inner.config.encryption_key,
         );
         reader.read(record_id)
     }
@@ -493,7 +512,7 @@ impl LogDb {
     /// Progress is persisted to `tailer_<name>.dat` via `commit()`.
     pub fn new_tailer(&self, name: &str) -> crate::tailer::Tailer {
         crate::tailer::Tailer::open(
-            Arc::clone(&self.inner.manifest),
+            Arc::clone(&self.inner.manifests[0]),
             Arc::clone(self.inner.shards.ring(0)),
             name,
             self.inner.config.encryption_key,
@@ -507,13 +526,17 @@ impl LogDb {
     }
 
     /// Scan records in range `[from_id, to_id)`.
+    ///
+    /// NOTE: cross-shard scan merge is Phase 3. Until then this reads
+    /// shard 0 — correct for `shards=1` (the only fully-supported scan
+    /// config). `shards>1` scan is intentionally limited here.
     pub fn scan(
         &self,
         from_id: u64,
         to_id: u64,
     ) -> Result<reader::iter::RecordIter, ReadError> {
         let reader = reader::Reader::new(
-            Arc::clone(&self.inner.manifest),
+            Arc::clone(&self.inner.manifests[0]),
             self.inner.config.encryption_key,
         );
         reader.scan(from_id, to_id)

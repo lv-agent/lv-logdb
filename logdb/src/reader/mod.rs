@@ -131,11 +131,12 @@ impl SegmentManifest {
 
     /// Re-scan the directory into `entries` iff its mtime changed (or on first
     /// call). On filesystems where mtime is unavailable, falls back to
-    /// refreshing every call (correct, just slower).
-    fn refresh_if_needed(&mut self) -> Result<(), ReadError> {
+    /// refreshing every call (correct, just slower). Returns `true` if the
+    /// cache was (re)populated this call, `false` if it was served unchanged.
+    fn refresh_if_needed(&mut self) -> Result<bool, ReadError> {
         let mtime = fs::metadata(&self.data_dir).and_then(|m| m.modified()).ok();
         if mtime == self.dir_mtime && !self.entries.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mut entries = Vec::new();
         let dir = fs::read_dir(&self.data_dir)
@@ -161,21 +162,50 @@ impl SegmentManifest {
         entries.sort_by_key(|e| e.segment_id);
         self.entries = entries;
         self.dir_mtime = mtime;
+        Ok(true)
+    }
+
+    /// Cached lookup (no refresh): the entry with the largest
+    /// `base_sequence <= seq`, or `None`. `base_sequence` is monotonic with
+    /// `segment_id`, so a partition_point (binary search) locates it in O(log N).
+    fn find_in_cache(&self, seq: u64) -> Option<ManifestEntry> {
+        let idx = self.entries.partition_point(|e| e.base_sequence <= seq);
+        if idx == 0 {
+            None
+        } else {
+            Some(self.entries[idx - 1].clone())
+        }
+    }
+
+    /// Force a rescan ignoring the mtime cache (the cache was found to be stale).
+    fn force_refresh(&mut self) -> Result<(), ReadError> {
+        self.dir_mtime = None;
+        self.refresh_if_needed()?;
         Ok(())
     }
 
     /// Find the segment containing `seq`: the entry with the largest
     /// `base_sequence <= seq`. Returns a clone so callers don't hold the lock
-    /// during file I/O. `base_sequence` is monotonic with `segment_id`, so a
-    /// partition_point (binary search) locates it in O(log N).
+    /// during file I/O.
+    ///
+    /// Guards against a stale cache: a segment may have been deleted (checkpoint
+    /// truncation / retention) without the directory mtime changing yet
+    /// (coarse-mtime filesystems, or propagation lag), in which case
+    /// `refresh_if_needed` would skip and serve an entry pointing at a now-missing
+    /// file. When we served from cache (not just rescanned) and the entry's file
+    /// is gone, force a rescan and re-lookup. Freshly-scanned entries are trusted.
     pub(crate) fn find(&mut self, seq: u64) -> Result<Option<ManifestEntry>, ReadError> {
-        self.refresh_if_needed()?;
-        let idx = self.entries.partition_point(|e| e.base_sequence <= seq);
-        Ok(if idx == 0 {
-            None
-        } else {
-            Some(self.entries[idx - 1].clone())
-        })
+        let refreshed = self.refresh_if_needed()?;
+        let entry = self.find_in_cache(seq);
+        if !refreshed {
+            if let Some(e) = &entry {
+                if !e.path.exists() {
+                    self.force_refresh()?;
+                    return Ok(self.find_in_cache(seq));
+                }
+            }
+        }
+        Ok(entry)
     }
 
     /// All segment entries from the one containing `seq` onward, in ascending
@@ -504,5 +534,60 @@ mod tests {
             None,
         );
         assert!(reader.read(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_rescans_when_cached_segment_deleted() {
+        // Reproduces the stale-manifest race behind the flaky
+        // `checkpoint_truncation` test. A segment listed in the cache is
+        // deleted (checkpoint truncation / retention), but the directory mtime
+        // reads as UNCHANGED (coarse-mtime filesystems, or propagation lag), so
+        // `refresh_if_needed` would skip and serve the stale entry — the caller
+        // then opens a now-missing file (transient read miss).
+        //
+        // `find()` must detect a stale entry (path gone) and force a rescan.
+        let dir = tempfile::tempdir().unwrap();
+        let ring = Ring::new(64, false, 0);
+        let mut mgr = crate::storage::SegmentManager::create(
+            dir.path().to_path_buf(),
+            10 * 1024 * 1024,
+            false,
+            false,
+            None,
+            [0u8; 32],
+            RetentionPolicy::KeepAll,
+            0,
+        )
+        .unwrap();
+        let seq = ring.claim(QueueFullPolicy::Block).unwrap();
+        unsafe {
+            ring.slot(seq).producer_write(seq, 0, b"rec-0");
+        }
+        ring.slot(seq).publish(seq);
+        mgr.append_batch(&ring, 0, 0).unwrap();
+        mgr.fdatasync().unwrap();
+        drop(mgr);
+
+        let mut manifest = SegmentManifest::new(dir.path().to_path_buf());
+        // Prime the cache: first find() scans + records dir_mtime.
+        let entry = manifest.find(0).unwrap().expect("segment should be cached");
+        assert!(entry.path.exists(), "segment file exists before deletion");
+
+        // Delete the segment (as truncation/retention would).
+        std::fs::remove_file(&entry.path).unwrap();
+
+        // Simulate a coarse-mtime filesystem: pretend the deletion did not
+        // change the directory mtime, so refresh_if_needed skips the rescan.
+        manifest.dir_mtime =
+            std::fs::metadata(dir.path()).and_then(|m| m.modified()).ok();
+
+        // Before the fix: find() returns the stale entry (path no longer
+        // exists) -> the caller's open fails. After: it force-rescans and
+        // reports the segment gone.
+        let stale = manifest.find(0).unwrap();
+        assert!(
+            stale.is_none(),
+            "find() must not return a stale entry for a deleted segment"
+        );
     }
 }

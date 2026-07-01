@@ -46,6 +46,19 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `append_batch(&[])` now returns `AppendError::EmptyBatch` instead of the
   misleading `AppendError::ContentTooLarge { size: 0, max: 0 }`.
 
+### Fixed
+
+- **Stale-manifest read miss after segment deletion.** `SegmentManifest` caches
+  the segment directory listing and refreshes it only when the directory mtime
+  changes. On filesystems with coarse mtime granularity (or under mtime
+  propagation lag), a segment deleted by checkpoint truncation / retention
+  could remain in the cache, so `read()` returned an entry pointing at a
+  now-missing file — a transient read miss. This was the root cause of the
+  intermittently-failing `checkpoint_truncation` test (which retried around it).
+  `find()` now detects a cache-served entry whose file is gone, force-rescans,
+  and re-looks-up. The fast path adds no overhead (freshly-scanned entries are
+  trusted).
+
 ### Added
 
 - `OpenError`, `ConfigError`, and `AppendError::EmptyBatch` error types.

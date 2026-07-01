@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # logdb — Build release binaries for deployment (no-Rust target machines).
 #
-# Set FEATURES to select optional crate features (comma-separated):
-#   FEATURES="hash-chain" ./scripts/build.sh
-#   FEATURES="hash-chain,compression" ./scripts/build.sh
-#   FEATURES="" ./scripts/build.sh              # default (no optional features)
+# Environment variables:
+#   FEATURES  — comma-separated Cargo features (default: none)
+#               e.g. FEATURES="hash-chain,compression"
+#   TARGET    — cross-compilation target triple (default: native)
+#               e.g. TARGET=aarch64-unknown-linux-gnu
 #
-# Produces in target/release/examples/:
+# Cross-compilation example (x86 → arm64):
+#   # one-time setup
+#   rustup target add aarch64-unknown-linux-gnu
+#   sudo apt install gcc-aarch64-linux-gnu   # Debian/Ubuntu
+#   # or on Fedora:
+#   sudo dnf install gcc-aarch64-linux-gnu
+#
+#   TARGET=aarch64-unknown-linux-gnu FEATURES="hash-chain" ./scripts/build.sh
+#
+# Produces in target/<triple>/release/examples/:
 #   perf             — append throughput / latency
 #   scan_perf        — range-scan throughput
 #   read_perf        — point-read throughput + read_batch
@@ -26,31 +36,44 @@ WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$WORKSPACE_DIR"
 
 FEATURES="${FEATURES:-}"
+TARGET="${TARGET:-}"
 
 echo "=== logdb Build ==="
 echo "rustc: $(rustc --version)"
 echo "cargo: $(cargo --version)"
-echo "target: $(rustc -vV | grep host | awk '{print $2}')"
+echo "host:   $(rustc -vV | grep host | awk '{print $2}')"
+echo "target: ${TARGET:-native}"
 echo "features: '${FEATURES}'"
 echo ""
 
+# Compute the binary output directory; cross-compilation puts binaries under
+# target/<triple>/release/ instead of target/release/.
+if [ -n "$TARGET" ]; then
+    CARGO_TARGET_FLAG="--target $TARGET"
+    TARGET_DIR="target/$TARGET/release"
+else
+    CARGO_TARGET_FLAG=""
+    TARGET_DIR="target/release"
+fi
+
 echo "Building performance examples (features: '${FEATURES:-none}')..."
-cargo build --release -p logdb --features "$FEATURES" \
+cargo build --release -p logdb --features "$FEATURES" $CARGO_TARGET_FLAG \
     --example perf --example scan_perf --example read_perf \
     --example sharding --example tailer_consumer
 
 echo "Building soak / crash_test / testsuite..."
-cargo build --release -p logdb --features testing \
+cargo build --release -p logdb --features testing $CARGO_TARGET_FLAG \
     --example soak --example crash_test --example testsuite
 
 echo ""
 echo "Binaries:"
-ls -lh target/release/examples/{perf,scan_perf,read_perf,sharding,tailer_consumer,soak,crash_test,testsuite}
+BIN_DIR="$TARGET_DIR/examples"
+ls -lh "$BIN_DIR"/{perf,scan_perf,read_perf,sharding,tailer_consumer,soak,crash_test,testsuite}
 echo ""
 echo "=== Build complete ==="
 echo ""
 echo "To run on the target machine (no Rust needed):"
-echo "  scp target/release/examples/{perf,scan_perf,read_perf} user@target:/tmp/"
+echo "  scp $BIN_DIR/{perf,scan_perf,read_perf} user@target:/tmp/"
 echo "  ssh user@target /tmp/perf"
 echo "  ssh user@target /tmp/scan_perf"
 echo "  ssh user@target /tmp/read_perf"

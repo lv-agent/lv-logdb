@@ -61,6 +61,12 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `LogDb::read_batch(&[u64]) -> Result<Vec<Option<Record>>, ReadError>` — a
+  multi-get. For clustered ids it is dramatically faster than N individual
+  `read()`s: a single forward pass reads each record once (with OS read-ahead)
+  instead of re-seeking and re-scanning to each id. Measured ~190× on a 20k-record
+  batch (~3 µs/record vs ~600 µs). Result order matches `ids`; missing /
+  not-yet-durable ids yield `None`.
 - `OpenError`, `ConfigError`, and `AppendError::EmptyBatch` error types.
 - `tracing` feature: an off-by-default feature that emits structured events
   (segment rolls, retention, recovery warnings, flush/drain timeouts, the

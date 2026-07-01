@@ -341,6 +341,29 @@ impl Reader {
         };
 
         let mut file = File::open(&path).map_err(|e| ReadError::Io(format!("open: {}", e)))?;
+        self.read_from_open_file(
+            &mut file,
+            file_size,
+            is_compressed,
+            is_encrypted,
+            start_offset,
+            record_id,
+        )
+    }
+
+    /// Read `record_id` from an already-open segment file, scanning forward from
+    /// `start_offset`. Shared by [`read`](Reader::read) (one record) and
+    /// [`read_batch`](Reader::read_batch) (many records from the same open file,
+    /// amortizing the open + index load across the batch).
+    fn read_from_open_file(
+        &self,
+        file: &mut File,
+        file_size: u64,
+        is_compressed: bool,
+        is_encrypted: bool,
+        start_offset: u64,
+        record_id: u64,
+    ) -> Result<Option<Record>, ReadError> {
         let mut offset = start_offset;
 
         if is_compressed || is_encrypted {
@@ -441,6 +464,167 @@ impl Reader {
         }
 
         Ok(None)
+    }
+
+    /// Read many records by id in one call. Cheaper than N individual
+    /// [`read`](Reader::read)s when several ids land in the same segment: the
+    /// segment file is opened and its sparse index loaded **once per segment**,
+    /// not once per record. Records not present (or beyond the durable cursor)
+    /// yield `None` at their position. Result order matches `ids`.
+    ///
+    /// All `ids` must belong to this `Reader`'s shard (the public entry point
+    /// [`LogDb::read_batch`](crate::LogDb::read_batch) routes per shard).
+    pub fn read_batch(&self, ids: &[u64]) -> Result<Vec<Option<Record>>, ReadError> {
+        let mut results: Vec<Option<Record>> = vec![None; ids.len()];
+        if ids.is_empty() {
+            return Ok(results);
+        }
+        // Resolve each id -> segment entry (manifest caches the listing; O(log N)).
+        // Unresolved ids stay None.
+        let mut resolved: Vec<(usize, ManifestEntry)> = Vec::with_capacity(ids.len());
+        {
+            let mut m = self.manifest.lock().unwrap();
+            for (i, &id) in ids.iter().enumerate() {
+                if let Some(entry) = m.find(id)? {
+                    resolved.push((i, entry));
+                }
+            }
+        }
+        // Cluster ids in the same segment, then read each cluster with one open
+        // file + one sparse-index load.
+        resolved.sort_by_key(|(_, e)| e.path.clone());
+        let mut start = 0;
+        while start < resolved.len() {
+            let path = resolved[start].1.path.clone();
+            let mut end = start + 1;
+            while end < resolved.len() && resolved[end].1.path == path {
+                end += 1;
+            }
+            let entry = &resolved[start].1;
+            let is_compressed = entry.flags & crate::storage::format::FLAG_COMPRESSED_ZSTD != 0;
+            let is_encrypted = entry.flags & crate::storage::format::FLAG_ENCRYPTED_AES256GCM != 0;
+
+            let file_size = match fs::metadata(&path) {
+                Ok(m) => m.len(),
+                Err(_) => {
+                    start = end;
+                    continue;
+                }
+            };
+            let mut file = match File::open(&path) {
+                Ok(f) => f,
+                Err(_) => {
+                    start = end;
+                    continue;
+                }
+            };
+            // Load this segment's index once (raw segments only).
+            let index = if is_compressed || is_encrypted {
+                None
+            } else {
+                let idx_path = SparseIndex::index_path(&path);
+                if idx_path.exists() {
+                    SparseIndex::load(&idx_path).ok()
+                } else {
+                    None
+                }
+            };
+            // Targets in this segment, sorted ascending by id (records are
+            // stored ascending within a shard, so a single forward pass merges).
+            let mut group: Vec<(usize, u64)> = (start..end)
+                .map(|i| (resolved[i].0, ids[resolved[i].0]))
+                .collect();
+            group.sort_by_key(|&(_, id)| id);
+
+            if !is_compressed && !is_encrypted {
+                // Single forward pass: each record is read exactly once.
+                let start_offset = group
+                    .first()
+                    .and_then(|&(_, id)| {
+                        index.as_ref().and_then(|idx| idx.find_anchor(id))
+                    })
+                    .map(|(e, _)| e.file_offset)
+                    .unwrap_or(SEGMENT_HEADER_SIZE as u64);
+                for (slot, record) in
+                    Self::read_many_raw(&mut file, file_size, start_offset, &group)?
+                {
+                    results[slot] = Some(record);
+                }
+            } else {
+                // Frame segments: per-id seek (frames must be decoded whole).
+                for (slot, id) in group {
+                    results[slot] = self.read_from_open_file(
+                        &mut file,
+                        file_size,
+                        is_compressed,
+                        is_encrypted,
+                        SEGMENT_HEADER_SIZE as u64,
+                        id,
+                    )?;
+                }
+            }
+            start = end;
+        }
+        Ok(results)
+    }
+
+    /// Scan a raw segment forward from `start_offset`, reading each record once,
+    /// and return the ones whose id is in `targets` (sorted ascending by id).
+    /// A single pass replaces N per-id anchor-seeks — far fewer reads when
+    /// several targets cluster in one segment. Records are stored ascending
+    /// within a shard, so this is a merge: skip records below the next target,
+    /// emit on match, stop past the last target.
+    fn read_many_raw(
+        file: &mut File,
+        file_size: u64,
+        start_offset: u64,
+        targets: &[(usize, u64)],
+    ) -> Result<Vec<(usize, Record)>, ReadError> {
+        let mut out = Vec::with_capacity(targets.len());
+        if targets.is_empty() {
+            return Ok(out);
+        }
+        let mut t = 0usize;
+        let mut offset = start_offset;
+        while offset < file_size && t < targets.len() {
+            if offset + 4 > file_size {
+                break;
+            }
+            let mut len_buf = [0u8; 4];
+            file.seek(std::io::SeekFrom::Start(offset))
+                .map_err(|e| ReadError::Io(format!("seek: {}", e)))?;
+            if file.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let total = u32::from_le_bytes(len_buf) as usize;
+            if total < MIN_RECORD_SIZE {
+                offset += 1; // resync past a corrupt length
+                continue;
+            }
+            if offset + total as u64 > file_size {
+                break;
+            }
+            let mut record_buf = vec![0u8; total];
+            file.seek(std::io::SeekFrom::Start(offset))
+                .map_err(|e| ReadError::Io(format!("seek rec: {}", e)))?;
+            file.read_exact(&mut record_buf)
+                .map_err(|e| ReadError::Io(format!("read rec: {}", e)))?;
+            offset += total as u64;
+            let Ok((record, _)) = deserialize_record(&record_buf) else {
+                continue;
+            };
+            let id = record.id.sequence;
+            // Merge: drop targets below this id (absent — gap/deleted).
+            while t < targets.len() && targets[t].1 < id {
+                t += 1;
+            }
+            if t < targets.len() && targets[t].1 == id {
+                out.push((targets[t].0, record));
+                t += 1;
+            }
+            // targets[t].1 > id → this record isn't targeted; keep scanning.
+        }
+        Ok(out)
     }
 
     /// Scan records in the range `[from_id, to_id)` within the single segment

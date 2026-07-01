@@ -579,6 +579,53 @@ impl LogDb {
         reader.read(record_id)
     }
 
+    /// Read many records by id in one call — a multi-get. Faster than N
+    /// individual [`read`](LogDb::read)s when several ids share a segment:
+    /// `read_batch` opens each segment file and loads its sparse index **once
+    /// per segment**, not once per record.
+    ///
+    /// Result order matches `ids`. Ids that don't exist, or whose records are
+    /// not yet durable, yield `None` at their position.
+    pub fn read_batch(&self, ids: &[u64]) -> Result<Vec<Option<Record>>, ReadError> {
+        let mut results: Vec<Option<Record>> = vec![None; ids.len()];
+        if ids.is_empty() {
+            return Ok(results);
+        }
+        let inner = &self.inner;
+        let bits = inner.shards.shard_bits();
+        let durable = inner.shards.durable_cursors();
+
+        // Group result slots by shard (each shard has its own manifest/reader).
+        let mut by_shard: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, &id) in ids.iter().enumerate() {
+            let (shard, _local) = shard::decode_record_id(id, bits);
+            by_shard.entry(shard).or_default().push(i);
+        }
+        for (shard, slots) in by_shard {
+            let durable_s = durable.get(shard).copied().unwrap_or(0);
+            // Keep only ids that are durable in this shard; the rest stay None.
+            let live: Vec<(usize, u64)> = slots
+                .iter()
+                .map(|&slot| (slot, ids[slot]))
+                .filter(|&(_slot, id)| shard::decode_record_id(id, bits).1 < durable_s)
+                .collect();
+            if live.is_empty() {
+                continue;
+            }
+            let reader = reader::Reader::new(
+                Arc::clone(&inner.manifests[shard]),
+                inner.config.encryption_key,
+            );
+            let shard_ids: Vec<u64> = live.iter().map(|&(_, id)| id).collect();
+            let mut batch = reader.read_batch(&shard_ids)?;
+            for (k, (slot, _id)) in live.iter().enumerate() {
+                results[*slot] = batch[k].take(); // move (no Record clone)
+            }
+        }
+        Ok(results)
+    }
+
     // ── Internal state accessors (for diagnostics/benchmarking) ─────────
 
     /// Get the maximum producer cursor across all shards.
@@ -958,6 +1005,78 @@ mod tests {
         let record = db.read(id).unwrap().unwrap();
         assert_eq!(record.id.sequence, id);
         assert_eq!(record.content, b"hello logdb");
+    }
+
+    #[test]
+    fn read_batch_matches_single_reads() {
+        // read_batch must return the same records as N individual reads, in the
+        // same order, with None for missing / not-yet-durable ids.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.shards = 4; // exercise the per-shard routing inside read_batch
+        config.ring_size = 256;
+        config.durability_mode = DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        let db = Arc::new(LogDb::open(config).unwrap());
+
+        // Spread writes across shards (thread-affine routing).
+        let mut all_ids = Vec::new();
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let db = Arc::clone(&db);
+            handles.push(std::thread::spawn(move || {
+                (0..8u64)
+                    .map(|i| db.append(format!("t{}-{}", t, i).as_bytes()).unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        for h in handles {
+            all_ids.extend(h.join().unwrap());
+        }
+        db.flush().unwrap();
+        for _ in 0..50 {
+            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // A shuffled batch that includes a missing id (u64::MAX) and reorders.
+        let mut batch_ids = all_ids.clone();
+        batch_ids.push(u64::MAX); // not present -> None
+        batch_ids.sort_by_key(|_| std::cmp::Reverse(0)); // keep order, but exercise non-sorted
+        batch_ids.reverse();
+
+        let batch = db.read_batch(&batch_ids).unwrap();
+        assert_eq!(batch.len(), batch_ids.len());
+
+        // Cross-check each slot against an individual read.
+        for (i, &id) in batch_ids.iter().enumerate() {
+            let single = db.read(id).unwrap();
+            match (&batch[i], &single) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(a.content, b.content, "content mismatch id {}", id)
+                }
+                (None, None) => {}
+                other => panic!(
+                    "slot {} (id {}): batch {:?} vs single {:?}",
+                    i, id, other.0, other.1
+                ),
+            }
+        }
+        // The missing id is None.
+        let missing_pos = batch_ids.iter().position(|&id| id == u64::MAX).unwrap();
+        assert!(batch[missing_pos].is_none());
+    }
+
+    #[test]
+    fn read_batch_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        let db = LogDb::open(config).unwrap();
+        assert!(db.read_batch(&[]).unwrap().is_empty());
     }
 
     #[test]

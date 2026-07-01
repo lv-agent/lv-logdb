@@ -41,7 +41,7 @@ fn main() {
         let _ = db.read(id).unwrap();
     }
 
-    println!("--- point read(0..N), 3 runs ---");
+    println!("--- N x read(id), 3 runs ---");
     for run in 0..3 {
         let t0 = Instant::now();
         let mut ok = 0u64;
@@ -51,6 +51,24 @@ fn main() {
             }
         }
         let elapsed = t0.elapsed();
+        println!(
+            "  run {}: {} reads in {:.3}s -> {:.0} reads/s ({:.0} ns/read) [ok={}]",
+            run,
+            n,
+            elapsed.as_secs_f64(),
+            n as f64 / elapsed.as_secs_f64(),
+            elapsed.as_nanos() as f64 / n as f64,
+            ok,
+        );
+    }
+
+    let ids: Vec<u64> = (0..n).collect();
+    println!("--- read_batch(all), 3 runs ---");
+    for run in 0..3 {
+        let t0 = Instant::now();
+        let batch = db.read_batch(&ids).unwrap();
+        let elapsed = t0.elapsed();
+        let ok = batch.iter().filter(|r| r.is_some()).count() as u64;
         println!(
             "  run {}: {} reads in {:.3}s -> {:.0} reads/s ({:.0} ns/read) [ok={}]",
             run,

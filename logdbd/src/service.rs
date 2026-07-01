@@ -178,7 +178,7 @@ impl LogDbService for LogDbServiceImpl {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(Status::internal(e))).await;
+                        let _ = tx.send(Err(Status::internal(e.to_string()))).await;
                         return;
                     }
                 }

@@ -23,6 +23,11 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   already contained only the Apache-2.0 text; the crate `license` field and the
   README statements are updated to match. Downstream license-check tooling that
   keyed on the dual SPDX expression should be updated.
+- `Tailer::next_batch` now returns `Result<Option<Vec<Record>>, TailerError>`
+  instead of `Result<_, String>`. `TailerError` wraps the underlying `ReadError`
+  (`#[from]`), so callers can forward it via `?`. Migration: callers that
+  stringified the error (`.unwrap()` / `format!(..)`) are unaffected —
+  `TailerError` implements `Display`.
 - **Narrowed public API surface.** Implementation modules (`config`, `error`,
   `ring`, `storage`, `pipeline`, `health`, `platform`, `reader`, `record`,
   `shard`, `recovery`, `tailer`) are now `pub(crate)` — they are no longer part

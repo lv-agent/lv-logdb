@@ -80,6 +80,7 @@ pub use config::{
 };
 pub use error::{
     AppendError, ConfigError, FlushError, OpenError, ReadError, ShutdownError, ShutdownReport,
+    TailerError,
 };
 pub use reader::ScanIter;
 pub use record::{Record, RecordId};

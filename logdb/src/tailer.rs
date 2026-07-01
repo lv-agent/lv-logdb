@@ -27,6 +27,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::error::TailerError;
 use crate::reader::{ScanIter, SegmentManifest};
 use crate::record::Record;
 use crate::ring::Ring;
@@ -213,7 +214,7 @@ impl Tailer {
     /// Each shard is drained against its own durable cursor; the per-shard
     /// streams are merged by ascending global id and truncated to `max_count`.
     /// Returns `Ok(None)` when no shard has new durable records.
-    pub fn next_batch(&mut self, max_count: usize) -> Result<Option<Vec<Record>>, String> {
+    pub fn next_batch(&mut self, max_count: usize) -> Result<Option<Vec<Record>>, TailerError> {
         let mut all: Vec<Record> = Vec::new();
         for s in 0..self.manifests.len() {
             let durable = self.rings[s]
@@ -234,12 +235,11 @@ impl Tailer {
                 self.encryption_key,
                 from_gid,
                 to_gid,
-            )
-            .map_err(|e| format!("{:?}", e))?;
+            )?;
             for r in iter {
                 match r {
                     Ok(rec) => all.push(rec),
-                    Err(e) => return Err(format!("{:?}", e)),
+                    Err(e) => return Err(e.into()),
                 }
             }
         }

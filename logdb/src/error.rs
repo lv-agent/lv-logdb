@@ -150,3 +150,15 @@ pub enum OpenError {
     #[error("failed to spawn background thread: {0}")]
     ThreadSpawn(#[source] std::io::Error),
 }
+
+/// Errors that can occur while reading the next batch from a [`Tailer`](crate::Tailer).
+///
+/// Replaces the previous `Result<_, String>` on `Tailer::next_batch`, so callers
+/// can forward it via `?` and match on the category. Currently every failure is
+/// a read error from the underlying scan.
+#[derive(Error, Debug)]
+pub enum TailerError {
+    /// A read error while scanning the next batch (I/O, CRC, not-found).
+    #[error("tailer read error: {0}")]
+    Read(#[from] ReadError),
+}

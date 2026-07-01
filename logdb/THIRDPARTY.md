@@ -4,7 +4,7 @@ This is the license inventory for the **runtime** dependencies of the `logdb`
 crate (built with `--all-features`; dev-only dependencies such as `criterion`
 and `proptest` are excluded — they are not distributed with the library).
 
-logdb is `MIT OR Apache-2.0`. Every transitive runtime dependency below is
+logdb is `Apache-2.0`. Every transitive runtime dependency below is
 permissively licensed (MIT / Apache-2.0 / BSD-3-Clause). **There is no copyleft
 (GPL/AGPL/LGPL/MPL/CDDL/EPL) anywhere in the graph.** This is enforced in CI by
 `cargo-deny` (see [`../deny.toml`](../deny.toml)).

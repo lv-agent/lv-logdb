@@ -7,6 +7,10 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed (BREAKING)
 
+- **License is now `Apache-2.0`** (was `MIT OR Apache-2.0`). The `LICENSE` file
+  already contained only the Apache-2.0 text; the crate `license` field and the
+  README statements are updated to match. Downstream license-check tooling that
+  keyed on the dual SPDX expression should be updated.
 - **Narrowed public API surface.** Implementation modules (`config`, `error`,
   `ring`, `storage`, `pipeline`, `health`, `platform`, `reader`, `record`,
   `shard`, `recovery`, `tailer`) are now `pub(crate)` — they are no longer part

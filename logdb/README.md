@@ -108,7 +108,7 @@ Many producer threads
 
 ## License
 
-MIT OR Apache-2.0. Third-party attributions: [`THIRDPARTY.md`](THIRDPARTY.md).
+Apache-2.0. Third-party attributions: [`THIRDPARTY.md`](THIRDPARTY.md).
 
 ## Security
 

@@ -34,7 +34,7 @@ lv-logdb/
 
 ## License
 
-MIT OR Apache-2.0. Dependency licenses are vetted with `cargo-deny`
+Apache-2.0. Dependency licenses are vetted with `cargo-deny`
 ([`deny.toml`](deny.toml)); the library's attributions are in
 [`logdb/THIRDPARTY.md`](logdb/THIRDPARTY.md).
 

@@ -38,6 +38,46 @@ cd "$WORKSPACE_DIR"
 FEATURES="${FEATURES:-}"
 TARGET="${TARGET:-}"
 
+# ── Prerequisites for cross-compilation ────────────────────────────────────
+
+if [ -n "$TARGET" ]; then
+    # Verify the Rust target is installed.
+    if ! rustup target list --installed 2>/dev/null | grep -qF "$TARGET"; then
+        echo "ERROR: target '$TARGET' is not installed."
+        echo "  Install it:  rustup target add $TARGET"
+        exit 1
+    fi
+
+    # Select the right linker for common targets.  Without this, rustc may
+    # fall back to lld, which is often not installed.
+    case "$TARGET" in
+        aarch64-unknown-linux-gnu)
+            LINKER="${LINKER:-aarch64-linux-gnu-gcc}"
+            ;;
+        aarch64-unknown-linux-musl)
+            LINKER="${LINKER:-aarch64-linux-gnu-gcc}";;
+        armv7-unknown-linux-gnueabihf)
+            LINKER="${LINKER:-arm-linux-gnueabihf-gcc}";;
+        riscv64gc-unknown-linux-gnu)
+            LINKER="${LINKER:-riscv64-linux-gnu-gcc}";;
+        *)
+            LINKER="${LINKER:-}";;
+    esac
+
+    if [ -n "$LINKER" ] && ! command -v "$LINKER" &>/dev/null; then
+        echo "ERROR: cross-linker '$LINKER' not found."
+        echo "  On Debian/Ubuntu:  sudo apt install gcc-${TARGET%-unknown-*}"
+        echo "  On Fedora:         sudo dnf install gcc-${TARGET%-unknown-*}"
+        echo "  Or set LINKER env to your cross-gcc path."
+        exit 1
+    fi
+
+    if [ -n "$LINKER" ]; then
+        export "CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER=$LINKER"
+        echo "cross-linker: $LINKER"
+    fi
+fi
+
 echo "=== logdb Build ==="
 echo "rustc:    $(rustc --version)"
 echo "cargo:    $(cargo --version)"

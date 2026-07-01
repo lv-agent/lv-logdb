@@ -11,9 +11,7 @@ Private Vulnerability Reporting:
 
 (GitHub → *Security* tab → *Report a vulnerability*.)
 
-Alternatively, email the maintainer at **security@lv-agent.example**
-(replace with the maintained address before publishing) with a description and,
-if possible, a proof of concept.
+Alternatively, create a private security advisory via the GitHub Security tab.
 
 Please include:
 
@@ -22,28 +20,17 @@ Please include:
 - A minimal reproduction or the exact steps that trigger the issue.
 - The impact you observe or suspect.
 
-## Response SLA
+## Response
 
-| Stage | Target |
-|-------|--------|
-| Acknowledge receipt | within 3 business days |
-| Initial assessment / triage | within 14 days |
-| Fix or mitigation coordinated disclosure | best-effort, typically within 90 days |
-
-We will keep the reporter informed of progress and coordinate a public
-disclosure date. Coordinated disclosure is preferred; we will credit reporters
-unless they prefer to remain anonymous.
+We will acknowledge receipt and respond as soon as practical. Response
+timelines are **best-effort** and depend on severity and availability — there
+is no committed SLA. We prefer coordinated disclosure and will credit reporters
+unless they request anonymity.
 
 ## Supported Versions
 
-logdb is pre-1.0. Security fixes are applied to the **latest released minor**
-only; older versions are not maintained. Backports are at the maintainer's
-discretion.
-
-| Version | Supported |
-|---------|-----------|
-| latest 0.x | ✅ |
-| older 0.x | ❌ |
+logdb is pre-1.0 and under active development. Security fixes are applied to
+the **latest released version**. Older versions are not maintained.
 
 ## Scope
 

@@ -143,6 +143,19 @@ impl LogDb {
         let data_dir = config.data_dir.clone();
         let hash_enabled = config.hash_enabled;
 
+        // Hash-chain key strategy. With an encryption key, the chain key is
+        // DERIVED from it (real MAC — not persistable); the segment header then
+        // stores zeros (not the key). Without a key, the chain is seeded from
+        // non-secret entropy / the header (tamper-evidence only).
+        #[cfg(feature = "hash-chain")]
+        let derived_chain_key: Option<[u8; 32]> = if hash_enabled {
+            config.encryption_key.map(|k| derive_hash_init(&k))
+        } else {
+            None
+        };
+        // Header stores the chain key only when NOT key-derived; else zeros.
+        let header_stores_chain_key = config.encryption_key.is_none();
+
         let num_shards = config.shards;
         let shard_bits = shard::shard_bits(num_shards);
 
@@ -194,16 +207,30 @@ impl LogDb {
                 // shard id in its low bits, so recovery re-seeds its stride chain
                 // from that first record rather than from base_sequence.
                 if !hash_init_known {
-                    hash_init = generate_hash_init();
+                    #[cfg(feature = "hash-chain")]
+                    {
+                        hash_init = derived_chain_key.unwrap_or_else(generate_hash_init);
+                    }
+                    #[cfg(not(feature = "hash-chain"))]
+                    {
+                        hash_init = generate_hash_init();
+                    }
                     hash_init_known = true;
                 }
+                // Header stores the chain key only without an encryption key;
+                // with one, store zeros (the real key is derived, never stored).
+                let header_hash_init = if header_stores_chain_key {
+                    hash_init
+                } else {
+                    [0u8; 32]
+                };
                 let sm = SegmentManager::create(
                     sdir,
                     config.segment_size,
                     hash_enabled,
                     config.compression_enabled,
                     config.encryption_key,
-                    hash_init,
+                    header_hash_init,
                     config.retention.clone(),
                     0,
                 )
@@ -958,11 +985,26 @@ fn count_log_bytes(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// Derive the hash-chain key from the encryption key (BLAKE3 keyed KDF).
+///
+/// When an encryption key is configured, the chain key is derived from it so an
+/// attacker who reads the segment file — but not the key — cannot recompute it
+/// and forge the chain: a real MAC, vs the clock-seeded tamper-evidence used
+/// without a key. The derived value is NEVER written to the segment header
+/// (zeros are stored there instead); the sealer and recovery re-derive it from
+/// the encryption key.
+#[cfg(feature = "hash-chain")]
+pub(crate) fn derive_hash_init(key: &[u8; 32]) -> [u8; 32] {
+    *blake3::keyed_hash(key, b"logdb-hash-chain-init-v1").as_bytes()
+}
+
 fn generate_hash_init() -> [u8; 32] {
     #[cfg(feature = "hash-chain")]
     {
-        // BLAKE3 keyed mode uses hash_init as the key.
-        // Generate it from CSPRNG-quality entropy.
+        // Used ONLY when no encryption key is configured. Seeds the chain from
+        // non-secret entropy (wall clock) — tamper-EVIDENCE, not authenticity,
+        // because the seed is reproducible. With an encryption key, the chain
+        // key is derived from it instead (see `derive_hash_init`).
         let mut hasher = blake3::Hasher::new();
         hasher.update(&platform::clock_realtime_coarse_ns().to_le_bytes());
         hasher.update(b"logdb-hash-init-v0.2.0");
@@ -1030,6 +1072,64 @@ mod tests {
         let record = db.read(id).unwrap().unwrap();
         assert_eq!(record.id.sequence, id);
         assert_eq!(record.content, b"hello logdb");
+    }
+
+    /// With hash-chain + an encryption key, the chain key is DERIVED from the
+    /// key (real MAC) and the segment header must store ZEROS — not the derived
+    /// key — so an attacker who reads the file cannot recompute the chain.
+    /// Also verifies a round-trip: reopen with the same key reads everything back.
+    #[cfg(all(feature = "hash-chain", feature = "encryption"))]
+    #[test]
+    fn hash_chain_with_key_derives_mac_and_hides_it() {
+        use crate::storage::format::{SEGMENT_HEADER_SIZE, SegmentHeader};
+        use std::io::Read;
+
+        let key = [0x99u8; 32];
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let mut mk = || {
+            let mut c = Config::default();
+            c.data_dir = data_dir.clone();
+            c.hash_enabled = true;
+            c.encryption_key = Some(key);
+            c.ring_size = 64;
+            c.durability_mode = DurabilityMode::Sync;
+            c.flush_timeout = Duration::from_secs(5);
+            c
+        };
+
+        // Write 5 records, durable.
+        {
+            let db = LogDb::open(mk()).unwrap();
+            for i in 0..5u64 {
+                db.append(format!("r-{}", i).as_bytes()).unwrap();
+            }
+            db.flush().unwrap();
+            for _ in 0..50 {
+                if db.durable_cursor() >= 5 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        // The segment header must NOT carry the key-derived chain key.
+        let seg = data_dir.join("segment-00000001.log");
+        let mut buf = [0u8; SEGMENT_HEADER_SIZE];
+        let mut f = std::fs::File::open(&seg).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        let header = SegmentHeader::deserialize(&buf).unwrap();
+        assert_eq!(
+            header.hash_init, [0u8; 32],
+            "header must store zeros, not the key-derived chain key"
+        );
+
+        // Reopen with the SAME key: chain re-derives, records read back.
+        let db = LogDb::open(mk()).unwrap();
+        for i in 0..5u64 {
+            let rec = db.read(i).unwrap().expect("record readable after reopen");
+            assert_eq!(rec.content, format!("r-{}", i).as_bytes());
+        }
     }
 
     #[test]

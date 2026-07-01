@@ -7,6 +7,15 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed (BREAKING)
 
+- **`hash-chain` with an encryption key is now a real MAC.** When both
+  `hash-chain` and `encryption` are enabled and an encryption key is set, the
+  chain key is **derived from the encryption key** (domain-separated BLAKE3 KDF)
+  instead of seeded from wall-clock time, and is **never written to disk** (the
+  segment header stores zeros). An attacker who reads the segment file but lacks
+  the key can no longer recompute the chain and forge a tail. Without an
+  encryption key, behavior is unchanged (clock-seeded tamper-evidence). This
+  changes the stored chain hashes for `hash-chain` + `encryption` segments (no
+  migration; pre-release data only).
 - **Migrated to Rust edition 2024** (`logdb` and `logdbd`). **MSRV is now
   `1.85`** (was `1.74` — the previous value was unachievable under
   `--all-features` because `blake3` 1.8 uses edition 2024). The migration is

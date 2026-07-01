@@ -102,24 +102,25 @@ Verification replays the chain and rejects any divergence.
   with write access can still corrupt data; you find out when you read.
 - **Single-shard only.** A global chain needs total order; `shards > 1` is
   rejected at `Config::validate`.
-- **⚠️ Not cryptographic authenticity against a sophisticated forger.** This is
-  the most important caveat. The chain is BLAKE3 in *keyed* mode — but the key
-  (`hash_init`) is:
-  1. derived by logdb from **non-secret inputs** (wall-clock time + a domain
-     constant), and
-  2. **persisted in cleartext** in the segment header.
+- **Authenticity depends on whether an encryption key is configured.**
+  - **With an encryption key** (`Config.encryption_key = Some(k)`, requires
+    `encryption` + `hash-chain`, `shards == 1`): the chain key is **derived
+    from `k`** (`BLAKE3::keyed_hash(k, "logdb-hash-chain-init-v1")`) and is
+    **never written to disk** — the segment header stores zeros. An attacker
+    who reads the segment file cannot recover the chain key, cannot recompute
+    the chain, and cannot forge a self-consistent tail without `k`. **This is a
+    real MAC** (authenticity) against an attacker who lacks the key.
+  - **Without an encryption key**: the chain key is seeded from **non-secret**
+    entropy (wall-clock time) and stored in the segment header. An attacker who
+    reads the header can recover it, recompute the chain, and forge a tail. This
+    is **tamper-evidence only** — it detects accidental damage and naive edits,
+    not an active forger with write access. Configure an encryption key if you
+    need authenticity.
 
-  Therefore an attacker who can read the segment header can recover `hash_init`,
-  recompute the chain, and forge a self-consistent tail. The chain is a strong
-  integrity check against accidental damage and read-only or naive attackers,
-  but **not a MAC against an active forger with write access**. If you need
-  authenticity against such an attacker, derive the chain key from your own
-  secret (see [key-management.md](key-management.md#hash-chain-key)) and/or keep
-  the data directory on trusted storage.
-
-> **Roadmap:** a future hardening may derive `hash_init` from the user's secret
-> and avoid persisting it in cleartext, turning the chain into a true MAC. Until
-> then, treat `hash-chain` as tamper-**evidence**, not tamper-**resistance**.
+> The earlier "derive `hash_init` from the user's secret" roadmap item is
+> implemented for the keyed case above. Remaining hardening (in-memory key
+> zeroization, on-disk key-versioning for rotation) is still deferred — see
+> [key-management.md](key-management.md).
 
 ---
 

@@ -86,6 +86,22 @@ pub struct RecoveryState {
 ///
 /// Returns `Ok(RecoveryState)` on success. Returns `Err(String)` if recovery
 /// fails catastrophically (no valid segments found, etc.).
+
+/// Resolve the hash-chain key for verification: derived from the encryption
+/// key when one is configured (real MAC — matches what the sealer used), else
+/// the segment header's stored value (clock-seeded tamper-evidence).
+#[cfg(feature = "hash-chain")]
+fn chain_key(encryption_key: Option<&[u8; 32]>, header_value: &[u8; 32]) -> [u8; 32] {
+    match encryption_key {
+        Some(k) => crate::derive_hash_init(k),
+        None => *header_value,
+    }
+}
+#[cfg(not(feature = "hash-chain"))]
+fn chain_key(_encryption_key: Option<&[u8; 32]>, header_value: &[u8; 32]) -> [u8; 32] {
+    *header_value
+}
+
 pub fn recover_shard(
     shard_dir: &Path,
     shard_bits: u32,
@@ -183,7 +199,7 @@ fn recover_shard_inner(
     // 3. Extract metadata from the first valid segment
     let first_header = &valid_segments[0].2; // (seg_id, path, header, size)
     let hash_enabled = first_header.hash_enabled();
-    let hash_init = first_header.hash_init;
+    let hash_init = chain_key(encryption_key.as_ref(), &first_header.hash_init);
 
     // 4. Scan the last segment for torn writes
     let last_idx = valid_segments.len() - 1;
@@ -331,7 +347,7 @@ fn scan_last_segment(
     // record and compare to the stored hash_n. A mismatch means tampering or
     // corruption → treat as a break and stop trusting data past it.
     #[cfg(feature = "hash-chain")]
-    let hash_init = header.hash_init;
+    let hash_init = chain_key(encryption_key.as_ref(), &header.hash_init);
     #[cfg(feature = "hash-chain")]
     let mut chain_prev = header.prev_last_hash; // [0;32] for the first segment
     #[cfg(not(feature = "hash-chain"))]

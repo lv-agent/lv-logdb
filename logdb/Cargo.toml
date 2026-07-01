@@ -65,6 +65,10 @@ harness = false
 name = "testsuite"
 required-features = ["testing"]
 
+[[example]]
+name = "encryption"
+required-features = ["encryption"]
+
 # Property test for the on-disk record format; reaches into `storage::format`.
 [[test]]
 name = "fuzz"

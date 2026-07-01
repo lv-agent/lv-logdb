@@ -86,6 +86,9 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (segment rolls, retention, recovery warnings, flush/drain timeouts, the
   best-effort drain on drop) via the `tracing` crate. Off by default, logdb
   stays zero-extra-dependency.
+- `LogDb::health_code() -> Option<u8>` — exposes the internal health state
+  for readiness probes. `None` when healthy; `Some(code)` when degraded
+  (e.g. disk-full). Self-heals once the fs recovers.
 - `metrics` feature: an off-by-default feature that emits quantitative metrics
   via the `metrics` facade crate — install a recorder (e.g. a Prometheus
   exporter) in the host to collect them. Emits `logdb.appends` (counter),

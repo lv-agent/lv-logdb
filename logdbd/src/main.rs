@@ -18,12 +18,16 @@
 //!                            enabled on the server (P0-3)
 //! - `LOGDBD_TLS_CA`        — PEM CA the primary trusts for standby TLS (P0-3)
 //! - `LOGDBD_MAX_MSG_SIZE`  — max inbound RPC body size in bytes (default 4 MiB)
+//! - `LOGDBD_METRICS_LISTEN` — Prometheus /metrics HTTP endpoint (default
+//!                            `127.0.0.1:9100`; empty disables)
 //! - `HOSTNAME`             — node identity reported via `Status`
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use logdb::Config;
 use logdb::LogDb;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tonic::transport::Server;
 use tonic::transport::{Identity, ServerTlsConfig};
 
@@ -111,6 +115,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     health_reporter
         .set_serving::<LogDbServiceServer<LogDbServiceImpl>>()
         .await;
+
+    // Prometheus /metrics endpoint (default loopback :9100). Set
+    // LOGDBD_METRICS_LISTEN to override; empty disables it.
+    let metrics_addr: Option<SocketAddr> = std::env::var("LOGDBD_METRICS_LISTEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:9100".into())
+        .parse()
+        .ok();
+    if let Some(addr) = metrics_addr {
+        match PrometheusBuilder::new()
+            .with_http_listener(addr)
+            .install_recorder()
+        {
+            Ok(_) => tracing::info!(metrics_addr = %addr, "Prometheus /metrics endpoint"),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install Prometheus exporter; metrics disabled")
+            }
+        }
+    }
+
+    // Background probe: every 5 s, refresh the gauges (durable lag / queue depth
+    // / wal bytes) and flip the gRPC health status to match LogDb's actual
+    // state (disk-full / IO-error → NOT_SERVING, else SERVING). Self-heals:
+    // logdb clears the error once the fs recovers.
+    {
+        let db = Arc::clone(&db);
+        let mut hr = health_reporter.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.tick().await; // first tick is immediate
+            loop {
+                tick.tick().await;
+                db.record_gauges();
+                if db.health_code().is_some() {
+                    hr.set_not_serving::<LogDbServiceServer<LogDbServiceImpl>>()
+                        .await;
+                } else {
+                    hr.set_serving::<LogDbServiceServer<LogDbServiceImpl>>()
+                        .await;
+                }
+            }
+        });
+    }
 
     // Primary: spawn background replication to standbys (with token + TLS).
     if role == "primary" && !standbys.is_empty() {

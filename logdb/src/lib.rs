@@ -676,6 +676,15 @@ impl LogDb {
         self.inner.shards.min_durable_cursor()
     }
 
+    /// Current health state: `None` if healthy, `Some(code)` if degraded
+    /// (e.g. `health::HEALTH_DISK_FULL` on ENOSPC). The state self-heals —
+    /// `clear_if_recovered` is checked on each append, so a transient disk-full
+    /// clears once the filesystem has space again. Hosts (e.g. logdbd) poll
+    /// this to drive a readiness/liveness probe.
+    pub fn health_code(&self) -> Option<u8> {
+        self.inner.health.check()
+    }
+
     /// Sample the current operational gauges into the `metrics` facade
     /// (no-op without the `metrics` feature). A host that exports metrics
     /// (e.g. a Prometheus scraper) should call this on its scrape interval.

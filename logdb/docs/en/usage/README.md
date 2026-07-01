@@ -17,6 +17,7 @@ Read the pages in order; each builds on the previous one.
 11. [Performance](performance.md) — throughput, latency, and benchmarks.
 12. [Errors](errors.md) — error types, causes, and recovery actions.
 13. [Cookbook](cookbook.md) — recipes for common tasks.
+14. [Async integration](async.md) — using logdb from tokio / async runtimes.
 
 ## See also
 

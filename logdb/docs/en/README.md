@@ -21,6 +21,7 @@ Start here if you want to use logdb in your own application.
   - [Sharding](usage/sharding.md)
   - [Performance](usage/performance.md)
   - [Errors](usage/errors.md)
+  - [Async integration](usage/async.md)
   - [Cookbook](usage/cookbook.md)
 
 ## Development Guide

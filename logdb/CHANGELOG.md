@@ -98,6 +98,11 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **CI coverage job** (`cargo llvm-cov`, non-blocking) and new "Coverage"
   section in the Dev Guide testing docs. Qualification scripts and long-soak /
   long-fuzz documentation already exist in `scripts/run-all.sh`.
+- **Async integration guide** ([`docs/en/usage/async.md`](docs/en/usage/async.md)):
+  documents that `LogDb` is `Send + Sync`, common hot-path calls (`append`,
+  `read`, `flush`) are microseconds and safe to call inline from an async task,
+  and `spawn_blocking` is only needed for `shutdown` / very large range scans.
+  `logdbd` is the reference async example.
 - `testing` feature: an off-by-default feature that re-exposes the internal
   modules as `#[doc(hidden)] pub`, for the deployed test binary
   (`examples/testsuite`) and the `tests/fuzz` integration target. Not a

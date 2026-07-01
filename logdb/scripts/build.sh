@@ -39,10 +39,10 @@ FEATURES="${FEATURES:-}"
 TARGET="${TARGET:-}"
 
 echo "=== logdb Build ==="
-echo "rustc: $(rustc --version)"
-echo "cargo: $(cargo --version)"
-echo "host:   $(rustc -vV | grep host | awk '{print $2}')"
-echo "target: ${TARGET:-native}"
+echo "rustc:    $(rustc --version)"
+echo "cargo:    $(cargo --version)"
+echo "host:     $(rustc -vV | grep host | awk '{print $2}') (build machine)"
+echo "target:   ${TARGET:-$(rustc -vV | grep host | awk '{print $2}') (native)}"
 echo "features: '${FEATURES}'"
 echo ""
 
@@ -57,11 +57,13 @@ else
 fi
 
 echo "Building performance examples (features: '${FEATURES:-none}')..."
+echo "  cargo build --release -p logdb --features \"$FEATURES\" $CARGO_TARGET_FLAG --example perf ..."
 cargo build --release -p logdb --features "$FEATURES" $CARGO_TARGET_FLAG \
     --example perf --example scan_perf --example read_perf \
     --example sharding --example tailer_consumer
 
 echo "Building soak / crash_test / testsuite..."
+echo "  cargo build --release -p logdb --features testing $CARGO_TARGET_FLAG --example soak ..."
 cargo build --release -p logdb --features testing $CARGO_TARGET_FLAG \
     --example soak --example crash_test --example testsuite
 

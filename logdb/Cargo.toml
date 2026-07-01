@@ -12,6 +12,12 @@ readme = "README.md"
 keywords = ["log", "database", "wal", "append-only", "embedded"]
 categories = ["database-implementations", "cryptography"]
 
+# How docs.rs builds the API docs: document every optional PUBLIC feature so
+# feature-gated items render, but NOT `testing` (it only re-exposes internal
+# modules as #[doc(hidden)] pub for the deployed test binary).
+[package.metadata.docs.rs]
+features = ["hash-chain", "compression", "encryption", "remote-push", "tracing"]
+
 [dependencies]
 thiserror = "2"
 crc32c = "0.6"

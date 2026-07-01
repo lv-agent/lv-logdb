@@ -62,6 +62,7 @@ Full example: `cargo run --example wal`
 | `encryption` | off | AES-256-GCM encryption |
 | `remote-push` | off | Async remote push |
 | `tracing` | off | Structured logging (segment rolls, recovery, retention, flush/drop warnings) |
+| `metrics` | off | Quantitative metrics (counters/histograms/gauges) via the `metrics` facade |
 | `testing` | off | Re-exposes internals for the deployed test binary (not a supported API) |
 
 ## Shutdown & drop

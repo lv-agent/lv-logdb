@@ -37,6 +37,7 @@ jobs:
           - '--features hash-chain'
           - '--features remote-push'
           - '--features tracing'
+          - '--features metrics'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

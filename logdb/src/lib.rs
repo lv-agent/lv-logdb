@@ -381,6 +381,7 @@ impl LogDb {
             }
             ring.slot(local_seq).publish(local_seq);
         }
+        metric_counter!("logdb.appends", n);
         Ok(first_id)
     }
 
@@ -426,6 +427,7 @@ impl LogDb {
         // Publish
         ring.slot(local_seq).publish(local_seq);
 
+        metric_counter!("logdb.appends", 1);
         Ok(global_id)
     }
 
@@ -526,12 +528,14 @@ impl LogDb {
     ///
     /// Waits for `durable_cursor` (NOT committed_cursor — fix C4).
     pub fn flush(&self) -> Result<(), FlushError> {
+        let _t0 = Instant::now();
         let inner = &self.inner;
 
         // Per-shard snapshot: flush completes when EVERY shard's durable reaches
         // its own producer-cursor snapshot (handles uneven sharded loads).
         let targets = inner.shards.producer_cursors();
         if targets.iter().all(|&t| t == 0) {
+            metric_histogram!("logdb.flush.duration", _t0.elapsed());
             return Ok(());
         }
 
@@ -553,6 +557,7 @@ impl LogDb {
             inner.config.flush_timeout,
         )?;
 
+        metric_histogram!("logdb.flush.duration", _t0.elapsed());
         Ok(())
     }
 
@@ -642,6 +647,25 @@ impl LogDb {
     /// Get the minimum durable cursor across all shards.
     pub fn durable_cursor(&self) -> u64 {
         self.inner.shards.min_durable_cursor()
+    }
+
+    /// Sample the current operational gauges into the `metrics` facade
+    /// (no-op without the `metrics` feature). A host that exports metrics
+    /// (e.g. a Prometheus scraper) should call this on its scrape interval.
+    ///
+    /// Emits:
+    /// - `logdb.durable_lag`  — `producer_cursor − durable_cursor` (records
+    ///   appended but not yet fsynced; the durability backlog).
+    /// - `logdb.queue_depth`  — `producer_cursor − committed_cursor` (records
+    ///   claimed but not yet serialized by the Committer).
+    /// - `logdb.wal_bytes`    — total size of segment files (`wal_usage().0`).
+    pub fn record_gauges(&self) {
+        let _producer = self.producer_cursor();
+        let _durable = self.durable_cursor();
+        let _committed = self.committed_cursor();
+        metric_gauge!("logdb.durable_lag", _producer.saturating_sub(_durable));
+        metric_gauge!("logdb.queue_depth", _producer.saturating_sub(_committed));
+        metric_gauge!("logdb.wal_bytes", self.wal_usage().0);
     }
 
     /// Get the total ring capacity across all shards.

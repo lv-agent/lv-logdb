@@ -16,7 +16,7 @@ categories = ["database-implementations", "cryptography"]
 # feature-gated items render, but NOT `testing` (it only re-exposes internal
 # modules as #[doc(hidden)] pub for the deployed test binary).
 [package.metadata.docs.rs]
-features = ["hash-chain", "compression", "encryption", "remote-push", "tracing"]
+features = ["hash-chain", "compression", "encryption", "remote-push", "tracing", "metrics"]
 
 [dependencies]
 thiserror = "2"
@@ -29,6 +29,7 @@ zstd = { version = "0.13", optional = true, default-features = false }
 aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "alloc"] }
 getrandom = { version = "0.2", optional = true }
 tracing = { version = "0.1", optional = true }
+metrics = { version = "0.23", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -46,6 +47,10 @@ remote-push = []
 # dep by default); enable for observability of segment rolls, recovery, retention,
 # flush timeouts, and the best-effort drain on drop.
 tracing = ["dep:tracing"]
+# Quantitative metrics via the `metrics` facade crate (counters/histograms/
+# gauges). Off by default; install a recorder (e.g. a Prometheus exporter) in
+# the host to collect them. Pairs well with `tracing` (logs vs. metrics).
+metrics = ["dep:metrics"]
 # Expose internal modules (`ring`, `storage`, `pipeline`, …) as `#[doc(hidden)] pub`
 # so the deployed test binary (`examples/testsuite.rs`) and the `tests/fuzz`
 # integration target can exercise internals. NOT a supported public API.

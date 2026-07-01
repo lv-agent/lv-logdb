@@ -23,6 +23,7 @@ The feature table (`Cargo.toml`, `default = []`):
 | `encryption` | `aes-gcm` (with `aes`, `alloc`), `getrandom` | `Config.encryption_key: Option<[u8;32]>` | AES-256-GCM per frame with a random nonce. **Key loss is unrecoverable.** |
 | `remote-push` | — (flag only) | Standby write-in via `LogDb::replicate` | Flag-gated module; see [remote-push](#remote-push). |
 | `tracing` | `tracing` | Structured logging | Off by default; emits events for segment rolls, retention, recovery warnings, flush/drain timeouts, and the best-effort drain on drop. See [tracing](#tracing). |
+| `metrics` | `metrics` | Quantitative metrics | Off by default; emits counters/histograms/gauges via the `metrics` facade (install a Prometheus/OTel recorder to collect). See [metrics](#metrics). |
 | `testing` | — (flag only) | Re-exposes internal modules as `#[doc(hidden)] pub` | For the deployed test binary and `tests/fuzz`; **not** a supported public API. |
 
 All features are independent and can be combined, except that `hash-chain` implies `shards == 1` (see [hash-chain](#hash-chain)).
@@ -144,6 +145,42 @@ Events emitted (install a `tracing` subscriber in your app to collect them):
 - `LogDb::drain(timeout)` — shared-safe (`&self`); drains without consuming (for `Arc<LogDb>` in a service).
 
 **`Drop`** performs a best-effort bounded drain (≤5 s) of already-published records and emits a `tracing` warning if it cannot reach a clean state — a safety net against silent in-flight data loss, **not** a durability guarantee. It is skipped during panic unwinding (no I/O during unwind).
+
+## metrics
+
+`metrics` is an **off-by-default** feature that emits quantitative metrics via
+the [`metrics`](https://docs.rs/metrics) facade crate. Unlike `tracing`
+(discrete events/logs), `metrics` is for aggregateable numbers a scraper
+(Prometheus, OpenTelemetry) collects. Install a recorder in your host
+(e.g. `metrics_exporter_prometheus::PrometheusBuilder`); with no recorder
+installed, calls are cheap no-ops.
+
+```toml
+logdb = { version = "0.3", features = ["metrics"] }
+```
+
+| Metric | Kind | Where | Description |
+|--------|------|-------|-------------|
+| `logdb.appends` | counter | `append` / `append_batch` | records appended (global) |
+| `logdb.segment.rolls` | counter | `SegmentManager::roll` | segment rolls (global) |
+| `logdb.flush.duration` | histogram | `flush` | wall time of a flush |
+| `logdb.recovery.duration` | histogram | `recover_shard` | per-shard recovery time |
+| `logdb.durable_lag` | gauge | `record_gauges()` | `producer − durable` (durability backlog) |
+| `logdb.queue_depth` | gauge | `record_gauges()` | `producer − committed` (in-flight to Committer) |
+| `logdb.wal_bytes` | gauge | `record_gauges()` | total segment file bytes |
+
+The counters/histograms are emitted automatically at their events. The **gauges**
+are derived state; call `LogDb::record_gauges()` on your scrape interval
+(e.g. from the Prometheus scrape handler) so they reflect current values:
+
+```rust
+# fn scrape(db: &logdb::LogDb) {
+db.record_gauges();   // sample durable_lag / queue_depth / wal_bytes into the recorder
+# }
+```
+
+`tracing` and `metrics` are independent — enable both for full observability
+(logs + metrics). Neither adds a dependency when off.
 
 ## See also
 

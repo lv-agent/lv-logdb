@@ -77,6 +77,12 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (segment rolls, retention, recovery warnings, flush/drain timeouts, the
   best-effort drain on drop) via the `tracing` crate. Off by default, logdb
   stays zero-extra-dependency.
+- `metrics` feature: an off-by-default feature that emits quantitative metrics
+  via the `metrics` facade crate — install a recorder (e.g. a Prometheus
+  exporter) in the host to collect them. Emits `logdb.appends` (counter),
+  `logdb.segment.rolls` (counter), `logdb.flush.duration` &
+  `logdb.recovery.duration` (histograms), and `LogDb::record_gauges()` samples
+  `logdb.durable_lag` / `logdb.queue_depth` / `logdb.wal_bytes` (gauges).
 - `testing` feature: an off-by-default feature that re-exposes the internal
   modules as `#[doc(hidden)] pub`, for the deployed test binary
   (`examples/testsuite`) and the `tests/fuzz` integration target. Not a

@@ -93,6 +93,19 @@ pub fn recover_shard(
     retention: RetentionPolicy,
     encryption_key: Option<[u8; 32]>,
 ) -> Result<RecoveryState, String> {
+    let __t0 = std::time::Instant::now();
+    let result = recover_shard_inner(shard_dir, shard_bits, segment_size, retention, encryption_key);
+    metric_histogram!("logdb.recovery.duration", __t0.elapsed());
+    result
+}
+
+fn recover_shard_inner(
+    shard_dir: &Path,
+    shard_bits: u32,
+    segment_size: u64,
+    retention: RetentionPolicy,
+    encryption_key: Option<[u8; 32]>,
+) -> Result<RecoveryState, String> {
     if !shard_dir.exists() {
         return Err(format!("data directory does not exist: {:?}", shard_dir));
     }

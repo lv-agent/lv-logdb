@@ -615,6 +615,7 @@ impl SegmentManager {
     /// making the swap effectively instant from the Committer's perspective.
     pub fn roll(&mut self, next_base_sequence: u64, checkpoint: u64) -> Result<(), SegmentError> {
         log_info!(shard = self.shard_id, from_segment = self.active_id, "rolling segment");
+        metric_counter!("logdb.segment.rolls", 1);
         // Backfill timestamps in the old segment header
         self.active.backfill_header_ts()?;
         // Persist the (now-sealed) segment's sparse index before swapping it out.

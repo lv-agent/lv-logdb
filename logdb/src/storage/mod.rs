@@ -9,6 +9,7 @@
 //! The SegmentManager is owned exclusively by the Committer thread — no locks
 //! needed (it is `!Sync` by construction).
 
+use crate::KeyHandle;
 pub mod format;
 pub mod index;
 
@@ -252,7 +253,7 @@ pub struct SegmentManager {
     hash_init: [u8; 32],
     hash_enabled: bool,
     compressed: bool,
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<KeyHandle>,
     retention: RetentionPolicy,
     write_buf: Vec<u8>,
     /// Sparse index being built for the active segment (raw segments only —
@@ -282,7 +283,7 @@ pub struct SegmentManager {
 
 /// Encrypt data with AES-256-GCM if key is provided, otherwise pass through.
 /// Returns `{nonce:12B | ciphertext}` when encrypted, or plaintext when no key.
-fn encrypt_if_enabled(_key: &Option<[u8; 32]>, plaintext: &[u8]) -> Result<Vec<u8>, SegmentError> {
+fn encrypt_if_enabled(_key: Option<&[u8; 32]>, plaintext: &[u8]) -> Result<Vec<u8>, SegmentError> {
     #[cfg(feature = "encryption")]
     if let Some(k) = _key {
         use aes_gcm::aead::{Aead, KeyInit};
@@ -316,7 +317,7 @@ fn encrypt_if_enabled(_key: &Option<[u8; 32]>, plaintext: &[u8]) -> Result<Vec<u
 /// (compressed/encrypted) — frame segments store records inside opaque frames,
 /// so per-record file offsets aren't independently seekable and an index is
 /// useless (read falls back to scanning from the segment header).
-fn fresh_index(compressed: bool, encryption_key: &Option<[u8; 32]>) -> Option<index::SparseIndex> {
+fn fresh_index(compressed: bool, encryption_key: Option<&[u8; 32]>) -> Option<index::SparseIndex> {
     if compressed || encryption_key.is_some() {
         None
     } else {
@@ -339,7 +340,7 @@ impl SegmentManager {
         segment_size: u64,
         hash_enabled: bool,
         compressed: bool,
-        encryption_key: Option<[u8; 32]>,
+        encryption_key: Option<KeyHandle>,
         hash_init: [u8; 32],
         retention: RetentionPolicy,
         base_sequence: u64,
@@ -373,7 +374,7 @@ impl SegmentManager {
         let dir_file = File::open(&dir)?;
         platform::sync_dir(&dir_file)?;
 
-        let active_index = fresh_index(compressed, &encryption_key);
+        let active_index = fresh_index(compressed, encryption_key.as_deref().map(|z| &**z));
         Ok(Self {
             dir,
             active,
@@ -406,12 +407,12 @@ impl SegmentManager {
         last_hash: [u8; 32],
         hash_init: [u8; 32],
         hash_enabled: bool,
-        encryption_key: Option<[u8; 32]>,
+        encryption_key: Option<KeyHandle>,
         retention: RetentionPolicy,
     ) -> io::Result<Self> {
         let active = ActiveSegment::open_existing(active_path, active_id, active_offset, header)?;
         let compressed = active.compressed;
-        let active_index = fresh_index(compressed, &encryption_key);
+        let active_index = fresh_index(compressed, encryption_key.as_deref().map(|z| &**z));
 
         Ok(Self {
             dir,
@@ -505,15 +506,15 @@ impl SegmentManager {
                         let compressed = zstd::encode_all(raw, 0).map_err(|e| {
                             SegmentError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
                         })?;
-                        encrypt_if_enabled(&self.encryption_key, &compressed)?
+                        encrypt_if_enabled(self.encryption_key.as_deref().map(|z| &**z), &compressed)?
                     }
                     #[cfg(not(feature = "compression"))]
                     {
-                        encrypt_if_enabled(&self.encryption_key, raw)?
+                        encrypt_if_enabled(self.encryption_key.as_deref().map(|z| &**z), raw)?
                     }
                 } else {
                     // Encrypted but not compressed.
-                    encrypt_if_enabled(&self.encryption_key, raw)?
+                    encrypt_if_enabled(self.encryption_key.as_deref().map(|z| &**z), raw)?
                 };
                 let mut frame_buf = [0u8; FRAME_HEADER_SIZE];
                 write_frame_header(&mut frame_buf, payload.len() as u32, pos as u32);
@@ -682,7 +683,7 @@ impl SegmentManager {
         }}
 
         // Start a fresh sparse index for the newly-active segment.
-        self.active_index = fresh_index(self.compressed, &self.encryption_key);
+        self.active_index = fresh_index(self.compressed, self.encryption_key.as_deref().map(|z| &**z));
         self.active_index_count = 0;
 
         // Apply retention

@@ -12,6 +12,7 @@
 //! 3. Open the segment file, seek to the anchor's file_offset, and sequentially
 //!    scan forward to the target record_id.
 
+use crate::KeyHandle;
 pub mod iter;
 pub mod scan;
 pub use scan::ScanIter;
@@ -237,7 +238,7 @@ pub(crate) fn iter_for_segment(
     entry: &ManifestEntry,
     from_id: u64,
     to_id: u64,
-    key: Option<[u8; 32]>,
+    key: Option<KeyHandle>,
 ) -> Result<iter::RecordIter, ReadError> {
     let path = entry.path.clone();
     let is_compressed = entry.flags & crate::storage::format::FLAG_COMPRESSED_ZSTD != 0;
@@ -288,14 +289,14 @@ pub struct Reader {
     manifest: Arc<Mutex<SegmentManifest>>,
     /// Encryption key, if the database was opened with one. Required to read
     /// encrypted frames; without it encrypted records are undecryptable.
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<KeyHandle>,
 }
 
 impl Reader {
     /// Create a new reader sharing a segment manifest (cached dir listing).
     pub(crate) fn new(
         manifest: Arc<Mutex<SegmentManifest>>,
-        encryption_key: Option<[u8; 32]>,
+        encryption_key: Option<KeyHandle>,
     ) -> Self {
         Self {
             manifest,
@@ -370,7 +371,7 @@ impl Reader {
             // Frame-based segment: [frame_header(8)][payload], where
             // payload = encrypt?(compress?(raw_records)). Either flag
             // triggers the frame layout (P0-1: encrypted-only also frames).
-            let key = self.encryption_key.as_ref();
+            let key = self.encryption_key.as_deref().map(|z| &**z);
             while offset < file_size {
                 if offset + FRAME_HEADER_SIZE as u64 > file_size {
                     break;
@@ -637,7 +638,7 @@ impl Reader {
             Some(e) => e,
             None => return Err(ReadError::NotFound(from_id)),
         };
-        iter_for_segment(&entry, from_id, to_id, self.encryption_key)
+        iter_for_segment(&entry, from_id, to_id, self.encryption_key.clone())
     }
 }
 

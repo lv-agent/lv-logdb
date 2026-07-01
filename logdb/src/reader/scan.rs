@@ -10,6 +10,7 @@
 //! `iter_for_segment`, so raw/compressed/encrypted framing is handled
 //! identically to point reads.
 
+use crate::KeyHandle;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex};
@@ -22,7 +23,7 @@ use super::{iter_for_segment, ManifestEntry, SegmentManifest};
 
 /// Single-shard, cross-segment ascending iterator over `[from_id, to_id)`.
 struct ShardScanner {
-    key: Option<[u8; 32]>,
+    key: Option<KeyHandle>,
     from_id: u64,
     to_id: u64,
     /// Candidate segments, from the one containing `from_id` onward. Fetched
@@ -37,7 +38,7 @@ struct ShardScanner {
 impl ShardScanner {
     fn new(
         manifest: Arc<Mutex<SegmentManifest>>,
-        key: Option<[u8; 32]>,
+        key: Option<KeyHandle>,
         from_id: u64,
         to_id: u64,
     ) -> Result<Self, ReadError> {
@@ -65,7 +66,7 @@ impl ShardScanner {
                 self.cur = None;
                 return false;
             }
-            match iter_for_segment(entry, self.from_id, self.to_id, self.key) {
+            match iter_for_segment(entry, self.from_id, self.to_id, self.key.clone()) {
                 Ok(it) => {
                     self.cur = Some(it);
                     return true;
@@ -185,13 +186,13 @@ impl ScanIter {
     /// single stream; several yield a k-way merge by global id.
     pub(crate) fn build(
         manifests: Vec<Arc<Mutex<SegmentManifest>>>,
-        key: Option<[u8; 32]>,
+        key: Option<KeyHandle>,
         from_id: u64,
         to_id: u64,
     ) -> Result<Self, ReadError> {
         let mut scanners: Vec<ShardScanner> = Vec::with_capacity(manifests.len());
         for m in manifests {
-            scanners.push(ShardScanner::new(m, key, from_id, to_id)?);
+            scanners.push(ShardScanner::new(m, key.clone(), from_id, to_id)?);
         }
         Ok(match scanners.len() {
             1 => ScanIter {

@@ -102,7 +102,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroizing;
+
 use health::HealthState;
+
+/// Shared handle to the encryption key. The inner `[u8; 32]` is wrapped in
+/// [`Zeroizing`] so the memory is scrubbed when the last holder drops the
+/// [`Arc`]. All internal components (SegmentManager, Reader, Tailer, …) hold a
+/// clone of this handle — no [`Copy`] duplicates left in memory.
+pub(crate) type KeyHandle = Arc<zeroize::Zeroizing<[u8; 32]>>;
 use pipeline::signal::{FlushSignal, ShutdownState};
 use pipeline::trigger::CommitTrigger;
 use ring::Ring;
@@ -116,6 +124,7 @@ pub struct LogDb {
 
 struct LogDbInner {
     config: config::Config,
+    key_handle: Option<KeyHandle>,
     shards: ShardMap,
     health: Arc<HealthState>,
     flush: Arc<FlushSignal>,
@@ -143,18 +152,25 @@ impl LogDb {
         let data_dir = config.data_dir.clone();
         let hash_enabled = config.hash_enabled;
 
+        // Extract the encryption key into a zeroizing handle. From here on
+        // every component that needs the key gets an Arc clone of this handle
+        // — no raw [u8; 32] copies left in memory. The last holder's drop
+        // scrubs the key bytes.
+        let encryption_key: Option<KeyHandle> =
+            config.encryption_key.map(|k| Arc::new(Zeroizing::new(k)));
+
         // Hash-chain key strategy. With an encryption key, the chain key is
         // DERIVED from it (real MAC — not persistable); the segment header then
         // stores zeros (not the key). Without a key, the chain is seeded from
         // non-secret entropy / the header (tamper-evidence only).
         #[cfg(feature = "hash-chain")]
         let derived_chain_key: Option<[u8; 32]> = if hash_enabled {
-            config.encryption_key.map(|k| derive_hash_init(&k))
+            encryption_key.as_ref().map(|k| derive_hash_init(k))
         } else {
             None
         };
         // Header stores the chain key only when NOT key-derived; else zeros.
-        let header_stores_chain_key = config.encryption_key.is_none();
+        let header_stores_chain_key = encryption_key.is_none();
 
         let num_shards = config.shards;
         let shard_bits = shard::shard_bits(num_shards);
@@ -183,7 +199,7 @@ impl LogDb {
                     shard_bits,
                     config.segment_size,
                     config.retention.clone(),
-                    config.encryption_key,
+                    encryption_key.clone(),
                 )
                 .map_err(|reason| OpenError::Recovery { shard: s, reason })?;
                 // Resume this shard's ring at the LOCAL seq after the last recovered
@@ -229,7 +245,7 @@ impl LogDb {
                     config.segment_size,
                     hash_enabled,
                     config.compression_enabled,
-                    config.encryption_key,
+                    encryption_key.clone(),
                     header_hash_init,
                     config.retention.clone(),
                     0,
@@ -342,6 +358,7 @@ impl LogDb {
         Ok(Self {
             inner: Arc::new(LogDbInner {
                 config,
+                key_handle: encryption_key,
                 shards,
                 health,
                 flush,
@@ -607,7 +624,7 @@ impl LogDb {
         }
         let reader = reader::Reader::new(
             Arc::clone(&inner.manifests[shard]),
-            inner.config.encryption_key,
+            inner.key_handle.clone(),
         );
         reader.read(record_id)
     }
@@ -648,7 +665,7 @@ impl LogDb {
             }
             let reader = reader::Reader::new(
                 Arc::clone(&inner.manifests[shard]),
-                inner.config.encryption_key,
+                inner.key_handle.clone(),
             );
             let shard_ids: Vec<u64> = live.iter().map(|&(_, id)| id).collect();
             let mut batch = reader.read_batch(&shard_ids)?;
@@ -730,7 +747,7 @@ impl LogDb {
             rings,
             self.inner.shards.shard_bits(),
             name,
-            self.inner.config.encryption_key,
+            self.inner.key_handle.clone(),
             self.inner.data_dir.clone(),
         )
     }
@@ -741,7 +758,7 @@ impl LogDb {
     /// empty iterator (no error).
     pub fn scan(&self, from_id: u64, to_id: u64) -> Result<ScanIter, ReadError> {
         let manifests = self.inner.manifests.iter().map(Arc::clone).collect();
-        reader::ScanIter::build(manifests, self.inner.config.encryption_key, from_id, to_id)
+        reader::ScanIter::build(manifests, self.inner.key_handle.clone(), from_id, to_id)
     }
 
     /// Mark `sequence` as the WAL checkpoint.

@@ -78,11 +78,20 @@ if [ -n "$TARGET" ]; then
     fi
 fi
 
+# Enable host-CPU-specific optimizations (e.g. ARMv8 LSE atomic instructions
+# which can measurably speed up CAS-heavy code like the ring buffer).
+# Only set for native builds; cross-compilation leaves RUSTFLAGS up to the
+# caller (target-cpu=native would optimise for the wrong machine).
+if [ -z "$TARGET" ] && [ -z "${RUSTFLAGS:-}" ]; then
+    export RUSTFLAGS="-C target-cpu=native"
+fi
+
 echo "=== logdb Build ==="
 echo "rustc:    $(rustc --version)"
 echo "cargo:    $(cargo --version)"
 echo "host:     $(rustc -vV | grep host | awk '{print $2}') (build machine)"
 echo "target:   ${TARGET:-$(rustc -vV | grep host | awk '{print $2}') (native)}"
+echo "RUSTFLAGS: ${RUSTFLAGS:-<none>}"
 echo "features: '${FEATURES}'"
 echo ""
 

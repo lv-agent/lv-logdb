@@ -36,12 +36,25 @@ jobs:
           - '--features encryption'
           - '--features hash-chain'
           - '--features remote-push'
+          - '--features tracing'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p logdb ${{ matrix.features }}
       - run: cargo test -p logdb ${{ matrix.features }}
+
+  msrv:
+    # Enforce the declared MSRV (rust-version in logdb/Cargo.toml). cargo 1.85
+    # reads the v4 lock natively, so no lock-regeneration hack is needed.
+    name: MSRV 1.85 (logdb build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p logdb --all-features
+      - run: cargo build -p logdbd
 
   logdbd:
     name: logdbd — build + test (needs protoc)

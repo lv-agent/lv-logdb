@@ -3,10 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use logdb::config::{Config, DurabilityMode};
 use logdb::LogDb;
+use logdb::{Config, DurabilityMode};
 
 fn bench_db(ring_size: usize) -> LogDb {
     let dir = tempfile::tempdir().unwrap();

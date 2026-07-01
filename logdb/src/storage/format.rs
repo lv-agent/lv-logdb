@@ -29,7 +29,7 @@
 //! | timestamp_ns | u64 LE  | 8    |                                          |
 //! | content_len  | u32 LE  | 4    |                                          |
 //! | content      | [u8]    | N    | Variable length                          |
-//! | hash_n       | [u8;32] | 32   | Always present, zeros if hash disabled   |
+//! | hash_n       | `[u8;32]` | 32   | Always present, zeros if hash disabled   |
 //! | crc          | u32 LE  | 4    | CRC32C over bytes [len_field, crc_field) |
 
 use crate::record::{ReadView, Record, RecordId};

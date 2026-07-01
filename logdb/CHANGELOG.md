@@ -7,6 +7,18 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed (BREAKING)
 
+- **Migrated to Rust edition 2024** (`logdb` and `logdbd`). **MSRV is now
+  `1.85`** (was `1.74` — the previous value was unachievable under
+  `--all-features` because `blake3` 1.8 uses edition 2024). The migration is
+  behavior-preserving (mechanical: `unsafe fn` bodies gain explicit `unsafe {}`
+  blocks, `if let … else` → `match` to keep drop order, the recovery macro's
+  fragment specifier pinned to `:expr_2021`).
+- **`LogDb::drop` now performs a best-effort bounded drain** (≤5 s) of
+  already-published records before aborting background threads, and emits a
+  `tracing` warning if it cannot reach a clean state. Previously, dropping an
+  unflushed `LogDb` silently lost in-flight records. Drop is a safety net, not a
+  guarantee — call `shutdown()` / `drain()` for assured durability. Skipped
+  during panic unwinding.
 - **License is now `Apache-2.0`** (was `MIT OR Apache-2.0`). The `LICENSE` file
   already contained only the Apache-2.0 text; the crate `license` field and the
   README statements are updated to match. Downstream license-check tooling that
@@ -37,6 +49,10 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `OpenError`, `ConfigError`, and `AppendError::EmptyBatch` error types.
+- `tracing` feature: an off-by-default feature that emits structured events
+  (segment rolls, retention, recovery warnings, flush/drain timeouts, the
+  best-effort drain on drop) via the `tracing` crate. Off by default, logdb
+  stays zero-extra-dependency.
 - `testing` feature: an off-by-default feature that re-exposes the internal
   modules as `#[doc(hidden)] pub`, for the deployed test binary
   (`examples/testsuite`) and the `tests/fuzz` integration target. Not a

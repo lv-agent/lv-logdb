@@ -4,8 +4,8 @@
 //! Criterion benchmarks have issues in WSL2 due to tempdir overhead and
 //! thread interactions. This binary directly measures append latency.
 
-use logdb::config::{Config, DurabilityMode};
 use logdb::LogDb;
+use logdb::{Config, DurabilityMode};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -17,7 +17,7 @@ fn main() {
     config.ring_size = 65536; // large ring to avoid backpressure
     config.durability_mode = DurabilityMode::Async;
     config.flush_timeout = Duration::from_secs(30);
-    config.queue_full_policy = logdb::config::QueueFullPolicy::Block;
+    config.queue_full_policy = logdb::QueueFullPolicy::Block;
 
     let db = LogDb::open(config).unwrap();
 
@@ -100,7 +100,7 @@ fn main() {
         for _ in 0..num_threads {
             let c = content.clone();
             handles.push(std::thread::spawn(move || {
-                let db = unsafe {
+                let _db = unsafe {
                     // We need a db reference here. Since LogDb is Send+Sync,
                     // we can share a raw pointer. But in practice we use the
                     // same in-memory DB. Actually this needs Arc<LogDb>.

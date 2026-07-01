@@ -228,6 +228,15 @@ pub fn recover_shard(
     )
     .map_err(|e| format!("open existing segment manager: {}", e))?;
 
+    if !warnings.is_empty() {
+        log_warn!(
+            shard_dir = ?shard_dir,
+            warning_count = warnings.len(),
+            recovered = recovered_count,
+            "recovery completed with warnings (torn writes / corrupt headers / hash breaks)"
+        );
+    }
+
     Ok(RecoveryState {
         segment_manager: seg_mgr,
         last_sequence,
@@ -319,7 +328,7 @@ fn scan_last_segment(
     // Defined as a macro so it expands in place (no borrow held across the
     // loop, unlike a closure capturing `file`/`warnings`/the counters).
     macro_rules! torn {
-        ($at:expr) => {{
+        ($at:expr_2021) => {{
             file.set_len(last_valid_offset)
                 .map_err(|e| format!("truncate {:?}: {}", path, e))?;
             warnings.push(RecoveryWarning::TornWrite {

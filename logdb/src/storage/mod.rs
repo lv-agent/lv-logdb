@@ -614,13 +614,14 @@ impl SegmentManager {
     /// path. The old segment's fdatasync is offloaded to a background thread,
     /// making the swap effectively instant from the Committer's perspective.
     pub fn roll(&mut self, next_base_sequence: u64, checkpoint: u64) -> Result<(), SegmentError> {
+        log_info!(shard = self.shard_id, from_segment = self.active_id, "rolling segment");
         // Backfill timestamps in the old segment header
         self.active.backfill_header_ts()?;
         // Persist the (now-sealed) segment's sparse index before swapping it out.
         let _ = self.save_active_index();
 
         // Use pre-prepared segment if available
-        if let Some((new_id, new_seg)) = self.prepared_segment.take() {
+        match self.prepared_segment.take() { Some((new_id, new_seg)) => {
             // Swap to pre-prepared segment (instant)
             let old_active = std::mem::replace(&mut self.active, new_seg);
             self.active_id = new_id;
@@ -630,7 +631,7 @@ impl SegmentManager {
             // fsync, then drop the old ActiveSegment to release its fd now.
             self.pending_fsync.push(old_active.path.clone());
             drop(old_active);
-        } else {
+        } _ => {
             // Fallback: create new segment inline, fsync old in background.
             let new_id = self.active_id + 1;
             let mut flags = if self.hash_enabled {
@@ -677,7 +678,7 @@ impl SegmentManager {
             // fsync, then drop the old ActiveSegment to release its fd now.
             self.pending_fsync.push(old_active.path.clone());
             drop(old_active);
-        }
+        }}
 
         // Start a fresh sparse index for the newly-active segment.
         self.active_index = fresh_index(self.compressed, &self.encryption_key);
@@ -858,8 +859,18 @@ impl SegmentManager {
     fn apply_retention(&self) -> Result<(), SegmentError> {
         match &self.retention {
             RetentionPolicy::KeepAll => {}
-            RetentionPolicy::MaxBytes(limit) => self.evict_until_under(*limit)?,
-            RetentionPolicy::MaxAge(dur) => self.evict_older_than(*dur)?,
+            RetentionPolicy::MaxBytes(limit) => {
+                log_debug!(shard = self.shard_id, limit = *limit, "applying MaxBytes retention");
+                self.evict_until_under(*limit)?
+            }
+            RetentionPolicy::MaxAge(dur) => {
+                log_debug!(
+                    shard = self.shard_id,
+                    max_age_ms = dur.as_millis() as u64,
+                    "applying MaxAge retention"
+                );
+                self.evict_older_than(*dur)?
+            }
         }
         Ok(())
     }

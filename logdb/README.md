@@ -61,6 +61,17 @@ Full example: `cargo run --example wal`
 | `compression` | off | Streaming zstd compression |
 | `encryption` | off | AES-256-GCM encryption |
 | `remote-push` | off | Async remote push |
+| `tracing` | off | Structured logging (segment rolls, recovery, retention, flush/drop warnings) |
+| `testing` | off | Re-exposes internals for the deployed test binary (not a supported API) |
+
+## Shutdown & drop
+
+`LogDb` spawns background threads (Committer, Sealer). For guaranteed
+durability, call `shutdown(timeout)` (consumes the handle, joins threads) or
+`drain(timeout)` (shared-safe, flushes without consuming). **`Drop` performs a
+best-effort bounded drain (≤5 s) of already-published records and emits a
+`tracing` warning if it cannot finish — a safety net, not a guarantee.** It is
+skipped during panic unwinding.
 
 ## Testing
 

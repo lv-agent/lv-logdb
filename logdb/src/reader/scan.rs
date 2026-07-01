@@ -1,13 +1,13 @@
 //! Cross-shard, cross-segment scan iterators.
 //!
-//! [`ShardScanner`] yields one shard's records in ascending global-id order,
+//! `ShardScanner` yields one shard's records in ascending global-id order,
 //! transparently crossing segment boundaries. For `shards > 1`, [`ScanIter`]
 //! k-way-merges the per-shard scanners by global id (a total order, since the
 //! shard id occupies the low bits of every record id). `shards == 1` skips the
 //! merge heap entirely.
 //!
-//! Both scanners reuse the single-segment [`super::iter::RecordIter`] via
-//! [`super::iter_for_segment`], so raw/compressed/encrypted framing is handled
+//! Both scanners reuse the single-segment `RecordIter` via
+//! `iter_for_segment`, so raw/compressed/encrypted framing is handled
 //! identically to point reads.
 
 use std::cmp::Reverse;

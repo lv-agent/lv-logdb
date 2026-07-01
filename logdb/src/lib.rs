@@ -52,6 +52,12 @@ macro_rules! internal_mod {
     };
 }
 
+// Observability shim — `tracing` when the feature is on, no-ops otherwise.
+// Declared first with `#[macro_use]` so the `log_*!` macros are in scope for
+// every module below.
+#[macro_use]
+mod observe;
+
 internal_mod!(config);
 internal_mod!(error);
 internal_mod!(health);
@@ -830,6 +836,7 @@ fn wait_until(
             return Err(FlushError::Aborted);
         }
         if Instant::now() >= deadline {
+            log_warn!("logdb flush/drain timed out waiting for the Committer");
             return Err(FlushError::Timeout);
         }
         spins = spins.saturating_add(1);
@@ -897,9 +904,36 @@ fn generate_hash_init() -> [u8; 32] {
 
 impl Drop for LogDb {
     fn drop(&mut self) {
+        // Best-effort durability on drop: flush already-published records.
+        // Skipped during panic unwinding (I/O during unwind is risky) and
+        // bounded by `DROP_DRAIN_TIMEOUT` so a stuck Committer can never hang
+        // drop. For a guaranteed-clean shutdown, call `shutdown()` / `drain()`
+        // explicitly — drop is a safety net, not a contract.
+        if !std::thread::panicking() {
+            match self.drain(DROP_DRAIN_TIMEOUT) {
+                Ok(ShutdownReport::Clean) => {}
+                Ok(_) => {
+                    log_warn!(
+                        timeout_secs = DROP_DRAIN_TIMEOUT.as_secs(),
+                        "logdb dropped with records not fully fsynced; call shutdown()/drain() for guaranteed durability"
+                    );
+                }
+                Err(_) => {
+                    log_warn!(
+                        timeout_secs = DROP_DRAIN_TIMEOUT.as_secs(),
+                        "logdb best-effort drain on drop failed/timed out; in-flight records may be lost"
+                    );
+                }
+            }
+        }
         self.inner.shutdown.abort();
     }
 }
+
+/// Bound on the best-effort drain performed in `Drop`. Long enough to let the
+/// Committer flush a typical in-flight batch, short enough that dropping a
+/// `LogDb` never visibly stalls.
+const DROP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod tests {

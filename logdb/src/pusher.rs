@@ -14,8 +14,8 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -292,9 +292,9 @@ impl Drop for PusherHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LogDb;
     use crate::config::{Config, DurabilityMode};
     use crate::record::Record;
-    use crate::LogDb;
     use std::sync::Mutex;
 
     struct TestSink {

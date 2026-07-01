@@ -438,7 +438,6 @@ fn bench_segment_roll_latency() {
     // Track committed_cursor per-spike to distinguish roll stalls
     // (cursor frozen) from general I/O contention (cursor advancing).
     let mut spike_data: Vec<(Duration, u64)> = Vec::new(); // (latency, committed_at_spike)
-    let mut last_known_committed = db.committed_cursor();
     let t0 = Instant::now();
     for _ in 0..n {
         let t_app = Instant::now();
@@ -447,7 +446,6 @@ fn bench_segment_roll_latency() {
         if lat.as_micros() > 500 {
             let cur = db.committed_cursor();
             spike_data.push((lat, cur));
-            last_known_committed = cur;
         }
     }
     let total_elapsed = t0.elapsed();
@@ -509,7 +507,7 @@ fn bench_segment_roll_latency() {
 
     // Baseline: measure raw append latency without Committer running
     // (all appends happen while ring is not full → Committer not the bottleneck)
-    let baseline_p50 = if !spike_data.is_empty() {
+    let _baseline_p50 = if !spike_data.is_empty() {
         spike_data
             .iter()
             .map(|(d, _)| d.as_nanos() as u64)

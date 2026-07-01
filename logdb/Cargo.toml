@@ -1,8 +1,8 @@
 [package]
 name = "logdb"
 version = "0.3.0"
-edition = "2021"
-rust-version = "1.74"
+edition = "2024"
+rust-version = "1.85"
 description = "Embedded, append-only, crash-recoverable, optionally tamper-proof local log database"
 license = "Apache-2.0"
 repository = "https://github.com/lv-agent/lv-logdb"
@@ -22,6 +22,7 @@ scopeguard = "1"
 zstd = { version = "0.13", optional = true, default-features = false }
 aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "alloc"] }
 getrandom = { version = "0.2", optional = true }
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -35,6 +36,10 @@ hash-chain = ["sha2", "blake3"]
 compression = ["zstd"]
 encryption = ["aes-gcm", "getrandom"]
 remote-push = []
+# Structured logging via the `tracing` crate. Off by default (logdb is zero-extra-
+# dep by default); enable for observability of segment rolls, recovery, retention,
+# flush timeouts, and the best-effort drain on drop.
+tracing = ["dep:tracing"]
 # Expose internal modules (`ring`, `storage`, `pipeline`, …) as `#[doc(hidden)] pub`
 # so the deployed test binary (`examples/testsuite.rs`) and the `tests/fuzz`
 # integration target can exercise internals. NOT a supported public API.

@@ -22,6 +22,8 @@ The feature table (`Cargo.toml`, `default = []`):
 | `compression` | `zstd` (no default features) | `Config.compression_enabled` | Streaming, per-frame zstd compression. Transparent on read. |
 | `encryption` | `aes-gcm` (with `aes`, `alloc`), `getrandom` | `Config.encryption_key: Option<[u8;32]>` | AES-256-GCM per frame with a random nonce. **Key loss is unrecoverable.** |
 | `remote-push` | — (flag only) | Standby write-in via `LogDb::replicate` | Flag-gated module; see [remote-push](#remote-push). |
+| `tracing` | `tracing` | Structured logging | Off by default; emits events for segment rolls, retention, recovery warnings, flush/drain timeouts, and the best-effort drain on drop. See [tracing](#tracing). |
+| `testing` | — (flag only) | Re-exposes internal modules as `#[doc(hidden)] pub` | For the deployed test binary and `tests/fuzz`; **not** a supported public API. |
 
 All features are independent and can be combined, except that `hash-chain` implies `shards == 1` (see [hash-chain](#hash-chain)).
 
@@ -113,6 +115,35 @@ let config = Config {
 **Daemon-level plumbing — the Pusher / `RemoteSink` trait / `run_pusher`.** These are **not exposed via `LogDb`**. The `pusher` module is private (`mod pusher;` at `src/lib.rs:37` — note: not `pub mod`), and the Pusher is meant to be driven by an embedding daemon (e.g. `logdbd`) that owns its own thread, progress file, and backoff policy. There is **no one-line `db.push(...)` API**.
 
 This is a **known gap** in v1.1: the library exposes the standby write-in (`replicate`) but not the primary-side push driver. A public push API would need its own design change record. For the daemon-level integration pattern, see [Extending logdb](../dev/extending.md) (the `RemoteSink` trait and how a host daemon threads records to a remote endpoint).
+
+## tracing
+
+`tracing` is an **off-by-default** feature that emits structured events via the [`tracing`](https://docs.rs/tracing) crate. With it disabled, logdb pulls in **no** extra dependencies and the instrumentation compiles to nothing.
+
+Enable it for operational visibility:
+
+```toml
+logdb = { version = "0.3", features = ["tracing"] }
+```
+
+Events emitted (install a `tracing` subscriber in your app to collect them):
+
+| Event | Level | Where |
+|-------|-------|-------|
+| Segment roll | `info` | `SegmentManager::roll` (shard, from-segment) |
+| Retention applied | `debug` | `apply_retention` (shard, limit / max-age) |
+| Recovery warnings (torn writes, corrupt headers, hash breaks) | `warn` | `recover_shard` (shard-dir, count) |
+| Flush/drain timeout | `warn` | `wait_until` |
+| Best-effort drain on drop incomplete | `warn` | `Drop` (timeout-secs) |
+
+## Shutdown semantics
+
+`LogDb` owns background threads (Committer, and the Sealer under `hash-chain`). For guaranteed durability use:
+
+- `LogDb::shutdown(timeout)` — drains, joins threads, consumes the handle.
+- `LogDb::drain(timeout)` — shared-safe (`&self`); drains without consuming (for `Arc<LogDb>` in a service).
+
+**`Drop`** performs a best-effort bounded drain (≤5 s) of already-published records and emits a `tracing` warning if it cannot reach a clean state — a safety net against silent in-flight data loss, **not** a durability guarantee. It is skipped during panic unwinding (no I/O during unwind).
 
 ## See also
 

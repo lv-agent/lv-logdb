@@ -375,7 +375,7 @@ mod tests {
         let ring = Arc::new(Ring::new(16, false, 0));
 
         // Fill the ring
-        for i in 0..16 {
+        for _i in 0..16 {
             ring.claim(QueueFullPolicy::Block).unwrap();
         }
 
@@ -570,11 +570,11 @@ mod tests {
         let ring = Ring::new(64, false, 0);
         let base = &ring as *const Ring as usize;
 
-        let pc_offset = unsafe {
+        let pc_offset = {
             let pc = &ring.producer_cursor as *const CachePadded<AtomicU64> as usize;
             pc - base
         };
-        let sc_offset = unsafe {
+        let sc_offset = {
             let sc = &ring.sealed_cursor as *const AtomicU64 as usize;
             sc - base
         };

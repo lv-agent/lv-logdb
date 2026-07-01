@@ -145,7 +145,7 @@ impl Slot {
     /// This is guaranteed by the CAS claim in `Ring::claim()` succeeding
     /// for this `seq` before calling this method.
     #[inline]
-    pub unsafe fn producer_write(&self, seq: u64, ts: u64, content: &[u8]) {
+    pub unsafe fn producer_write(&self, seq: u64, ts: u64, content: &[u8]) { unsafe {
         let inner = &mut *self.inner.get();
         inner.record_id = seq;
         inner.timestamp_ns = ts;
@@ -172,7 +172,7 @@ impl Slot {
             inner.storage = ContentStorage::Spill(content.to_vec().into_boxed_slice());
         }
         // Note: sequence Release store is done separately in publish().
-    }
+    }}
 
     /// Publish the slot, making it visible to consumers.
     ///
@@ -204,7 +204,7 @@ impl Slot {
     /// watermark has not advanced past `seq`) while the returned `ReadView`
     /// is alive.
     #[inline]
-    pub unsafe fn read(&self) -> ReadView<'_> {
+    pub unsafe fn read(&self) -> ReadView<'_> { unsafe {
         let inner = &*self.inner.get();
         let content = match &inner.storage {
             ContentStorage::Inline(buf) => &buf[..inner.content_len as usize],
@@ -216,7 +216,7 @@ impl Slot {
             content,
             hash_n: &inner.hash_n,
         }
-    }
+    }}
 
     /// Write the hash chain value into this slot.
     ///
@@ -230,9 +230,9 @@ impl Slot {
     /// - In practice: `sealed_cursor < seq` and the Sealer is the only
     ///   thread that writes hash_n
     #[inline]
-    pub unsafe fn write_hash(&self, hash_n: [u8; 32]) {
+    pub unsafe fn write_hash(&self, hash_n: [u8; 32]) { unsafe {
         (&mut *self.inner.get()).hash_n = hash_n;
-    }
+    }}
 }
 
 // SlotInner does not need to be Send (it doesn't own heap data directly),

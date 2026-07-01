@@ -30,7 +30,7 @@ use tonic::transport::{Identity, ServerTlsConfig};
 use logdbd::auth::AuthInterceptor;
 use logdbd::pb::log_db_service_server::LogDbServiceServer;
 use logdbd::pb::replication_service_server::ReplicationServiceServer;
-use logdbd::replication::{run_primary_sync, ReplicationServiceImpl};
+use logdbd::replication::{ReplicationServiceImpl, run_primary_sync};
 use logdbd::service::LogDbServiceImpl;
 
 #[tokio::main]

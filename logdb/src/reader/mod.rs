@@ -251,7 +251,7 @@ pub(crate) fn iter_for_segment(
 
 /// A reader that queries records from segment files.
 ///
-/// Uses a shared [`SegmentManifest`] (cached, directory-mtime invalidated) so
+/// Uses a shared `SegmentManifest` (cached, directory-mtime invalidated) so
 /// segment-finding is O(log N) and does NOT re-`readdir` or re-read every
 /// segment header on each call (P2-1: read amplification).
 pub struct Reader {

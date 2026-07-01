@@ -16,7 +16,7 @@ use logdbd::auth::AuthInterceptor;
 use logdbd::pb;
 use logdbd::pb::log_db_service_client::LogDbServiceClient;
 use logdbd::pb::log_db_service_server::LogDbServiceServer;
-use logdbd::replication::{run_primary_sync, ReplicationServiceImpl};
+use logdbd::replication::{ReplicationServiceImpl, run_primary_sync};
 use logdbd::service::LogDbServiceImpl;
 
 /// Start a test server on a random port. Returns the address and the temp dir guard.

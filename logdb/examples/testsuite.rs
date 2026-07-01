@@ -9,21 +9,18 @@
 
 use std::time::Duration;
 
+use logdb::LogDb;
 use logdb::config::{Config, DurabilityMode, QueueFullPolicy, RetentionPolicy};
-use logdb::health::{HealthState, HEALTH_DISK_FULL, HEALTH_IO_ERROR, HEALTH_OK};
+use logdb::health::{HEALTH_DISK_FULL, HealthState};
 use logdb::pipeline::signal::{FlushSignal, ShutdownState};
-use logdb::pipeline::trigger::{Backoff, CommitTrigger, WaitStrategy};
-use logdb::record::{Record, RecordId};
+use logdb::record::RecordId;
 use logdb::ring::Ring;
 use logdb::shard::ShardMap;
-use logdb::storage::format::{
-    deserialize_record, record_size, serialize_record, SegmentHeader, FLAG_HASH_ENABLED,
-    FLAG_NOT_FIRST, FORMAT_VERSION, HASH_ALGO_BLAKE3, HASH_ALGO_SHA256, HEADER_CRC_END, MAGIC,
-    MIN_RECORD_SIZE, RECORD_FORMAT_V1, SEGMENT_HEADER_SIZE,
-};
-use logdb::storage::index::{IndexEntry, SparseIndex};
 use logdb::storage::SegmentManager;
-use logdb::LogDb;
+use logdb::storage::format::{
+    FORMAT_VERSION, HASH_ALGO_BLAKE3, HASH_ALGO_SHA256, SEGMENT_HEADER_SIZE, SegmentHeader,
+    deserialize_record, record_size, serialize_record,
+};
 
 macro_rules! check {
     ($cond:expr, $msg:expr) => {
@@ -326,7 +323,6 @@ fn test_ring_slot_index_wraps() -> i32 {
 }
 
 fn test_ring_consume_watermark_no_hash() -> i32 {
-    use std::sync::atomic::Ordering;
     let ring = Ring::new(16, false, 0);
     check!(ring.consume_watermark() == 0, "initial wm");
     ring.set_committed_cursor(5);
@@ -335,7 +331,6 @@ fn test_ring_consume_watermark_no_hash() -> i32 {
 }
 
 fn test_ring_consume_watermark_with_hash() -> i32 {
-    use std::sync::atomic::Ordering;
     let ring = Ring::new(16, true, 0);
     ring.set_sealed_cursor(3);
     ring.set_committed_cursor(5);
@@ -360,7 +355,6 @@ fn test_ring_full_write_read_cycle() -> i32 {
 }
 
 fn test_ring_claim_unblocks_after_consume() -> i32 {
-    use std::sync::atomic::Ordering;
     let ring = std::sync::Arc::new(Ring::new(16, false, 0));
     for _ in 0..16 {
         ring.claim(QueueFullPolicy::Block).unwrap();

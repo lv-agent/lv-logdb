@@ -79,6 +79,21 @@ cargo run --release --example perf   # standalone perf measurement
 
 Criterion is configured with `html_reports` and writes its reports under `target/criterion/`.
 
+## Coverage
+
+Test coverage is measured with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+(uses `-C instrument-coverage`, stable Rust). CI runs it as a **non-blocking**
+job; the summary is visible in the workflow logs.
+
+```sh
+cargo install cargo-llvm-cov --locked
+cargo llvm-cov --workspace --all-features --summary-only   # terminal summary
+cargo llvm-cov --workspace --all-features --open           # HTML report in browser
+```
+
+For PRs, check the CI output; for local work, `--open` gives per-line coverage
+in a browser.
+
 ## Qualification scripts
 
 `scripts/` contains runner scripts for the long-running and bare-metal tests. Most consume the release binaries produced by [`scripts/build.sh`](building.md#release-helper-scriptsbuildsh).
@@ -113,6 +128,7 @@ Criterion is configured with `html_reports` and writes its reports under `target
 | Benchmarks (Criterion)        | `cargo bench`                                                   |
 | Perf binary                   | `cargo run --release --example perf`                            |
 | Fuzz a target                 | `cargo +nightly fuzz run <target>`                              |
+| Coverage report               | `cargo llvm-cov --workspace --all-features --open`              |
 | Build release binaries        | `./scripts/build.sh`                                            |
 | Master qualification run      | `./scripts/run-all.sh`                                          |
 | Crash recovery loop           | `./scripts/crash-recovery-test.sh`                              |

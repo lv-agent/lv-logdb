@@ -95,6 +95,9 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `logdb.segment.rolls` (counter), `logdb.flush.duration` &
   `logdb.recovery.duration` (histograms), and `LogDb::record_gauges()` samples
   `logdb.durable_lag` / `logdb.queue_depth` / `logdb.wal_bytes` (gauges).
+- **CI coverage job** (`cargo llvm-cov`, non-blocking) and new "Coverage"
+  section in the Dev Guide testing docs. Qualification scripts and long-soak /
+  long-fuzz documentation already exist in `scripts/run-all.sh`.
 - `testing` feature: an off-by-default feature that re-exposes the internal
   modules as `#[doc(hidden)] pub`, for the deployed test binary
   (`examples/testsuite`) and the `tests/fuzz` integration target. Not a

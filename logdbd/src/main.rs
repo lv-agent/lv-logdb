@@ -147,6 +147,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Storage — wraps logdb with record encode/decode
     let storage = Arc::new(Storage::new(db, num_shards));
 
+    // Cache — per-stream SQLite query cache (Indexer background thread)
+    let cache_indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        config.cache.dir.clone(),
+        &config.cache,
+    ));
+    cache_indexer.clone().start();
+
     let hostname = node.id.clone();
     let role_str = node.role.to_string();
     let log_svc = LogDbServiceImpl::new(
@@ -240,11 +249,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let db_for_drain = storage.db_arc();
+    let idx_for_drain = Arc::clone(&cache_indexer);
     server
         .serve_with_shutdown(listen, async move {
             shutdown_signal().await;
+            tracing::info!("shutdown signal received; stopping cache indexer");
+            idx_for_drain.stop();
+            // Give Indexer a brief moment to flush
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             tracing::info!(
-                "shutdown signal received; draining logdb (flush in-flight to durable, up to 30s)"
+                "draining logdb (flush in-flight to durable, up to 30s)"
             );
             match db_for_drain.drain(std::time::Duration::from_secs(30)) {
                 Ok(logdb::ShutdownReport::Clean) => tracing::info!(report = "clean", "drain complete"),

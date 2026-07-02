@@ -745,16 +745,12 @@ async fn out_of_retention_graceful() {
 
 // ── Cache (SQLite Query) Tests ───────────────────────────────────────────────
 
-#[tokio::test]
-async fn cache_query_after_append() {
-    use logdbd::cache::Indexer;
-    use logdbd::config::CacheConfig;
-
+// Helper: start a test server with cache Indexer, returning (addr, tempdir, indexer).
+async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cache::Indexer>) {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let cache_dir = dir.path().join("cache");
 
-    // Create storage + catalog (same as main.rs startup)
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
     db_config.durability_mode = logdb::DurabilityMode::Sync;
@@ -765,7 +761,83 @@ async fn cache_query_after_append() {
     let storage = Arc::new(Storage::new(db, 1));
     let catalog = test_catalog(&data_dir);
 
-    // Start Indexer
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        ..Default::default()
+    };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+    ));
+    indexer.clone().start();
+
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage),
+        catalog,
+        Arc::new(ConsumerTracker::new()),
+        "cache-test".into(),
+        "primary".into(),
+        cache_dir,
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (addr, dir, indexer)
+}
+
+/// Wait for the Indexer to reach or exceed `target_gid`.
+async fn wait_for_indexer(indexer: &logdbd::cache::Indexer, target_gid: u64, timeout_ms: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if indexer.last_gid() >= target_gid {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "Indexer did not reach target_gid={} within {}ms (current={})",
+                target_gid,
+                timeout_ms,
+                indexer.last_gid()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// Redisign the first test to use the helper
+
+#[tokio::test]
+async fn cache_query_after_append() {
+    use logdbd::cache::Indexer;
+    use logdbd::config::CacheConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
     let cache_config = CacheConfig { dir: cache_dir.clone(), ..Default::default() };
     let indexer = Arc::new(Indexer::new(
         storage.db_arc(),
@@ -775,7 +847,6 @@ async fn cache_query_after_append() {
     ));
     indexer.clone().start();
 
-    // Start gRPC server
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
@@ -798,12 +869,10 @@ async fn cache_query_after_append() {
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Connect client
     let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
         .await
         .unwrap();
 
-    // Append 3 records with different event_types
     for i in 0..3u64 {
         client.append(pb::AppendRequest {
             namespace: "test".into(),
@@ -814,16 +883,8 @@ async fn cache_query_after_append() {
         }).await.unwrap();
     }
 
-    // Wait for Indexer to catch up
-    for _ in 0..50 {
-        if indexer.last_gid() >= 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(indexer.last_gid() >= 3, "Indexer should have caught up");
+    wait_for_indexer(&indexer, 3, 3000).await;
 
-    // Query via gRPC
     let resp = client.query(pb::QueryRequest {
         namespace: "test".into(),
         stream: "main".into(),
@@ -831,11 +892,10 @@ async fn cache_query_after_append() {
     }).await.unwrap().into_inner();
 
     assert_eq!(resp.rows.len(), 3, "should return 3 rows");
-    assert!(resp.rows[0].contains("type.0"), "row 0 should contain event_type type.0");
-    assert!(resp.rows[1].contains("type.1"), "row 1 should contain event_type type.1");
-    assert!(resp.rows[2].contains("type.2"), "row 2 should contain event_type type.2");
+    assert!(resp.rows[0].contains("type.0"));
+    assert!(resp.rows[1].contains("type.1"));
+    assert!(resp.rows[2].contains("type.2"));
 
-    // COUNT query
     let count_resp = client.query(pb::QueryRequest {
         namespace: "test".into(),
         stream: "main".into(),
@@ -843,6 +903,197 @@ async fn cache_query_after_append() {
     }).await.unwrap().into_inner();
     assert!(count_resp.rows[0].contains("3"), "COUNT should return 3");
 
-    // Shutdown
+    indexer.stop();
+}
+
+#[tokio::test]
+async fn cache_multi_stream_isolation() {
+    let (addr, _dir, indexer) = start_cache_server().await;
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Append to stream-a
+    for i in 0..3u64 {
+        client.append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "stream-a".into(),
+            event_type: "a.event".into(),
+            content: format!("a-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+    // Append to stream-b
+    for i in 0..2u64 {
+        client.append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "stream-b".into(),
+            event_type: "b.event".into(),
+            content: format!("b-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+
+    wait_for_indexer(&indexer, 5, 3000).await;
+
+    // Query stream-a independently
+    let resp_a = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "stream-a".into(),
+        sql: "SELECT COUNT(*) FROM records".into(),
+    }).await.unwrap().into_inner();
+    assert!(resp_a.rows[0].contains("3"), "stream-a should have 3 records");
+
+    // Query stream-b independently
+    let resp_b = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "stream-b".into(),
+        sql: "SELECT COUNT(*) FROM records".into(),
+    }).await.unwrap().into_inner();
+    assert!(resp_b.rows[0].contains("2"), "stream-b should have 2 records");
+
+    // stream-a should NOT contain b's events
+    let resp_a_events = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "stream-a".into(),
+        sql: "SELECT event_type FROM records WHERE event_type LIKE 'b.%'".into(),
+    }).await.unwrap().into_inner();
+    assert!(resp_a_events.rows.is_empty(), "stream-a must not see stream-b's data");
+
+    indexer.stop();
+}
+
+#[tokio::test]
+async fn cache_query_rejects_non_select() {
+    let (addr, _dir, indexer) = start_cache_server().await;
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Append one record first
+    client.append(pb::AppendRequest {
+        namespace: "test".into(),
+        stream: "main".into(),
+        event_type: "test".into(),
+        content: b"data".to_vec(),
+        ..Default::default()
+    }).await.unwrap();
+
+    wait_for_indexer(&indexer, 1, 3000).await;
+
+    let forbidden_sqls = [
+        "INSERT INTO records (seq) VALUES (99)",
+        "DELETE FROM records WHERE seq = 1",
+        "UPDATE records SET deleted = 1",
+        "DROP TABLE records",
+    ];
+
+    for sql in &forbidden_sqls {
+        let err = client.query(pb::QueryRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            sql: sql.to_string(),
+        }).await;
+        assert!(err.is_err(), "should reject: {}", sql);
+    }
+
+    indexer.stop();
+}
+
+#[tokio::test]
+async fn cache_query_concurrent_reads() {
+    let (addr, _dir, indexer) = start_cache_server().await;
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Append 50 records
+    for i in 0..50u64 {
+        client.append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: format!("type.{}", i % 5),
+            content: format!("record-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+
+    wait_for_indexer(&indexer, 50, 5000).await;
+
+    // Multiple concurrent queries
+    let mut handles = Vec::new();
+    for filter_val in 0..5 {
+        let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+            .await
+            .unwrap();
+        handles.push(tokio::spawn(async move {
+            c.query(pb::QueryRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                sql: format!(
+                    "SELECT COUNT(*) FROM records WHERE event_type = 'type.{}'",
+                    filter_val
+                ),
+            })
+            .await
+        }));
+    }
+
+    for h in handles {
+        let resp = h.await.unwrap().unwrap().into_inner();
+        assert!(resp.rows[0].contains("10"), "each event_type should have 10 records");
+    }
+
+    indexer.stop();
+}
+
+#[tokio::test]
+async fn cache_tombstone_and_query() {
+    let (addr, _dir, indexer) = start_cache_server().await;
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Append 5 records
+    for i in 0..5u64 {
+        client.append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "msg".into(),
+            content: format!("msg-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+
+    // Append a tombstone targeting seq=2
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("target_seq".into(), "2".into());
+    client.append(pb::AppendRequest {
+        namespace: "test".into(),
+        stream: "main".into(),
+        event_type: "logdb.tombstone".into(),
+        metadata: meta,
+        content: vec![],
+        ..Default::default()
+    }).await.unwrap();
+
+    wait_for_indexer(&indexer, 6, 3000).await;
+
+    // Non-deleted count should be 4
+    let resp = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "main".into(),
+        sql: "SELECT COUNT(*) FROM records WHERE deleted = 0 AND event_type != 'logdb.tombstone'".into(),
+    }).await.unwrap().into_inner();
+    assert!(resp.rows[0].contains("4"), "should have 4 non-deleted records after tombstone: got {}", resp.rows[0]);
+
+    // Tombstone record should exist
+    let tomb_resp = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "main".into(),
+        sql: "SELECT seq FROM records WHERE event_type = 'logdb.tombstone'".into(),
+    }).await.unwrap().into_inner();
+    assert_eq!(tomb_resp.rows.len(), 1, "tombstone record should exist");
+
     indexer.stop();
 }

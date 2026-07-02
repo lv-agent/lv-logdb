@@ -19,6 +19,9 @@ service LogDbService {
   // Catalog — namespace & stream management
   rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse);
   rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
+
+  // Query cache — SQL SELECT against the stream's SQLite cache
+  rpc Query(QueryRequest) returns (QueryResponse);
 }
 
 // ─── Record (full logdbd record) ─────────────────────────────────────────
@@ -259,4 +262,16 @@ message StreamInfo {
 
 message ListStreamsResponse {
   repeated StreamInfo streams = 1;
+}
+
+// ─── Query (SQL cache) ────────────────────────────────────────────────────
+
+message QueryRequest {
+  string namespace = 1;
+  string stream    = 2;
+  string sql       = 3;  // SELECT statement only
+}
+
+message QueryResponse {
+  repeated string rows = 1;  // each row as JSON string
 }

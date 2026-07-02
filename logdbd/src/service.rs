@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -24,6 +25,7 @@ pub struct LogDbServiceImpl {
     consumer_tracker: Arc<ConsumerTracker>,
     hostname: String,
     role: String,
+    cache_dir: PathBuf,
 }
 
 impl LogDbServiceImpl {
@@ -33,8 +35,9 @@ impl LogDbServiceImpl {
         consumer_tracker: Arc<ConsumerTracker>,
         hostname: String,
         role: String,
+        cache_dir: PathBuf,
     ) -> Self {
-        Self { storage, catalog, consumer_tracker, hostname, role }
+        Self { storage, catalog, consumer_tracker, hostname, role, cache_dir }
     }
 
     fn check_write(&self) -> Result<(), Status> {
@@ -478,5 +481,27 @@ impl LogDbService for LogDbServiceImpl {
             })
             .collect();
         Ok(Response::new(pb::ListStreamsResponse { streams }))
+    }
+
+    async fn query(
+        &self,
+        req: Request<pb::QueryRequest>,
+    ) -> Result<Response<pb::QueryResponse>, Status> {
+        let r = req.get_ref();
+
+        // Validate namespace + stream exist
+        let (_ns_id, _stream_id) = self.resolve(&r.namespace, &r.stream)?;
+
+        let db_name = crate::cache::indexer::db_filename(&r.namespace, &r.stream);
+        let db_path = self.cache_dir.join(db_name);
+
+        if !db_path.exists() {
+            return Ok(Response::new(pb::QueryResponse { rows: vec![] }));
+        }
+
+        match crate::cache::execute_query(&db_path, &r.sql) {
+            Ok(rows) => Ok(Response::new(pb::QueryResponse { rows })),
+            Err(e) => Err(Status::invalid_argument(e.to_string())),
+        }
     }
 }

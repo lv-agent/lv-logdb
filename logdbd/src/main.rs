@@ -155,6 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(ConsumerTracker::new()),
         hostname,
         role_str,
+        config.cache.dir.clone(),
     );
     let repl_svc = ReplicationServiceImpl::new(
         Arc::clone(&storage),

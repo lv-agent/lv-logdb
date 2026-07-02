@@ -1,6 +1,7 @@
 //! Integration tests for logdbd gRPC service (v0.4 proto).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,9 +53,10 @@ async fn start_test_server() -> (SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(test_storage(dir.path()));
     let catalog = test_catalog(dir.path());
+    let cache_dir = dir.path().join("cache");
     let svc = LogDbServiceImpl::new(
         Arc::clone(&storage), catalog, Arc::new(ConsumerTracker::new()),
-        "test-node".into(), "primary".into(),
+        "test-node".into(), "primary".into(), cache_dir,
     );
     let svc = LogDbServiceServer::new(svc);
 
@@ -78,7 +80,8 @@ async fn start_node(role: &str, standby_addrs: Vec<String>) -> (SocketAddr, temp
     let catalog = test_catalog(dir.path());
 
     let node_id = format!("{}-{}", role, dir.path().file_name().unwrap().to_string_lossy());
-    let log_svc = LogDbServiceImpl::new(Arc::clone(&storage), catalog, Arc::new(ConsumerTracker::new()), node_id.clone(), role.into());
+    let cache_dir = dir.path().join("cache");
+    let log_svc = LogDbServiceImpl::new(Arc::clone(&storage), catalog, Arc::new(ConsumerTracker::new()), node_id.clone(), role.into(), cache_dir);
     let repl_svc = ReplicationServiceImpl::new(Arc::clone(&storage), "test-cluster".into(), 1);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -235,7 +238,7 @@ async fn standby_rejects_writes() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(test_storage(dir.path()));
     let catalog = test_catalog(dir.path());
-    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "standby-node".into(), "standby".into());
+    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "standby-node".into(), "standby".into(), PathBuf::from("/tmp"));
     let svc = LogDbServiceServer::new(svc);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -373,7 +376,7 @@ async fn start_server_with_auth(token: &str) -> (SocketAddr, tempfile::TempDir) 
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(test_storage(dir.path()));
     let catalog = test_catalog(dir.path());
-    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "auth-node".into(), "primary".into());
+    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "auth-node".into(), "primary".into(), PathBuf::from("/tmp"));
     let interceptor = AuthInterceptor::new(token);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -417,7 +420,7 @@ async fn tls_server_accepts_tls_client_and_rejects_plaintext() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(test_storage(dir.path()));
     let catalog = test_catalog(dir.path());
-    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "tls-node".into(), "primary".into());
+    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "tls-node".into(), "primary".into(), PathBuf::from("/tmp"));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -568,7 +571,7 @@ async fn catalog_survives_server_restart() {
     // Second session: reopen same data_dir, verify catalog is intact
     let storage = Arc::new(test_storage(dir1.path()));
     let catalog = Arc::new(Catalog::open(dir1.path()).unwrap());
-    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "restart-node".into(), "primary".into());
+    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "restart-node".into(), "primary".into(), PathBuf::from("/tmp"));
     let svc = LogDbServiceServer::new(svc);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -698,7 +701,7 @@ async fn out_of_retention_graceful() {
     let db = logdb::LogDb::open(db_config).unwrap();
     let storage = Arc::new(Storage::new(db, 1));
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
-    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "ret-node".into(), "primary".into());
+    let svc = LogDbServiceImpl::new(storage, catalog, Arc::new(ConsumerTracker::new()), "ret-node".into(), "primary".into(), PathBuf::from("/tmp"));
     let svc = LogDbServiceServer::new(svc);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -189,6 +189,34 @@ impl Client {
         Ok(resp.into_inner().rows)
     }
 
+    // ── Subscribe ───────────────────────────────────────────────────────
+
+    /// Subscribe to matching event types in real-time.
+    ///
+    /// Returns a server-streaming call.  Records are pushed as they are
+    /// committed to the log and filtered by `event_types`.  The consumer
+    /// offset is tracked server-side via `consumer_group` / `consumer_id`.
+    pub async fn subscribe(
+        &mut self,
+        namespace: &str,
+        stream: &str,
+        event_types: Vec<String>,
+        consumer_group: &str,
+        consumer_id: &str,
+    ) -> Result<tonic::codec::Streaming<Record>, tonic::Status> {
+        let resp = self
+            .inner
+            .subscribe(SubscribeRequest {
+                namespace: namespace.into(),
+                stream: stream.into(),
+                event_types,
+                consumer_group: consumer_group.into(),
+                consumer_id: consumer_id.into(),
+            })
+            .await?;
+        Ok(resp.into_inner())
+    }
+
     // ── Tail ───────────────────────────────────────────────────────────
 
     /// Create a tail subscription.

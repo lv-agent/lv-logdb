@@ -45,7 +45,7 @@ async fn start_logdbd() -> (String, tempfile::TempDir) {
     let svc = LogDbServiceImpl::new(
         storage,
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "test-node".into(),
         "primary".into(),

@@ -163,6 +163,34 @@ export class Client {
     });
   }
 
+  // ── Subscribe ───────────────────────────────────────────────────────
+
+  /** Subscribe to matching event types in real-time.
+   *
+   * Returns a gRPC server-streaming call.  Records are pushed as they
+   * are committed and filtered by `eventTypes`.  The consumer offset
+   * is tracked server-side.
+   *
+   * Usage:
+   *   const stream = client.subscribe('my-app', 'main', ['tool.call'], 'group', 'w1');
+   *   stream.on('data', (rec) => console.log(rec.eventType, rec.content));
+   */
+  subscribe(
+    namespace: string,
+    stream: string,
+    eventTypes: string[],
+    consumerGroup: string,
+    consumerId: string,
+  ): grpc.ClientReadableStream<any> {
+    return this.client.Subscribe({
+      namespace,
+      stream,
+      eventTypes,
+      consumerGroup,
+      consumerId,
+    }) as grpc.ClientReadableStream<any>;
+  }
+
   /** Subscribe to new records via Tail. */
   tail(namespace: string, stream: string, opts?: TailOptions): TailStream {
     const call = this.client.Tail({

@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Shared subscriber hub — Indexer publishes, Subscribe RPC reads
     let subscribe_hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
-    let consumer_tracker = Arc::new(ConsumerTracker::new());
+    let consumer_tracker = Arc::new(ConsumerTracker::new(Some(config.cache.dir.clone())));
 
     // Cache — per-stream SQLite query cache (Indexer background thread)
     let cache_indexer = Arc::new(logdbd::cache::Indexer::new(

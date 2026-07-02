@@ -35,7 +35,13 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             deleted        INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_records_event_type ON records (event_type);
-        CREATE INDEX IF NOT EXISTS idx_records_ts ON records (ts_ns);",
+        CREATE INDEX IF NOT EXISTS idx_records_ts ON records (ts_ns);
+        CREATE TABLE IF NOT EXISTS consumer_offsets (
+            consumer_group TEXT NOT NULL,
+            consumer_id    TEXT NOT NULL,
+            committed_seq  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (consumer_group, consumer_id)
+        );",
     )?;
     Ok(())
 }

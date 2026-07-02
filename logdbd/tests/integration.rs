@@ -57,7 +57,7 @@ async fn start_test_server() -> (SocketAddr, tempfile::TempDir) {
     let svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "test-node".into(),
         "primary".into(),
@@ -93,7 +93,7 @@ async fn start_node(role: &str, standby_addrs: Vec<String>) -> (SocketAddr, temp
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         node_id.clone(),
         role.into(),
@@ -330,7 +330,7 @@ async fn standby_rejects_writes() {
     let svc = LogDbServiceImpl::new(
         storage,
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "standby-node".into(),
         "standby".into(),
@@ -526,7 +526,7 @@ async fn start_server_with_auth(token: &str) -> (SocketAddr, tempfile::TempDir) 
     let svc = LogDbServiceImpl::new(
         storage,
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "auth-node".into(),
         "primary".into(),
@@ -583,7 +583,7 @@ async fn tls_server_accepts_tls_client_and_rejects_plaintext() {
     let svc = LogDbServiceImpl::new(
         storage,
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "tls-node".into(),
         "primary".into(),
@@ -815,7 +815,7 @@ async fn catalog_survives_server_restart() {
     let svc = LogDbServiceImpl::new(
         storage,
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "restart-node".into(),
         "primary".into(),
@@ -1034,7 +1034,7 @@ async fn out_of_retention_graceful() {
     let svc = LogDbServiceImpl::new(
         storage,
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "ret-node".into(),
         "primary".into(),
@@ -1139,7 +1139,7 @@ async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cac
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "cache-test".into(),
         "primary".into(),
@@ -1218,7 +1218,7 @@ async fn cache_query_after_append() {
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "cache-test".into(),
         "primary".into(),
@@ -1575,7 +1575,7 @@ async fn cache_query_with_metadata_index() {
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "meta-idx-test".into(),
         "primary".into(),
@@ -1687,7 +1687,7 @@ async fn subscribe_receives_matching_event_types() {
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
-        Arc::new(ConsumerTracker::new()),
+        Arc::new(ConsumerTracker::new(None)),
         Arc::clone(&hub),
         "subscribe-test".into(),
         "primary".into(),

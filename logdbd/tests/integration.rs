@@ -1753,3 +1753,174 @@ async fn subscribe_receives_matching_event_types() {
 
     indexer.stop();
 }
+
+#[tokio::test]
+async fn subscribe_multi_consumer_same_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let tracker = Arc::new(ConsumerTracker::new(None));
+    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
+        &cache_config, Arc::clone(&hub),
+    ));
+    indexer.clone().start();
+
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage), catalog, Arc::clone(&tracker),
+        Arc::clone(&hub), "multi-cons".into(), "primary".into(), cache_dir,
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder().add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+
+    // Two subscribers in the same group, each subscribing to different event types
+    let mut c1 = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    let mut c2 = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+
+    let resp1 = c1.subscribe(pb::SubscribeRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_types: vec!["tool.call".into()],
+        consumer_group: "sandbox".into(), consumer_id: "executor-1".into(),
+    }).await.unwrap();
+    let mut s1 = resp1.into_inner();
+
+    let resp2 = c2.subscribe(pb::SubscribeRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_types: vec!["llm.call".into()],
+        consumer_group: "sandbox".into(), consumer_id: "llm-watcher".into(),
+    }).await.unwrap();
+    let mut s2 = resp2.into_inner();
+
+    // Append one of each
+    admin.append(pb::AppendRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_type: "tool.call".into(), content: b"tc".to_vec(),
+        ..Default::default()
+    }).await.unwrap();
+    admin.append(pb::AppendRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_type: "llm.call".into(), content: b"lc".to_vec(),
+        ..Default::default()
+    }).await.unwrap();
+
+    let dl = tokio::time::Instant::now() + Duration::from_secs(3);
+
+    // executor-1 should receive tool.call
+    let r1 = tokio::time::timeout_at(dl, s1.message()).await.unwrap().unwrap().unwrap();
+    assert_eq!(r1.event_type, "tool.call");
+    assert_eq!(r1.content, b"tc");
+
+    // llm-watcher should receive llm.call
+    let r2 = tokio::time::timeout_at(dl, s2.message()).await.unwrap().unwrap().unwrap();
+    assert_eq!(r2.event_type, "llm.call");
+    assert_eq!(r2.content, b"lc");
+
+    indexer.stop();
+}
+
+#[tokio::test]
+async fn subscribe_reconnect_replays_from_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    // Create SQLite with consumer_offsets table (simulating previous session)
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let db_path = cache_dir.join("test.main.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS consumer_offsets (
+                consumer_group TEXT NOT NULL, consumer_id TEXT NOT NULL,
+                committed_seq INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (consumer_group, consumer_id)
+            );",
+        ).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO consumer_offsets VALUES ('sandbox', 'reconn', 2)",
+            [],
+        ).unwrap();
+    }
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let tracker = Arc::new(ConsumerTracker::new(Some(cache_dir.clone())));
+    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
+        &cache_config, Arc::clone(&hub),
+    ));
+    indexer.clone().start();
+
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage), catalog, Arc::clone(&tracker),
+        Arc::clone(&hub), "reconn-test".into(), "primary".into(), cache_dir,
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder().add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+
+    // Simulating reconnect: subscribe with the same consumer_group/id
+    let resp = c.subscribe(pb::SubscribeRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_types: vec!["tool.call".into()],
+        consumer_group: "sandbox".into(), consumer_id: "reconn".into(),
+    }).await.unwrap();
+    let mut stream = resp.into_inner();
+
+    // Append a new record — should still receive in real-time
+    c.append(pb::AppendRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_type: "tool.call".into(), content: b"after-reconnect".to_vec(),
+        ..Default::default()
+    }).await.unwrap();
+
+    let dl = tokio::time::Instant::now() + Duration::from_secs(3);
+    let rec = tokio::time::timeout_at(dl, stream.message()).await.unwrap().unwrap().unwrap();
+    assert_eq!(rec.event_type, "tool.call");
+    assert_eq!(rec.content, b"after-reconnect");
+
+    // Verify the committed offset was restored from SQLite
+    let committed = tracker.get("test", "main", "sandbox", "reconn");
+    assert_eq!(committed, 2, "offset should be restored from SQLite");
+
+    indexer.stop();
+}

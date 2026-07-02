@@ -141,3 +141,87 @@ impl ConsumerTracker {
             .collect()
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_and_get_in_memory() {
+        let tracker = ConsumerTracker::new(None);
+        assert_eq!(tracker.get("ns", "s", "g", "c1"), 0);
+
+        tracker.commit("ns", "s", "g", "c1", 42);
+        assert_eq!(tracker.get("ns", "s", "g", "c1"), 42);
+    }
+
+    #[test]
+    fn independent_consumers() {
+        let tracker = ConsumerTracker::new(None);
+        tracker.commit("ns", "s", "g", "w1", 10);
+        tracker.commit("ns", "s", "g", "w2", 20);
+
+        assert_eq!(tracker.get("ns", "s", "g", "w1"), 10);
+        assert_eq!(tracker.get("ns", "s", "g", "w2"), 20);
+    }
+
+    #[test]
+    fn commit_overwrites_previous() {
+        let tracker = ConsumerTracker::new(None);
+        tracker.commit("ns", "s", "g", "c1", 5);
+        tracker.commit("ns", "s", "g", "c1", 100);
+        assert_eq!(tracker.get("ns", "s", "g", "c1"), 100);
+    }
+
+    #[test]
+    fn sqlite_persistence_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+
+        // Create the db file with proper schema
+        let db_path = cache_dir.join("ns.stream.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS consumer_offsets (
+                    consumer_group TEXT NOT NULL,
+                    consumer_id    TEXT NOT NULL,
+                    committed_seq  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (consumer_group, consumer_id)
+                );",
+            )
+            .unwrap();
+        }
+
+        let tracker = ConsumerTracker::new(Some(cache_dir));
+
+        // Commit
+        tracker.commit("ns", "stream", "g1", "c1", 99);
+
+        // Read back from a fresh tracker (simulates restart)
+        let tracker2 = ConsumerTracker::new(Some(dir.path().to_path_buf()));
+        assert_eq!(tracker2.get("ns", "stream", "g1", "c1"), 99);
+    }
+
+    #[test]
+    fn sqlite_nonexistent_returns_zero() {
+        let tracker = ConsumerTracker::new(None);
+        // No consumer committed anything yet
+        assert_eq!(tracker.get("ns", "s", "g", "unknown"), 0);
+    }
+
+    #[test]
+    fn list_group_returns_consumer_ids() {
+        let tracker = ConsumerTracker::new(None);
+        tracker.commit("ns", "s", "g1", "w1", 10);
+        tracker.commit("ns", "s", "g1", "w2", 20);
+        tracker.commit("ns", "s", "g2", "w3", 30);
+
+        let g1 = tracker.list_group("ns", "s", "g1");
+        assert_eq!(g1.len(), 2);
+        assert!(g1.contains(&("w1".into(), 10)));
+        assert!(g1.contains(&("w2".into(), 20)));
+    }
+}

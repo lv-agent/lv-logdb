@@ -79,3 +79,133 @@ impl SubscribeHandle {
         }
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn make_record(stream_id: u64, seq: u64, event_type: &str) -> DecodedRecord {
+        DecodedRecord {
+            namespace_id: 1,
+            stream_id,
+            seq,
+            event_type: event_type.into(),
+            content_type: "text/plain".into(),
+            metadata: BTreeMap::new(),
+            timestamp_ns: seq * 1000,
+            user_content: format!("r-{}", seq).into_bytes(),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_and_receive() {
+        let hub = SubscribeHub::new();
+        let ets: HashSet<String> = ["tool.call".into(), "llm.call".into()].into();
+
+        // Subscribe first to create the channel, then publish
+        let mut handle = hub.subscribe(42, ets);
+        hub.publish(42, &make_record(42, 1, "tool.call"));
+        let rec = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.next_matching(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rec.event_type, "tool.call");
+        assert_eq!(rec.seq, 1);
+    }
+
+    #[tokio::test]
+    async fn filter_excludes_non_matching() {
+        let hub = SubscribeHub::new();
+        let ets: HashSet<String> = ["tool.call".into()].into();
+
+        let mut handle = hub.subscribe(1, ets);
+        // Publish non-matching, then matching
+        hub.publish(1, &make_record(1, 1, "user.input"));
+        hub.publish(1, &make_record(1, 2, "tool.call"));
+        let rec = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.next_matching(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Should skip "user.input" and get "tool.call"
+        assert_eq!(rec.event_type, "tool.call");
+        assert_eq!(rec.seq, 2);
+    }
+
+    #[tokio::test]
+    async fn multi_subscriber_same_stream() {
+        let hub = SubscribeHub::new();
+        let tool_ets: HashSet<String> = ["tool.call".into()].into();
+        let llm_ets: HashSet<String> = ["llm.call".into()].into();
+
+        let mut tool_handle = hub.subscribe(1, tool_ets);
+        let mut llm_handle = hub.subscribe(1, llm_ets);
+
+        hub.publish(1, &make_record(1, 1, "tool.call"));
+        hub.publish(1, &make_record(1, 2, "llm.call"));
+
+        let tool_rec = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tool_handle.next_matching(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(tool_rec.event_type, "tool.call");
+
+        let llm_rec = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            llm_handle.next_matching(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(llm_rec.event_type, "llm.call");
+    }
+
+    #[tokio::test]
+    async fn stream_isolation() {
+        let hub = SubscribeHub::new();
+        let ets: HashSet<String> = ["tool.call".into()].into();
+
+        let mut handle_s1 = hub.subscribe(1, ets.clone());
+        let mut handle_s2 = hub.subscribe(2, ets);
+
+        // Publish to both streams
+        hub.publish(1, &make_record(1, 1, "tool.call"));
+        hub.publish(2, &make_record(2, 1, "tool.call"));
+
+        let r1 = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_s1.next_matching(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(r1.stream_id, 1);
+
+        let r2 = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle_s2.next_matching(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(r2.stream_id, 2);
+    }
+
+    #[tokio::test]
+    async fn publish_without_subscribers_no_panic() {
+        let hub = SubscribeHub::new();
+        // No subscribers exist — publish must not panic
+        hub.publish(1, &make_record(1, 1, "test"));
+    }
+}

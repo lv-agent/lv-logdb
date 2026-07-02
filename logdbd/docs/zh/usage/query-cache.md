@@ -144,3 +144,81 @@ SQLite 缓存文件（`cache_dir/` 下的 `.db` 文件）完全可以从 Segment
 ## 快照
 
 调用 `Checkpoint` RPC 时，Indexer 会为每个活跃的 stream 创建一份 SQLite 快照（`<stream>.snap_{timestamp}.db`），保留最近 K 个（通过 `snapshot_retain` 配置）。快照用于加速下次启动时的缓存恢复。
+
+## 实时订阅（Subscribe）
+
+`Subscribe` RPC 提供按 event_type 过滤的实时推送。记录先落盘（Segment），再通过 Indexer 推送给订阅方。
+
+### 基本用法
+
+```rust
+// Rust SDK
+let mut stream = client.subscribe(
+    "my-app", "main",
+    vec!["tool.call".into(), "llm.call".into()],  // 订阅的事件类型
+    "sandbox-processors",  // consumer group
+    "worker-1",            // consumer id
+).await?;
+
+while let Some(rec) = stream.message().await? {
+    println!("[{}] {}: {:?}", rec.seq, rec.event_type, rec.content);
+    // 处理完成后提交 offset
+    client.commit_offset("my-app", "main", "sandbox-processors", "worker-1", rec.seq).await?;
+}
+```
+
+```typescript
+// TypeScript SDK
+const stream = client.subscribe(
+    'my-app', 'main',
+    ['tool.call', 'llm.call'],
+    'sandbox-processors',
+    'worker-1',
+);
+
+stream.on('data', (rec) => {
+    console.log(rec.seq, rec.eventType);
+    client.commitOffset('my-app', 'main', 'sandbox-processors', 'worker-1', rec.seq);
+});
+```
+
+```bash
+# grpcurl
+grpcurl -plaintext -d '{
+  "namespace": "my-app",
+  "stream": "main",
+  "event_types": ["tool.call"],
+  "consumer_group": "sandbox",
+  "consumer_id": "w1"
+}' 127.0.0.1:50051 logdbd.LogDbService/Subscribe
+```
+
+### 多消费者
+
+同一 consumer group 内的多个 consumer 可以独立消费。offset 按 consumer_id 独立追踪：
+
+```
+sandbox-processors (group)
+├── worker-1: committed_seq = 105
+├── worker-2: committed_seq = 98
+└── worker-3: committed_seq = 110
+```
+
+每个 worker 收到所有匹配的记录，由应用层决定如何分工（如按 key 分片）。
+
+### 断线重连
+
+消费者断线重连时，服务端自动从上次 committed offset + 1 开始回放错过的记录，再切回实时推送。offset 持久化在每个 stream 的 SQLite 缓存文件中，服务重启后仍然有效。
+
+### 积压保护
+
+广播 channel 容量为 256 条/stream。如果消费者处理速度跟不上推送速度，channel 满时新记录只会丢弃推送（数据仍在 Segment 中，消费者可通过 Scan/Query 补回）。
+
+### 与 Tail 的区别
+
+| | Tail | Subscribe |
+|---|---|---|
+| 粒度 | stream 全量 | event_type 过滤 |
+| 消费模式 | 客户端拉取 | 服务端推送 |
+| 积压 | 无限制（从 segment 读取） | 256 条 channel buffer |
+| 适用场景 | CDC 导出 | sandbox 实时处理 |

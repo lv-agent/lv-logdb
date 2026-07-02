@@ -31,9 +31,21 @@ for (const r of records) {
 const stream = client.tail('my-app', 'main', { fromSeq: 0, consumerGroup: 'workers', consumerId: 'w1' });
 for await (const rec of stream) {
   console.log(`[${rec.seq}] ${rec.eventType}`);
-  // Commit progress
   await client.commitOffset('my-app', 'main', 'workers', 'w1', rec.seq);
 }
+
+// SQL query against cache
+const rows = await client.query('my-app', 'main',
+  "SELECT seq, event_type FROM records WHERE event_type = 'llm.call' ORDER BY seq DESC LIMIT 10");
+for (const row of rows) console.log(JSON.parse(row));
+
+// Subscribe to event types in real-time
+const sub = client.subscribe('my-app', 'main',
+  ['tool.call', 'llm.call'], 'sandbox-processors', 'worker-1');
+sub.on('data', (rec) => {
+  console.log(`[${rec.seq}] ${rec.eventType}`);
+  client.commitOffset('my-app', 'main', 'sandbox-processors', 'worker-1', rec.seq);
+});
 ```
 
 ## API
@@ -44,6 +56,8 @@ for await (const rec of stream) {
 | `read(ns, stream, seq)` | Point read |
 | `scanAll(ns, stream, fromSeq)` | Scan all records |
 | `tail(ns, stream, opts)` | Live subscription (async iterable) |
+| `query(ns, stream, sql)` | SQL SELECT against query cache |
+| `subscribe(ns, stream, eventTypes, group, id)` | Event-type push subscription |
 | `listNamespaces()` | List all namespaces |
 | `listStreams(ns)` | List streams in a namespace |
 | `status()` | Node status |

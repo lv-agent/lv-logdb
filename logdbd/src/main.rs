@@ -103,7 +103,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Data directory
     let data_dir = config.logdb.data_dir.clone();
-    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| {
+        format!(
+            "cannot create data directory '{}': {}. \
+             If running as non-root, set logdb.data_dir to a writable path, e.g.:\n  \
+             logdb:\n    data_dir: ./data",
+            data_dir.display(), e
+        )
+    })?;
 
     // Build logdb config from our Config
     let mut db_config = logdb::Config::default();

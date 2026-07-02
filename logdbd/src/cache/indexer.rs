@@ -100,6 +100,8 @@ pub struct Indexer {
     streams: Mutex<HashMap<u64, StreamDb>>,
     running: AtomicBool,
     flush_interval: Duration,
+    /// Per-stream metadata field indexes (stream_name → [field_names]).
+    metadata_indexes: HashMap<String, Vec<String>>,
 }
 
 impl Indexer {
@@ -111,6 +113,11 @@ impl Indexer {
         config: &CacheConfig,
     ) -> Self {
         std::fs::create_dir_all(&cache_dir).ok();
+        let metadata_indexes: HashMap<String, Vec<String>> = config
+            .indexes
+            .iter()
+            .map(|idx| (idx.stream.clone(), idx.fields.clone()))
+            .collect();
         Self {
             db,
             catalog,
@@ -119,6 +126,7 @@ impl Indexer {
             streams: Mutex::new(HashMap::new()),
             running: AtomicBool::new(false),
             flush_interval: Duration::from_secs(config.flush_interval_secs),
+            metadata_indexes,
         }
     }
 
@@ -226,6 +234,19 @@ impl Indexer {
             let conn = Connection::open(&db_path).expect("open stream cache db");
             if let Err(e) = create_schema(&conn) {
                 tracing::error!(error = %e, path = %db_path.display(), "failed to create cache schema");
+            }
+            // Apply configured metadata field indexes
+            if let Some(fields) = self.metadata_indexes.get(&stream_name) {
+                for field in fields {
+                    let sql = format!(
+                        "CREATE INDEX IF NOT EXISTS idx_records_meta_{field}
+                         ON records (json_extract(metadata_json, '$.{field}'))",
+                        field = field.replace('\'', "''")
+                    );
+                    if let Err(e) = conn.execute(&sql, []) {
+                        tracing::warn!(field = field, error = %e, "failed to create metadata index");
+                    }
+                }
             }
             StreamDb { conn }
         });

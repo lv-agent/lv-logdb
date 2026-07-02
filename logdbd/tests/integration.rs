@@ -1097,3 +1097,103 @@ async fn cache_tombstone_and_query() {
 
     indexer.stop();
 }
+
+#[tokio::test]
+async fn cache_query_with_metadata_index() {
+    use logdbd::config::StreamIndexConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    // Config with metadata index on 'turn_id'
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        indexes: vec![StreamIndexConfig {
+            stream: "main".into(),
+            fields: vec!["turn_id".into()],
+        }],
+        ..Default::default()
+    };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+    ));
+    indexer.clone().start();
+
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage),
+        catalog,
+        Arc::new(ConsumerTracker::new()),
+        "meta-idx-test".into(),
+        "primary".into(),
+        cache_dir.clone(),
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Append records with different turn_ids in metadata
+    for i in 0..10u64 {
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("turn_id".into(), format!("turn-{}", i / 3));
+        client.append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "llm.call".into(),
+            metadata: meta,
+            content: format!("response-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+
+    wait_for_indexer(&indexer, 10, 5000).await;
+
+    // Query using json_extract on the indexed 'turn_id' field
+    let resp = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "main".into(),
+        sql: "SELECT seq FROM records WHERE json_extract(metadata_json, '$.turn_id') = 'turn-1' ORDER BY seq".into(),
+    }).await.unwrap().into_inner();
+    assert_eq!(resp.rows.len(), 3, "turn-1 should match 3 records (i=3,4,5)");
+
+    // Verify the index was created
+    let index_resp = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "main".into(),
+        sql: "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE '%meta%'".into(),
+    }).await.unwrap().into_inner();
+    assert!(
+        index_resp.rows.iter().any(|r| r.contains("idx_records_meta_turn_id")),
+        "metadata index on turn_id should exist: {:?}",
+        index_resp.rows
+    );
+
+    indexer.stop();
+}

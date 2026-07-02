@@ -805,6 +805,15 @@ pub struct CacheConfig {
     pub snapshot_min_interval_secs: u64,
     #[serde(default = "default_cache_snapshot_retain")]
     pub snapshot_retain: usize,
+    #[serde(default)]
+    pub indexes: Vec<StreamIndexConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamIndexConfig {
+    pub stream: String,
+    pub fields: Vec<String>,
 }
 
 fn default_cache_dir() -> PathBuf {
@@ -830,6 +839,7 @@ impl Default for CacheConfig {
             flush_interval_secs: 30,
             snapshot_min_interval_secs: 300,
             snapshot_retain: 5,
+            indexes: vec![],
         }
     }
 }

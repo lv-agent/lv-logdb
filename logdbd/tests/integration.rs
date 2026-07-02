@@ -742,3 +742,107 @@ async fn out_of_retention_graceful() {
     }).await.unwrap().into_inner();
     assert!(read10.found, "record at checkpoint boundary should survive");
 }
+
+// ── Cache (SQLite Query) Tests ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn cache_query_after_append() {
+    use logdbd::cache::Indexer;
+    use logdbd::config::CacheConfig;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    // Create storage + catalog (same as main.rs startup)
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    // Start Indexer
+    let cache_config = CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let indexer = Arc::new(Indexer::new(
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+    ));
+    indexer.clone().start();
+
+    // Start gRPC server
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage),
+        catalog,
+        Arc::new(ConsumerTracker::new()),
+        "cache-test".into(),
+        "primary".into(),
+        cache_dir.clone(),
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect client
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Append 3 records with different event_types
+    for i in 0..3u64 {
+        client.append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: format!("type.{}", i),
+            content: format!("record-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+
+    // Wait for Indexer to catch up
+    for _ in 0..50 {
+        if indexer.last_gid() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(indexer.last_gid() >= 3, "Indexer should have caught up");
+
+    // Query via gRPC
+    let resp = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "main".into(),
+        sql: "SELECT seq, event_type FROM records ORDER BY seq".into(),
+    }).await.unwrap().into_inner();
+
+    assert_eq!(resp.rows.len(), 3, "should return 3 rows");
+    assert!(resp.rows[0].contains("type.0"), "row 0 should contain event_type type.0");
+    assert!(resp.rows[1].contains("type.1"), "row 1 should contain event_type type.1");
+    assert!(resp.rows[2].contains("type.2"), "row 2 should contain event_type type.2");
+
+    // COUNT query
+    let count_resp = client.query(pb::QueryRequest {
+        namespace: "test".into(),
+        stream: "main".into(),
+        sql: "SELECT COUNT(*) FROM records".into(),
+    }).await.unwrap().into_inner();
+    assert!(count_resp.rows[0].contains("3"), "COUNT should return 3");
+
+    // Shutdown
+    indexer.stop();
+}

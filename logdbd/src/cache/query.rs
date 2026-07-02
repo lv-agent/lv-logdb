@@ -1,20 +1,22 @@
-//! Query execution — validates and runs read-only SQL against a stream's SQLite db.
+//! Query execution — runs read-only SQL against a stream's SQLite db.
+//!
+//! Connections are opened with `SQLITE_OPEN_READ_ONLY`, so the SQLite kernel
+//! rejects any write (INSERT, UPDATE, DELETE, DROP, etc.) at the engine level —
+//! stronger than string-based prefix checks.
 
 use std::path::Path;
 
 use rusqlite::Connection;
 
-/// Error returned by query validation or execution.
+/// Error returned by query execution.
 #[derive(Debug)]
 pub enum QueryError {
-    NotSelect,
     Sqlite(rusqlite::Error),
 }
 
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotSelect => write!(f, "only SELECT statements are allowed"),
             Self::Sqlite(e) => write!(f, "sqlite error: {}", e),
         }
     }
@@ -22,22 +24,18 @@ impl std::fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
-/// Validate that `sql` is a read-only SELECT statement.
-fn validate_sql(sql: &str) -> Result<(), QueryError> {
-    let trimmed = sql.trim();
-    let prefix = trimmed.chars().take(6).collect::<String>().to_uppercase();
-    if prefix != "SELECT" {
-        return Err(QueryError::NotSelect);
-    }
-    Ok(())
-}
-
-/// Execute a validated SELECT statement against a db file.
+/// Execute a read-only SQL statement against a db file.
 /// Returns rows as JSON strings.
+///
+/// The connection is opened read-only — any write operation is rejected by
+/// the SQLite kernel with `SQLITE_READONLY`.
 pub fn execute_query(db_path: &Path, sql: &str) -> Result<Vec<String>, QueryError> {
-    validate_sql(sql)?;
-
-    let conn = Connection::open(db_path).map_err(QueryError::Sqlite)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(QueryError::Sqlite)?;
 
     let mut stmt = conn.prepare(sql).map_err(QueryError::Sqlite)?;
 
@@ -58,7 +56,6 @@ pub fn execute_query(db_path: &Path, sql: &str) -> Result<Vec<String>, QueryErro
                         serde_json::Value::String(String::from_utf8_lossy(s).into_owned())
                     }
                     Ok(rusqlite::types::ValueRef::Blob(b)) => {
-                        // Return blob as hex string for JSON compatibility
                         serde_json::json!(blob_to_hex(b))
                     }
                     Err(_) => serde_json::Value::Null,
@@ -102,7 +99,6 @@ mod tests {
         let conn = Connection::open(&db_path).unwrap();
         create_schema(&conn).unwrap();
 
-        // Insert 5 records
         for i in 0..5u64 {
             let rec = DecodedRecord {
                 namespace_id: 1,
@@ -149,18 +145,14 @@ mod tests {
             "SELECT seq, event_type FROM records WHERE event_type = 'user.input' ORDER BY seq",
         )
         .unwrap();
-        assert_eq!(
-            rows.len(),
-            3,
-            "should find 3 user.input records (seq 1,3,5)"
-        );
+        assert_eq!(rows.len(), 3);
 
         let rows = execute_query(
             &db_path,
             "SELECT seq FROM records WHERE event_type = 'tool.call' ORDER BY seq",
         )
         .unwrap();
-        assert_eq!(rows.len(), 2, "should find 2 tool.call records (seq 2,4)");
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]
@@ -176,7 +168,7 @@ mod tests {
             "SELECT COUNT(*) FROM records WHERE event_type = 'tool.call'",
         )
         .unwrap();
-        assert!(rows[0].contains("2"), "filtered COUNT should be 2");
+        assert!(rows[0].contains("2"));
     }
 
     #[test]
@@ -189,7 +181,7 @@ mod tests {
             "SELECT seq FROM records WHERE json_extract(metadata_json, '$.turn_id') = 'turn-0' ORDER BY seq",
         )
         .unwrap();
-        assert_eq!(rows.len(), 2, "turn-0 should match 2 records (seq 1,2)");
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]
@@ -197,7 +189,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = setup_test_db(dir.path());
 
-        let rows = execute_query(&db_path, "SELECT seq FROM records ORDER BY seq LIMIT 2").unwrap();
+        let rows =
+            execute_query(&db_path, "SELECT seq FROM records ORDER BY seq LIMIT 2").unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -215,50 +208,74 @@ mod tests {
     }
 
     #[test]
-    fn reject_insert() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = setup_test_db(dir.path());
-
-        let err = execute_query(&db_path, "INSERT INTO records (seq) VALUES (99)").unwrap_err();
-        assert!(matches!(err, QueryError::NotSelect));
-    }
-
-    #[test]
-    fn reject_delete() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = setup_test_db(dir.path());
-
-        let err = execute_query(&db_path, "DELETE FROM records WHERE seq = 1").unwrap_err();
-        assert!(matches!(err, QueryError::NotSelect));
-    }
-
-    #[test]
-    fn reject_update() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = setup_test_db(dir.path());
-
-        let err =
-            execute_query(&db_path, "UPDATE records SET deleted = 1 WHERE seq = 1").unwrap_err();
-        assert!(matches!(err, QueryError::NotSelect));
-    }
-
-    #[test]
-    fn reject_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = setup_test_db(dir.path());
-
-        let err = execute_query(&db_path, "DROP TABLE records").unwrap_err();
-        assert!(matches!(err, QueryError::NotSelect));
-    }
-
-    #[test]
     fn select_with_leading_whitespace() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = setup_test_db(dir.path());
 
         let rows =
             execute_query(&db_path, "   SELECT seq FROM records ORDER BY seq LIMIT 1").unwrap();
-        assert_eq!(rows.len(), 1, "leading whitespace should be allowed");
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn read_only_rejects_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = setup_test_db(dir.path());
+
+        let err = execute_query(&db_path, "INSERT INTO records (seq) VALUES (99)").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("readonly") || msg.contains("READONLY"),
+            "INSERT must be rejected by read-only mode, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn read_only_rejects_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = setup_test_db(dir.path());
+
+        let err =
+            execute_query(&db_path, "DELETE FROM records WHERE seq = 1").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("readonly") || msg.contains("READONLY"),
+            "DELETE must be rejected by read-only mode, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn read_only_rejects_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = setup_test_db(dir.path());
+
+        let err = execute_query(
+            &db_path,
+            "UPDATE records SET deleted = 1 WHERE seq = 1",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("readonly") || msg.contains("READONLY"),
+            "UPDATE must be rejected by read-only mode, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn read_only_rejects_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = setup_test_db(dir.path());
+
+        let err = execute_query(&db_path, "DROP TABLE records").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("readonly") || msg.contains("READONLY"),
+            "DROP must be rejected by read-only mode, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -288,9 +305,6 @@ mod tests {
 
         let rows = execute_query(&db_path, "SELECT content FROM records WHERE seq = 1").unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0].contains("null"),
-            "NULL content should serialize as null"
-        );
+        assert!(rows[0].contains("null"), "NULL content should serialize as null");
     }
 }

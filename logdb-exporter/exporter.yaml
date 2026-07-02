@@ -1,0 +1,27 @@
+# logdb-exporter configuration
+exporter_id: "exporter-stdout"
+
+source:
+  addrs:
+    - "127.0.0.1:50051"
+  prefer_primary: true
+  tls:
+    mode: disabled            # disabled | tls | mtls
+    # ca_file: /etc/logdb-exporter/certs/ca.crt
+    # cert_file: /etc/logdb-exporter/certs/client.crt
+    # key_file: /etc/logdb-exporter/certs/client.key
+
+scope:
+  namespace: "test"
+  stream: "main"
+
+sink:
+  type: stdout
+
+progress:
+  file: /var/lib/logdb-exporter/progress.dat
+  checkpoint_interval_ms: 1000
+
+pipeline:
+  scan_batch_size: 10000
+  tail_batch_size: 1000

@@ -206,15 +206,9 @@ impl Config {
         if self.index_stride == 0 {
             return Err(ConfigError::ZeroIndexStride);
         }
-        // hash-chain needs single-shard global ordering. Feature-gated to mirror
-        // exactly the constraint open() enforced on the sealer path; without the
-        // feature, hash_enabled has no effect and is not rejected here.
-        #[cfg(feature = "hash-chain")]
-        if self.hash_enabled && self.shards > 1 {
-            return Err(ConfigError::HashChainRequiresSingleShard {
-                shards: self.shards,
-            });
-        }
+        // Per-shard hash chain: each shard independently sealed with its own
+        // hash_init and last_hash, so multi-shard hash-chain is supported.
+        // (The pre-v0.4 single-shard constraint has been removed.)
         // Note: no arena_size constraint — ContentArena has been eliminated.
         // Content lives in Slot (inline or spill), gated by the single
         // consume_watermark.  This removes the fragile ring_size * max_content_size
@@ -292,14 +286,12 @@ mod tests {
 
     #[cfg(feature = "hash-chain")]
     #[test]
-    fn rejects_hash_chain_with_multiple_shards() {
+    fn allows_hash_chain_with_multiple_shards() {
+        // Per-shard hash chain: multi-shard is now supported.
         let mut c = Config::default();
         c.hash_enabled = true;
-        c.shards = 2;
-        assert!(matches!(
-            c.validate(),
-            Err(ConfigError::HashChainRequiresSingleShard { shards: 2 })
-        ));
+        c.shards = 4;
+        assert!(c.validate().is_ok());
     }
 
     #[cfg(feature = "hash-chain")]

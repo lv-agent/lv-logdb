@@ -131,7 +131,7 @@ struct LogDbInner {
     shutdown: Arc<ShutdownState>,
     committer_handle: Option<std::thread::JoinHandle<()>>,
     #[cfg(feature = "hash-chain")]
-    sealer_handle: Option<std::thread::JoinHandle<()>>,
+    sealer_handles: Vec<std::thread::JoinHandle<()>>,
     data_dir: std::path::PathBuf,
     /// WAL checkpoint: records with sequence < this are safe to truncate.
     checkpoint_sequence: Arc<AtomicU64>,
@@ -181,9 +181,9 @@ impl LogDb {
         // shard_bits=0 (identity encoding, stride 1). shards>1: data_dir/s<shard>/.
         let mut seg_mgrs: Vec<SegmentManager> = Vec::with_capacity(num_shards);
         let mut initial_seqs: Vec<u64> = Vec::with_capacity(num_shards);
-        let mut hash_init = [0u8; 32];
-        let mut last_hash = [0u8; 32];
-        let mut hash_init_known = false;
+        // Per-shard hash chain state (one entry per shard).
+        let mut shard_hash_inits: Vec<[u8; 32]> = Vec::with_capacity(num_shards);
+        let mut shard_last_hashes: Vec<[u8; 32]> = Vec::with_capacity(num_shards);
 
         for s in 0..num_shards {
             let sdir = if num_shards == 1 {
@@ -209,34 +209,26 @@ impl LogDb {
                 } else {
                     shard::decode_record_id(st.last_sequence, shard_bits).1 + 1
                 };
-                if !hash_init_known {
-                    hash_init = st.hash_init;
-                    last_hash = st.last_hash;
-                    hash_init_known = true;
-                }
+                shard_hash_inits.push(st.hash_init);
+                shard_last_hashes.push(st.last_hash);
                 seg_mgrs.push(st.segment_manager);
                 initial_seqs.push(initial_local);
             } else {
-                // Fresh shard. base_sequence stays 0 (the reader's `find`/
-                // `segments_from` rely on `base <= first_id`, which holds for 0
-                // across all shards). The first record's GLOBAL id carries the
-                // shard id in its low bits, so recovery re-seeds its stride chain
-                // from that first record rather than from base_sequence.
-                if !hash_init_known {
-                    #[cfg(feature = "hash-chain")]
-                    {
-                        hash_init = derived_chain_key.unwrap_or_else(generate_hash_init);
-                    }
-                    #[cfg(not(feature = "hash-chain"))]
-                    {
-                        hash_init = generate_hash_init();
-                    }
-                    hash_init_known = true;
-                }
+                // Fresh shard.
+                #[cfg(feature = "hash-chain")]
+                let hi = {
+                    derived_chain_key.unwrap_or_else(generate_hash_init)
+                };
+                #[cfg(not(feature = "hash-chain"))]
+                let hi = generate_hash_init();
+
+                shard_hash_inits.push(hi);
+                shard_last_hashes.push([0u8; 32]);
+
                 // Header stores the chain key only without an encryption key;
                 // with one, store zeros (the real key is derived, never stored).
                 let header_hash_init = if header_stores_chain_key {
-                    hash_init
+                    hi
                 } else {
                     [0u8; 32]
                 };
@@ -255,13 +247,6 @@ impl LogDb {
                 initial_seqs.push(0);
             }
         }
-
-        // initial_seq (shard 0's resume point) is consumed by the Sealer for
-        // shards=1; read inline from initial_seqs there to avoid a dead binding
-        // when the hash-chain feature is disabled. Likewise `last_hash` is only
-        // read by the Sealer, so silence its unused assignment without the feature.
-        #[cfg(not(feature = "hash-chain"))]
-        let _ = last_hash;
 
         // Apply the configured sparse-index stride before the Committer starts
         // appending (active index is still empty here). Also tag each manager
@@ -316,33 +301,38 @@ impl LogDb {
             })
             .map_err(OpenError::ThreadSpawn)?;
 
-        // Spawn Sealer (only when hash-chain is enabled). A global hash chain
-        // needs single-shard ordering, so validate() rejects hash_enabled with
-        // shards > 1 (ConfigError::HashChainRequiresSingleShard); by this point
-        // shards == 1 is guaranteed on this path. Multi-shard hashing remains
-        // deferred.
+        // Spawn one Sealer per shard (only when hash-chain is enabled).
+        // Each shard has its own independent hash chain with its own
+        // hash_init and last_hash, recovered from on-disk state or generated
+        // fresh above. Multi-shard hashing is fully supported.
         #[cfg(feature = "hash-chain")]
-        let sealer_handle = if hash_enabled {
-            let sealer_ring = Arc::clone(shards.ring(0));
-            let sealer_shutdown = Arc::clone(&shutdown);
-            Some(
-                std::thread::Builder::new()
-                    .name("logdb-sealer".into())
-                    .spawn(move || {
-                        pipeline::sealer::run_sealer(
-                            sealer_ring,
-                            hash_init,
-                            last_hash,
-                            initial_seqs[0],
-                            sealer_shutdown,
-                            wait,
-                        );
-                    })
-                    .map_err(OpenError::ThreadSpawn)?,
-            )
-        } else {
-            None
-        };
+        let mut sealer_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        #[cfg(feature = "hash-chain")]
+        if hash_enabled {
+            for s in 0..num_shards {
+                let sealer_ring = Arc::clone(shards.ring(s));
+                let sealer_shutdown = Arc::clone(&shutdown);
+                let hi = shard_hash_inits[s];
+                let lh = shard_last_hashes[s];
+                let iseq = initial_seqs[s];
+                let name = format!("logdb-sealer-{}", s);
+                sealer_handles.push(
+                    std::thread::Builder::new()
+                        .name(name)
+                        .spawn(move || {
+                            pipeline::sealer::run_sealer(
+                                sealer_ring,
+                                hi,
+                                lh,
+                                iseq,
+                                sealer_shutdown,
+                                wait,
+                            );
+                        })
+                        .map_err(OpenError::ThreadSpawn)?,
+                );
+            }
+        }
 
         let manifests: Vec<Arc<Mutex<reader::SegmentManifest>>> = (0..num_shards)
             .map(|s| {
@@ -365,7 +355,7 @@ impl LogDb {
                 shutdown,
                 committer_handle: Some(committer_handle),
                 #[cfg(feature = "hash-chain")]
-                sealer_handle,
+                sealer_handles,
                 data_dir,
                 checkpoint_sequence: checkpoint,
                 manifests,
@@ -937,7 +927,7 @@ impl LogDb {
             let _ = h.join();
         }
         #[cfg(feature = "hash-chain")]
-        if let Some(h) = inner.sealer_handle.take() {
+        for h in inner.sealer_handles.drain(..) {
             let _ = h.join();
         }
 

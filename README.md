@@ -1,45 +1,66 @@
 # lv-logdb
 
-A cargo workspace containing the **logdb** embedded log database and the
-**logdbd** clustered gRPC service built on top of it.
+A cargo workspace for building tamper-proof, append-only audit log infrastructure.
 
 ## Crates
 
 | Crate | Path | What it is |
 |-------|------|------------|
-| [`logdb`](logdb/README.md) | `logdb/` | Embedded, append-only, crash-recoverable, optionally tamper-proof / compressed / encrypted local log database (library). |
-| [`logdbd`](logdbd/README.md) | `logdbd/` | Clustered log service: a gRPC daemon (tonic) wrapping logdb with Append/Read/Scan/Tail/Status RPCs, primary-standby replication, TLS, and auth. |
+| [`logdb`](logdb/README.md) | `logdb/` | Embedded append-only log database (library). BLAKE3 hash chain, AES-256-GCM, zstd. |
+| [`logdbd`](logdbd/README.md) | `logdbd/` | Clustered gRPC log service. Namespace/stream, per-stream hash chain, primary-standby replication, TLS+auth, consumer groups. |
+| [`logdb-exporter`](logdb-exporter/README.md) | `logdb-exporter/` | CDC exporter: Scan + Tail → ClickHouse / stdout. |
+| [`logdb-client`](logdb-client/) | `logdb-client/` | Rust SDK: ergonomic async client for logdbd. |
 
-## Quick start
+## Quick Start
 
 ```bash
-# Build the whole workspace.
+# Build everything
 cargo build
 
-# Test the library (all features) and the daemon.
-cargo test -p logdb --all-features
-cargo test -p logdbd
+# Test the workspace
+cargo test --workspace
+
+# Start logdbd
+cargo run --release -p logdbd -- --config logdbd/logdbd.yaml
 ```
 
-See each crate's README for usage, configuration, and feature flags.
+```rust
+// Use the SDK
+use logdb_client::Client;
+
+let mut client = Client::connect("127.0.0.1:50051").await?;
+let seq = client.append("my-app", "main", "test.event", b"hello").await?;
+let rec = client.read("my-app", "main", seq).await?;
+```
+
+## Documentation
+
+| Document | Language |
+|----------|----------|
+| [Getting Started](logdbd/docs/zh/usage/getting-started.md) | 中文 |
+| [Configuration Reference](logdbd/docs/zh/usage/configuration.md) | 中文 |
+| [Development Guide](logdbd/docs/zh/dev/building.md) | 中文 |
+| [Failover Runbook](deploy/failover-runbook.md) | English |
+| [Design Spec](veps/logdbd-cluster-design.md) | 中文 |
 
 ## Layout
 
 ```
 lv-logdb/
-├── Cargo.toml          # this workspace manifest
-├── logdb/              # the library crate
-└── logdbd/             # the gRPC service crate
+├── Cargo.toml              # workspace manifest
+├── logdb/                  # embedded library (crates.io)
+├── logdbd/                 # gRPC service + admin CLI
+├── logdb-exporter/         # CDC exporter
+├── logdb-client/           # Rust SDK
+├── deploy/                 # systemd, alerts, runbook
+├── docs/                   # upgrade guide
+└── veps/                   # design documents
 ```
 
 ## License
 
-Apache-2.0. Dependency licenses are vetted with `cargo-deny`
-([`deny.toml`](deny.toml)); the library's attributions are in
-[`logdb/THIRDPARTY.md`](logdb/THIRDPARTY.md).
+Apache-2.0. See [`deny.toml`](deny.toml) for dependency license policy.
 
 ## Security
 
-Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md). For the
-encryption/hash-chain threat model and key management, see
-[`logdb/docs/en/security/`](logdb/docs/en/security/).
+Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md).

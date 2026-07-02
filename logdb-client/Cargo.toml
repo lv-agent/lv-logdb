@@ -1,0 +1,19 @@
+[package]
+name = "logdb-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Rust client SDK for logdbd — the append-only audit log database"
+license = "Apache-2.0"
+
+[dependencies]
+logdbd = { path = "../logdbd" }
+tonic = { version = "0.12", features = ["tls"] }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
+tokio-stream = "0.1"
+tempfile = "3"
+logdb = { path = "../logdb" }
+logdbd = { path = "../logdbd" }

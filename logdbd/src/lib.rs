@@ -2,5 +2,12 @@ pub mod pb {
     tonic::include_proto!("logdbd");
 }
 pub mod auth;
+pub mod catalog;
+pub mod config;
+pub mod consumer;
+pub mod node;
+pub mod record;
 pub mod replication;
 pub mod service;
+pub mod snapshot;
+pub mod storage;

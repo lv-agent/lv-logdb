@@ -1,0 +1,104 @@
+# Prometheus alert rules for logdbd.
+# Load via: promtool check rules alerts.yml
+
+groups:
+  - name: logdbd
+    rules:
+      # ── Data durability ─────────────────────────────────────────────────
+
+      - alert: LogdbHighDurableLag
+        expr: logdb_durable_lag > 10000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "logdb durable lag is high"
+          description: "logdb has {{ $value }} records appended but not yet fsynced. Check disk I/O health."
+
+      - alert: LogdbCriticalDurableLag
+        expr: logdb_durable_lag > 100000
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "logdb durable lag is critical"
+          description: "logdb has {{ $value }} uncommitted records. Disk may be full or Committer stuck."
+
+      # ── Replication ──────────────────────────────────────────────────────
+
+      - alert: LogdbdReplicationLag
+        expr: logdbd_replication_lag_records > 10000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Standby {{ $labels.standby_id }} is {{ $value }} records behind"
+          description: "Replication lag is growing. Check standby connectivity and health."
+
+      - alert: LogdbdReplicationConflict
+        expr: logdbd_replication_conflicts_total > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Replication CONFLICT on standby {{ $labels.standby_id }}"
+          description: "Standby detected hash mismatch. Replication paused. Manual intervention required. See failover runbook §D.1."
+
+      - alert: LogdbdReplicationDisconnected
+        expr: logdbd_replication_state == 4
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Standby {{ $labels.standby_id }} disconnected"
+          description: "Standby has been unreachable for >1 minute. Check network."
+
+      # ── Disk / resource ──────────────────────────────────────────────────
+
+      - alert: LogdbdDiskSpaceLow
+        expr: logdb_wal_bytes / logdb_wal_bytes_total > 0.85
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WAL disk usage >85%"
+          description: "logdb WAL is {{ $value | humanizePercentage }} full. Consider increasing retention or adding disk."
+
+      - alert: LogdbdDiskFull
+        expr: logdbd_health_code > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "logdbd is unhealthy (health_code={{ $value }})"
+          description: "Check disk space and I/O. Append may be blocked."
+
+      # ── Process ──────────────────────────────────────────────────────────
+
+      - alert: LogdbdDown
+        expr: up{job="logdbd"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "logdbd instance {{ $labels.instance }} is down"
+          description: "Process is not responding on health endpoint."
+
+      # ── Exporter ─────────────────────────────────────────────────────────
+
+      - alert: LogdbExporterLag
+        expr: logdbd_exporter_lag_records > 50000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Exporter {{ $labels.exporter_id }} is {{ $value }} records behind"
+          description: "Exporter may be unable to keep up or is disconnected."
+
+      - alert: LogdbExporterStale
+        expr: time() - logdbd_exporter_last_reported_seq > 300
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Exporter {{ $labels.exporter_id }} has not reported progress for 5 minutes"
+          description: "Exporter may be down or disconnected."

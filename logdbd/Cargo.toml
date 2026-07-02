@@ -7,13 +7,16 @@ description = "Clustered log service built on logdb"
 license = "Apache-2.0"
 
 [dependencies]
-logdb = { path = "../logdb", features = ["compression", "encryption", "metrics", "tracing"] }
+logdb = { path = "../logdb", features = ["compression", "encryption", "hash-chain", "metrics", "tracing"] }
 tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic-health = "0.12"
 serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+fs2 = "0.4"
+crc32c = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.23"

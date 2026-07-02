@@ -1,44 +1,39 @@
 //! Primary-standby replication via gRPC.
 //!
-//! Primary: spawns a background task that reads durable records from logdb
-//! and pushes them to standby nodes via ReplicationService::Sync RPC.
+//! # Primary
 //!
-//! Standby: implements ReplicationService, receives records from primary
-//! and writes them to local logdb at the PRIMARY's exact sequence using
-//! [`LogDb::replicate`](logdb::LogDb::replicate), preserving the global
-//! offset space so consumers can fail over primary → standby.
+//! Reads durable records from Storage and pushes to all configured standbys.
+//! In `sync` mode the push loop waits for standby acks; in `async` mode it
+//! fires-and-forgets. Caches gRPC clients and reconnects on failure.
 //!
-//! ## Consistency
+//! # Standby
 //!
-//! The primary advances its push cursor only once *every* configured standby
-//! has acknowledged a batch. A transient standby failure therefore stalls
-//! replication (no data loss) until the standby recovers; `replicate` is
-//! idempotent, so replayed batches are safe.
+//! Validates `cluster_id` and `epoch` on every request, preventing cross-cluster
+//! or stale-primary corruption. Writes records at the primary's exact gid,
+//! decodes headers to rebuild the Storage seq→gid mapping.
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+
+use crate::config::{OnSyncTimeout, ReplicationConfig, SyncPolicy};
+use crate::pb;
+use crate::pb::replication_service_server::ReplicationService;
+use crate::storage::Storage;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
 
-use crate::pb;
-use crate::pb::replication_service_server::ReplicationService;
-use logdb::LogDb;
+// ── Standby handler ───────────────────────────────────────────────────────────
 
 pub struct ReplicationServiceImpl {
-    db: Arc<LogDb>,
-    /// Serializes concurrent Sync RPCs so replicate() sees a single writer.
-    /// Required: replicate() advances producer_cursor under an in-order
-    /// assumption that would be violated by interleaved batches.
-    replicate_lock: Arc<Mutex<()>>,
+    storage: Arc<Storage>,
+    cluster_id: String,
+    epoch: u64,
+    lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ReplicationServiceImpl {
-    pub fn new(db: Arc<LogDb>) -> Self {
-        Self {
-            db,
-            replicate_lock: Arc::new(Mutex::new(())),
-        }
+    pub fn new(storage: Arc<Storage>, cluster_id: String, epoch: u64) -> Self {
+        Self { storage, cluster_id, epoch, lock: Arc::new(tokio::sync::Mutex::new(())) }
     }
 }
 
@@ -48,162 +43,210 @@ impl ReplicationService for ReplicationServiceImpl {
         &self,
         req: Request<pb::ReplicationRequest>,
     ) -> Result<Response<pb::ReplicationResponse>, Status> {
-        let records = &req.get_ref().records;
-        if records.is_empty() {
-            return Ok(Response::new(pb::ReplicationResponse { last_sequence: 0 }));
+        let r = req.get_ref();
+
+        // Validate cluster_id and epoch (C3 fix)
+        if !r.cluster_id.is_empty() && r.cluster_id != self.cluster_id {
+            return Err(Status::failed_precondition(format!(
+                "WRONG_CLUSTER: got '{}', expected '{}'",
+                r.cluster_id, self.cluster_id
+            )));
+        }
+        if r.epoch > 0 && r.epoch < self.epoch {
+            return Err(Status::failed_precondition(format!(
+                "STALE_EPOCH: got {}, local {}",
+                r.epoch, self.epoch
+            )));
         }
 
-        // Serialize: only one batch applies records at a time.
-        let _lock = self.replicate_lock.lock().await;
-
-        let mut last_seq: u64 = 0;
-        for rec in records {
-            self.db
-                .replicate(rec.sequence, rec.timestamp_ns, &rec.content)
-                .map_err(|e| {
-                    Status::internal(format!("replicate seq={} failed: {:?}", rec.sequence, e))
-                })?;
-            last_seq = rec.sequence;
+        if r.records.is_empty() {
+            return Ok(Response::new(pb::ReplicationResponse { last_gid: 0 }));
         }
-        Ok(Response::new(pb::ReplicationResponse {
-            last_sequence: last_seq,
-        }))
+
+        let _guard = self.lock.lock().await;
+
+        let mut last_gid: u64 = 0;
+        for rec in &r.records {
+            self.storage.replicate(rec.gid, rec.timestamp_ns, &rec.content)
+                .map_err(|e| Status::internal(format!("replicate gid={}: {}", rec.gid, e)))?;
+            last_gid = rec.gid;
+        }
+
+        Ok(Response::new(pb::ReplicationResponse { last_gid }))
     }
 }
 
-/// Run primary-side replication: periodically push durable records to standbys.
-///
-/// The push cursor advances only when ALL standbys acknowledge a batch,
-/// guaranteeing no record is skipped on any standby. On failure, the same
-/// batch is retried next cycle (idempotent on the standby).
-///
-/// `auth_token` is sent as `authorization: Bearer <token>` so an authenticated
-/// standby accepts the Sync RPC. `tls_ca` (PEM) enables TLS to standbys,
-/// trusting that CA (P0-3).
+// ── Primary push loop ─────────────────────────────────────────────────────────
+
+/// Push durable records to all standbys. Respects sync/async mode,
+/// sync_policy, and sync_timeout from config (C1 fix).
 pub async fn run_primary_sync(
-    db: Arc<LogDb>,
-    standby_addrs: Vec<String>,
-    auth_token: Option<String>,
-    tls_ca: Option<Vec<u8>>,
+    storage: Arc<Storage>,
+    repl_config: ReplicationConfig,
+    cluster_id: String,
+    epoch: u64,
 ) {
-    if standby_addrs.is_empty() {
-        return;
+    let mut clients: Vec<(
+        String,
+        pb::replication_service_client::ReplicationServiceClient<Channel>,
+        Option<String>,
+    )> = Vec::new();
+    for s in &repl_config.standbys {
+        let tls_ca = s.tls.ca_file.as_ref().and_then(|p| std::fs::read(p).ok());
+        let token = s.auth_token_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        match connect_standby(&s.addr, tls_ca.as_deref()).await {
+            Some(channel) => {
+                clients.push((s.addr.clone(), pb::replication_service_client::ReplicationServiceClient::new(channel), token));
+            }
+            None => {
+                tracing::warn!(addr = %s.addr, "initial standby connection failed");
+            }
+        }
     }
 
-    // Pre-build the per-cycle auth header value once.
-    let bearer = auth_token.as_ref().map(|t| format!("Bearer {}", t));
+    let mut push_seq: u64 = 0;
+    let mut reconnect_backoff = Duration::from_millis(500);
+    let sync_required = repl_config.mode == crate::config::ReplicationMode::Sync;
 
-    // Build a persistent, reusable channel to each standby ONCE. tonic's Channel
-    // multiplexes over a single HTTP/2 connection and auto-reconnects on
-    // transient failure, so we avoid a fresh TCP+TLS handshake every 100ms.
-    // `None` means the channel could not even be built (misconfigured address)
-    // — that target is treated as perpetually failing so push_seq never advances
-    // past it (no silent data loss for a misconfigured standby).
-    let channels: Vec<Option<Channel>> = standby_addrs
-        .iter()
-        .map(|addr| build_channel(addr, tls_ca.as_deref()))
-        .collect();
-
-    let mut push_seq = db.durable_cursor();
     loop {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let durable = db.durable_cursor();
+        let durable = storage.durable_gid();
         if durable <= push_seq {
             continue;
         }
 
-        // Collect durable records not yet pushed.
-        let iter = match db.scan(push_seq, durable) {
-            Ok(i) => i,
-            Err(_) => continue,
+        let records = match read_durable_batch(&storage, push_seq, durable) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "replication read error");
+                continue;
+            }
         };
-        let records: Vec<pb::Record> = iter
-            .filter_map(|r| r.ok())
-            .map(|r| pb::Record {
-                sequence: r.id.sequence,
-                timestamp_ns: r.timestamp_ns,
-                content: r.content,
-            })
-            .collect();
         if records.is_empty() {
             continue;
         }
 
-        // Push to ALL standbys IN PARALLEL so one slow/unreachable standby
-        // cannot stall replication to the others. Advance push_seq only when
-        // every target acknowledged.
-        let mut set = tokio::task::JoinSet::new();
-        let mut all_ok = true;
-        for ch in &channels {
-            match ch {
-                Some(channel) => {
-                    let channel = channel.clone();
-                    let records = records.clone();
-                    let bearer = bearer.clone();
-                    set.spawn(async move {
-                        push_via_channel(channel, &records, bearer.as_deref()).await
-                    });
+        let req = pb::ReplicationRequest {
+            cluster_id: cluster_id.clone(),
+            epoch,
+            records: records.clone(),
+        };
+
+        let sync_timeout = Duration::from_millis(repl_config.sync_timeout_ms);
+
+        // Push to each standby
+        let mut acked_count: usize = 0;
+        let mut last_acked: u64 = push_seq;
+        let total = clients.len();
+        if total == 0 {
+            let last = records.last().unwrap().gid;
+            push_seq = last;
+            storage.advance_replicated(last);
+            continue;
+        }
+
+        for (addr, client, token) in &mut clients {
+            let mut grpc_req = tonic::Request::new(req.clone());
+            if let Some(t) = token {
+                if let Ok(val) = tonic::metadata::MetadataValue::try_from(format!("Bearer {}", t)) {
+                    grpc_req.metadata_mut().insert("authorization", val);
                 }
-                None => all_ok = false, // misconfigured target → block
             }
-        }
-        while let Some(res) = set.join_next().await {
-            if !res.unwrap_or(false) {
-                all_ok = false;
+            let result = if sync_required {
+                tokio::time::timeout(sync_timeout, client.sync(grpc_req)).await
+            } else {
+                Ok(client.sync(grpc_req).await)
+            };
+
+            match result {
+                Ok(Ok(resp)) => {
+                    last_acked = last_acked.max(resp.into_inner().last_gid);
+                    acked_count += 1;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(addr = %addr, error = %e, "push failed, reconnecting");
+                    if let Some(ch) = connect_standby(addr, repl_config.standbys.iter()
+                        .find(|s| &s.addr == addr)
+                        .and_then(|s| s.tls.ca_file.as_ref())
+                        .and_then(|p| std::fs::read(p).ok()).as_deref()
+                    ).await {
+                        *client = pb::replication_service_client::ReplicationServiceClient::new(ch);
+                        // keep the existing token
+                    }
+                }
+                Err(_timeout) => {
+                    tracing::warn!(addr = %addr, timeout_ms = repl_config.sync_timeout_ms, "sync push timed out");
+                }
             }
         }
 
-        if all_ok {
-            let advanced_to = records.last().unwrap().sequence + 1;
-            tracing::debug!(
-                from = push_seq,
-                to = advanced_to,
-                records = records.len(),
-                "replicated to all standbys"
-            );
-            push_seq = advanced_to;
-        } else {
-            tracing::warn!(
-                from = push_seq,
-                records = records.len(),
-                "replication: not all standbys acknowledged, will retry"
-            );
+        // Decide whether to advance push_seq based on sync_policy
+        let required = match repl_config.sync_policy {
+            SyncPolicy::All => total,
+            SyncPolicy::Quorum => total / 2 + 1,
+            SyncPolicy::N => (repl_config.required_acks as usize).min(total),
+        };
+
+        if !sync_required || acked_count >= required {
+            if last_acked > push_seq {
+                push_seq = last_acked;
+                storage.advance_replicated(push_seq);
+            }
+            reconnect_backoff = Duration::from_millis(500);
+        } else if repl_config.on_sync_timeout == OnSyncTimeout::Fail {
+            // Don't advance push_seq; records will be retried
+            tokio::time::sleep(reconnect_backoff).await;
+            reconnect_backoff = (reconnect_backoff * 2).min(Duration::from_secs(30));
+        } else if repl_config.on_sync_timeout == OnSyncTimeout::AsyncWarn {
+            tracing::warn!(acked = acked_count, required, "sync degraded: advancing despite insufficient acks");
+            if last_acked > push_seq {
+                push_seq = last_acked;
+                storage.advance_replicated(push_seq);
+            }
         }
-        // else: retry the same batch next cycle.
+        // Block case: loop continues, retrying same batch
     }
 }
 
-/// Build a persistent channel to a standby. Uses `connect_lazy` so startup
-/// doesn't block on a standby that's temporarily down; the first RPC triggers
-/// the connection and tonic reconnects automatically on later failure.
-fn build_channel(addr: &str, tls_ca: Option<&[u8]>) -> Option<Channel> {
-    let scheme = if tls_ca.is_some() { "https" } else { "http" };
-    let endpoint = Endpoint::from_shared(format!("{}://{}", scheme, addr)).ok()?;
-    let endpoint = match tls_ca {
-        Some(ca) => {
-            // domain_name = host portion of the address (before the port).
-            let domain = addr.split(':').next().unwrap_or("localhost").to_string();
-            let tls = ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(ca))
-                .domain_name(domain);
-            endpoint.tls_config(tls).ok()?
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+async fn connect_standby(addr: &str, tls_ca: Option<&[u8]>) -> Option<Channel> {
+    if let Some(ca) = tls_ca {
+        let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca.to_vec()));
+        let uri: tonic::transport::Uri = match format!("https://{}", addr).parse() {
+            Ok(u) => u,
+            Err(e) => { tracing::warn!(addr = %addr, error = %e, "invalid URI"); return None; }
+        };
+        match Endpoint::from(uri).tls_config(tls) {
+            Ok(ep) => Some(ep.connect_lazy()),
+            Err(e) => { tracing::warn!(addr = %addr, error = %e, "TLS config"); None }
         }
-        None => endpoint,
-    };
-    Some(endpoint.connect_lazy())
+    } else {
+        let uri: tonic::transport::Uri = match format!("http://{}", addr).parse() {
+            Ok(u) => u,
+            Err(_) => return None,
+        };
+        Some(Channel::builder(uri).connect_lazy())
+    }
 }
 
-/// Push a batch over an existing (reused) channel. Returns true on success.
-async fn push_via_channel(channel: Channel, records: &[pb::Record], bearer: Option<&str>) -> bool {
-    let mut client = pb::replication_service_client::ReplicationServiceClient::new(channel);
-    let mut req = Request::new(pb::ReplicationRequest {
-        records: records.to_vec(),
-    });
-    if let Some(b) = bearer {
-        if let Ok(v) = b.parse() {
-            req.metadata_mut().insert("authorization", v);
-        }
+fn read_durable_batch(
+    storage: &Storage,
+    from_gid: u64,
+    to_gid: u64,
+) -> Result<Vec<pb::ReplicationRecord>, String> {
+    let iter = storage.db_arc().scan(from_gid, to_gid)
+        .map_err(|e| format!("scan: {:?}", e))?;
+    let mut records = Vec::new();
+    for r in iter {
+        let rec = r.map_err(|e| format!("scan iter: {:?}", e))?;
+        records.push(pb::ReplicationRecord {
+            gid: rec.id.sequence,
+            timestamp_ns: rec.timestamp_ns,
+            content: rec.content,
+        });
     }
-    client.sync(req).await.is_ok()
+    Ok(records)
 }

@@ -3,86 +3,72 @@
 //! A node runs as either `primary` (accepts writes, replicates to standbys)
 //! or `standby` (read-only locally, receives records from the primary).
 //!
-//! # Environment
+//! # Configuration
 //!
-//! - `LOGDBD_LISTEN`        — bind address (default `127.0.0.1:50051`).
-//!                            Binding a non-loopback address without TLS+auth
-//!                            is refused unless `LOGDBD_ALLOW_INSECURE=1`.
-//! - `LOGDBD_DATA_DIR`      — logdb data directory (default `/var/lib/logdbd`)
-//! - `LOGDBD_ROLE`          — `primary` | `standby` (default `primary`)
-//! - `LOGDBD_STANDBYS`      — comma-separated standby addresses for the primary
-//!                            to replicate to (primary-only)
-//! - `LOGDBD_AUTH_TOKEN`    — if set, every RPC must carry
-//!                            `authorization: Bearer <token>` (P0-3)
-//! - `LOGDBD_TLS_CERT` / `LOGDBD_TLS_KEY` — PEM paths; if both set, TLS is
-//!                            enabled on the server (P0-3)
-//! - `LOGDBD_TLS_CA`        — PEM CA the primary trusts for standby TLS (P0-3)
-//! - `LOGDBD_MAX_MSG_SIZE`  — max inbound RPC body size in bytes (default 4 MiB)
-//! - `LOGDBD_METRICS_LISTEN` — Prometheus /metrics HTTP endpoint (default
-//!                            `127.0.0.1:9100`; empty disables)
-//! - `HOSTNAME`             — node identity reported via `Status`
+//! ```bash
+//! logdbd --config /etc/logdbd/logdbd.yaml
+//! ```
+//!
+//! Environment variables in the YAML file (`${VAR}`) are substituted at load
+//! time. Additionally, specific `LOGDBD_*` env vars can override YAML values
+//! for container-friendly deployment.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use logdb::Config;
 use logdb::LogDb;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tonic::transport::Server;
 use tonic::transport::{Identity, ServerTlsConfig};
 
 use logdbd::auth::AuthInterceptor;
+use logdbd::catalog::Catalog;
+use logdbd::config::Config;
+use logdbd::consumer::ConsumerTracker;
+use logdbd::node::{NodeIdentity, ProcessLock};
 use logdbd::pb::log_db_service_server::LogDbServiceServer;
 use logdbd::pb::replication_service_server::ReplicationServiceServer;
+use logdbd::pb::snapshot_service_server::SnapshotServiceServer;
 use logdbd::replication::{ReplicationServiceImpl, run_primary_sync};
 use logdbd::service::LogDbServiceImpl;
+use logdbd::snapshot::SnapshotServiceImpl;
+use logdbd::storage::Storage;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Structured logging. Level via RUST_LOG (default info); e.g.
-    // RUST_LOG=logdbd=debug,logdb=info to see per-RPC detail.
+    // Parse CLI: only flag is --config <path>
+    let config_path = parse_args()?;
+
+    // Load and validate configuration
+    let config = Config::load(&config_path)?;
+
+    // Node identity
+    let node = NodeIdentity::from_config(&config.node);
+
+    // Structured logging
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new(config.observability.log_level.as_str())
+                }),
         )
         .with_target(true)
         .try_init();
 
-    let listen: std::net::SocketAddr = std::env::var("LOGDBD_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:50051".into())
-        .parse()?;
-    let data_dir = std::env::var("LOGDBD_DATA_DIR").unwrap_or_else(|_| "/var/lib/logdbd".into());
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into());
-    let role = std::env::var("LOGDBD_ROLE")
-        .unwrap_or_else(|_| "primary".into())
-        .trim()
-        .to_ascii_lowercase();
+    // Process lock (primary only)
+    let _lock = ProcessLock::acquire(&config.logdb.data_dir, &config.node.role)?;
 
-    let standbys: Vec<String> = std::env::var("LOGDBD_STANDBYS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let listen: SocketAddr = config.server.bind.parse()?;
 
-    // Security (P0-3).
-    let auth_token: Option<String> = std::env::var("LOGDBD_AUTH_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
-    let tls_config = load_server_tls()?;
-    let tls_ca: Option<Vec<u8>> = std::env::var("LOGDBD_TLS_CA")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .and_then(|p| std::fs::read(p).ok());
-
-    // Safety: refuse to expose an unauthenticated / plaintext service on a
-    // non-loopback interface unless explicitly overridden.
-    if !listen.ip().is_loopback() && (!tls_config.is_some() || auth_token.is_none()) {
+    // Security: refuse non-loopback without TLS+auth
+    let tls_enabled = config.server.tls.mode != logdbd::config::TlsMode::Disabled;
+    let auth_enabled = config.server.auth.token_file.is_some();
+    if !listen.ip().is_loopback() && (!tls_enabled || !auth_enabled) {
         if std::env::var("LOGDBD_ALLOW_INSECURE").as_deref() != Ok("1") {
             return Err(format!(
                 "refusing to start: non-loopback bind ({}) without TLS+auth. \
-                 Configure LOGDBD_TLS_CERT/KEY and LOGDBD_AUTH_TOKEN, or set \
+                 Configure server.tls and server.auth in the config file, or set \
                  LOGDBD_ALLOW_INSECURE=1 to override (NOT recommended for production).",
                 listen
             )
@@ -90,41 +76,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // TLS
+    let tls_config = load_server_tls(&config)?;
+
+    // Auth token — fail if token_file is configured but unreadable (P1-6 fix)
+    let auth_token: Option<String> = match config.server.auth.token_file.as_ref() {
+        Some(p) => {
+            let token = std::fs::read_to_string(p)
+                .map_err(|e| format!("cannot read auth token_file {p}: {e}"))?;
+            if token.trim().is_empty() {
+                return Err(format!("auth token_file {p} is empty").into());
+            }
+            Some(token.trim().to_string())
+        }
+        None => std::env::var("LOGDBD_AUTH_TOKEN").ok().filter(|t| !t.is_empty()),
+    };
+
+    let tls_ca: Option<Vec<u8>> = match config.server.tls.ca_file.as_ref() {
+        Some(p) => {
+            let ca = std::fs::read(p)
+                .map_err(|e| format!("cannot read TLS CA file {p}: {e}"))?;
+            Some(ca)
+        }
+        None => None,
+    };
+
+    // Data directory
+    let data_dir = config.logdb.data_dir.clone();
     std::fs::create_dir_all(&data_dir)?;
 
-    let mut db_config = Config::default();
-    db_config.data_dir = data_dir.into();
-    // Replication requires a single linear sequence space (offset-preserving).
-    db_config.shards = 1;
-    let db = Arc::new(LogDb::open(db_config).map_err(|e| format!("logdb open: {}", e))?);
+    // Build logdb config from our Config
+    let mut db_config = logdb::Config::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.shards = config.logdb.shards;
+    db_config.segment_size = config.logdb.segment_size;
+    db_config.ring_size = config.logdb.ring_size;
+    db_config.durability_mode = map_durability(config.logdb.durability_mode);
+    db_config.flush_timeout =
+        std::time::Duration::from_millis(config.logdb.flush_timeout_ms);
+    db_config.hash_enabled = config.audit.hash_chain;
+    db_config.compression_enabled = config.storage.compression.enabled;
+
+    let db = LogDb::open(db_config).map_err(|e| format!("logdb open: {}", e))?;
+    let num_shards = config.logdb.shards;
 
     tracing::info!(
         listen = %listen,
-        node = %hostname,
-        role = %role,
-        tls = tls_config.is_some(),
+        node = %node.id,
+        cluster_id = %node.cluster_id,
+        role = %config.node.role,
+        epoch = config.node.epoch,
+        tls = tls_enabled,
         auth = auth_token.is_some(),
-        standbys = if standbys.is_empty() { "none".to_string() } else { standbys.join(",") },
-        "logdbd v0.2.0 starting"
+        standbys = config.replication.standbys.len(),
+        "logdbd starting"
     );
 
-    let log_svc = LogDbServiceImpl::new(Arc::clone(&db), hostname, role.clone());
-    let repl_svc = ReplicationServiceImpl::new(Arc::clone(&db));
+    // Catalog — namespace & stream name → ID mapping
+    let catalog = Arc::new(
+        Catalog::open(&data_dir).map_err(|e| format!("catalog open: {}", e))?
+    );
+
+    // Storage — wraps logdb with record encode/decode
+    let storage = Arc::new(Storage::new(db, num_shards));
+
+    let hostname = node.id.clone();
+    let role_str = node.role.to_string();
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage),
+        Arc::clone(&catalog),
+        Arc::new(ConsumerTracker::new()),
+        hostname,
+        role_str,
+    );
+    let repl_svc = ReplicationServiceImpl::new(
+        Arc::clone(&storage),
+        config.node.cluster_id.clone(),
+        config.node.epoch,
+    );
+    let snap_svc = SnapshotServiceImpl::new(data_dir);
 
     let (mut health_reporter, health_svc) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<LogDbServiceServer<LogDbServiceImpl>>()
         .await;
 
-    // Prometheus /metrics endpoint (default loopback :9100). Set
-    // LOGDBD_METRICS_LISTEN to override; empty disables it.
-    let metrics_addr: Option<SocketAddr> = std::env::var("LOGDBD_METRICS_LISTEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "127.0.0.1:9100".into())
-        .parse()
-        .ok();
+    // Prometheus /metrics endpoint
+    let metrics_addr: Option<SocketAddr> =
+        if config.observability.metrics && !config.observability.metrics_bind.is_empty() {
+            config.observability.metrics_bind.parse().ok()
+        } else {
+            None
+        };
     if let Some(addr) = metrics_addr {
         match PrometheusBuilder::new()
             .with_http_listener(addr)
@@ -137,20 +180,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Background probe: every 5 s, refresh the gauges (durable lag / queue depth
-    // / wal bytes) and flip the gRPC health status to match LogDb's actual
-    // state (disk-full / IO-error → NOT_SERVING, else SERVING). Self-heals:
-    // logdb clears the error once the fs recovers.
+    // Background probe: refresh gauges every 5s
     {
-        let db = Arc::clone(&db);
+        let probe_db = storage.db_arc();
         let mut hr = health_reporter.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
-            tick.tick().await; // first tick is immediate
+            tick.tick().await;
             loop {
                 tick.tick().await;
-                db.record_gauges();
-                if db.health_code().is_some() {
+                probe_db.record_gauges();
+                if probe_db.health_code().is_some() {
                     hr.set_not_serving::<LogDbServiceServer<LogDbServiceImpl>>()
                         .await;
                 } else {
@@ -161,13 +201,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Primary: spawn background replication to standbys (with token + TLS).
-    if role == "primary" && !standbys.is_empty() {
+    // Primary: spawn replication to standbys
+    if node.is_primary() && !config.replication.standbys.is_empty() {
         tokio::spawn(run_primary_sync(
-            Arc::clone(&db),
-            standbys,
-            auth_token.clone(),
-            tls_ca.clone(),
+            Arc::clone(&storage),
+            config.replication.clone(),
+            config.node.cluster_id.clone(),
+            config.node.epoch,
         ));
     }
 
@@ -181,23 +221,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = match interceptor {
         Some(i) => builder
             .add_service(LogDbServiceServer::with_interceptor(log_svc, i.clone()))
-            .add_service(ReplicationServiceServer::with_interceptor(repl_svc, i))
+            .add_service(ReplicationServiceServer::with_interceptor(repl_svc, i.clone()))
+            .add_service(SnapshotServiceServer::with_interceptor(snap_svc, i))
             .add_service(health_svc),
         None => builder
             .add_service(LogDbServiceServer::new(log_svc))
             .add_service(ReplicationServiceServer::new(repl_svc))
+            .add_service(SnapshotServiceServer::new(snap_svc))
             .add_service(health_svc),
     };
 
-    let db_for_drain = Arc::clone(&db);
+    let db_for_drain = storage.db_arc();
     server
         .serve_with_shutdown(listen, async move {
-            // Wait for SIGINT (ctrl-c) or SIGTERM (container stop), then drain
-            // logdb: flush all in-flight records to durable storage BEFORE the
-            // gRPC server stops and the process exits. Without this, the LogDb
-            // drop would abort the Committer and lose in-flight data (P1/L4).
             shutdown_signal().await;
-            tracing::info!("shutdown signal received; draining logdb (flush in-flight to durable, up to 30s)");
+            tracing::info!(
+                "shutdown signal received; draining logdb (flush in-flight to durable, up to 30s)"
+            );
             match db_for_drain.drain(std::time::Duration::from_secs(30)) {
                 Ok(logdb::ShutdownReport::Clean) => tracing::info!(report = "clean", "drain complete"),
                 Ok(r) => tracing::warn!(report = ?r, "drain complete — some data may be only in page cache"),
@@ -209,12 +249,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Wait for a process shutdown signal (SIGINT on all platforms, SIGTERM on Unix).
+/// Parse `--config <path>` from CLI args.
+fn parse_args() -> Result<String, Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && (args[1] == "--help" || args[1] == "-h") {
+        eprintln!("Usage: {} --config <path>", args[0]);
+        eprintln!();
+        eprintln!("Environment variables in the YAML file (${{VAR}}) are substituted.");
+        eprintln!("LOGDBD_* env vars override YAML values for container deployments.");
+        std::process::exit(0);
+    }
+    if args.len() == 3 && args[1] == "--config" {
+        Ok(args[2].clone())
+    } else {
+        Err(format!("Usage: {} --config <path>", args[0]).into())
+    }
+}
+
+/// Map our DurabilityMode to logdb's.
+fn map_durability(mode: logdbd::config::DurabilityMode) -> logdb::DurabilityMode {
+    match mode {
+        logdbd::config::DurabilityMode::Sync => logdb::DurabilityMode::Sync,
+        logdbd::config::DurabilityMode::Batch => logdb::DurabilityMode::Batch,
+        logdbd::config::DurabilityMode::Async => logdb::DurabilityMode::Async,
+    }
+}
+
+/// Load server TLS from config.
+fn load_server_tls(
+    config: &Config,
+) -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
+    if config.server.tls.mode == logdbd::config::TlsMode::Disabled {
+        return Ok(None);
+    }
+    match (
+        config.server.tls.cert_file.as_ref(),
+        config.server.tls.key_file.as_ref(),
+    ) {
+        (Some(c), Some(k)) => {
+            let cert = std::fs::read(c)?;
+            let key = std::fs::read(k)?;
+            let identity = Identity::from_pem(cert, key);
+            Ok(Some(ServerTlsConfig::new().identity(identity)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Wait for SIGINT / SIGTERM.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = sigterm.recv() => {}
@@ -223,24 +311,5 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await.ok();
-    }
-}
-
-/// Load server TLS config from `LOGDBD_TLS_CERT` / `LOGDBD_TLS_KEY` if both set.
-fn load_server_tls() -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
-    let cert_path = std::env::var("LOGDBD_TLS_CERT")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let key_path = std::env::var("LOGDBD_TLS_KEY")
-        .ok()
-        .filter(|s| !s.is_empty());
-    match (cert_path, key_path) {
-        (Some(c), Some(k)) => {
-            let cert = std::fs::read(&c)?;
-            let key = std::fs::read(&k)?;
-            let identity = Identity::from_pem(cert, key);
-            Ok(Some(ServerTlsConfig::new().identity(identity)))
-        }
-        _ => Ok(None),
     }
 }

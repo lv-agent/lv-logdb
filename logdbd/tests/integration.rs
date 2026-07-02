@@ -2121,3 +2121,99 @@ async fn subscribe_concurrent_stress() {
 
     indexer.stop();
 }
+
+/// 100 concurrent subscribers, 50 records — every subscriber must receive
+/// all 50 records with zero duplicates.
+#[tokio::test]
+async fn subscribe_100_concurrent_subscribers_stress() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 1024;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
+        &cache_config, Arc::clone(&hub),
+    ));
+    indexer.clone().start();
+
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage), Arc::clone(&catalog),
+        Arc::new(ConsumerTracker::new(None)),
+        Arc::clone(&hub), "stress-100".into(), "primary".into(), cache_dir,
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder().add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 100 subscribers
+    let mut handles = Vec::new();
+    for i in 0..100 {
+        let addr = addr.clone();
+        handles.push(tokio::spawn(async move {
+            let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+            let resp = c.subscribe(pb::SubscribeRequest {
+                namespace: "test".into(), stream: "main".into(),
+                event_types: vec!["bench.event".into()],
+                consumer_group: "load-test".into(),
+                consumer_id: format!("sub-{}", i),
+            }).await.unwrap();
+            let mut stream = resp.into_inner();
+            let mut seqs = Vec::new();
+            let dl = tokio::time::Instant::now() + Duration::from_secs(15);
+            while seqs.len() < 50 {
+                match tokio::time::timeout_at(dl, stream.message()).await {
+                    Ok(Ok(Some(msg))) => seqs.push(msg.seq),
+                    _ => break,
+                }
+            }
+            seqs.sort();
+            seqs.dedup();
+            seqs
+        }));
+    }
+
+    // Let all subscribers connect
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Publish 50 records
+    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    for i in 0..50u64 {
+        admin.append(pb::AppendRequest {
+            namespace: "test".into(), stream: "main".into(),
+            event_type: "bench.event".into(),
+            content: format!("data-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+    wait_for_indexer(&indexer, 50, 10000).await;
+
+    // Verify all 100 subscribers got all 50 records
+    let mut total_recv = 0u64;
+    for h in handles {
+        let seqs = h.await.unwrap();
+        assert_eq!(seqs.len(), 50, "each subscriber must receive all 50 records");
+        assert_eq!(seqs[0], 1);
+        assert_eq!(seqs[49], 50);
+        total_recv += 1;
+    }
+    assert_eq!(total_recv, 100, "all 100 subscribers completed");
+
+    indexer.stop();
+}

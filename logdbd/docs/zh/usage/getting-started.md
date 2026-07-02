@@ -206,5 +206,6 @@ logdb-exporter exporter.yaml
 ## 下一步
 
 - [配置参考](configuration.md) — 完整配置项说明
+- [SQL 查询缓存](query-cache.md) — 使用 SQL 直接查询流数据
 - [开发指南](../dev/building.md) — 编译、测试、贡献
 - [logdb-client SDK](../../../logdb-client/) — Rust SDK API 文档

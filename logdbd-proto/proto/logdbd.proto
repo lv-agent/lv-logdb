@@ -22,6 +22,9 @@ service LogDbService {
 
   // Query cache — SQL SELECT against the stream's SQLite cache
   rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Subscribe — real-time event-type push with consumer-group offset tracking
+  rpc Subscribe(SubscribeRequest) returns (stream Record);
 }
 
 // ─── Record (full logdbd record) ─────────────────────────────────────────
@@ -274,4 +277,14 @@ message QueryRequest {
 
 message QueryResponse {
   repeated string rows = 1;  // each row as JSON string
+}
+
+// ─── Subscribe (event-type push) ──────────────────────────────────────────
+
+message SubscribeRequest {
+  string namespace       = 1;
+  string stream          = 2;
+  repeated string event_types = 3;  // subscribe to these event types
+  string consumer_group  = 4;       // for offset tracking
+  string consumer_id     = 5;       // unique consumer within group
 }

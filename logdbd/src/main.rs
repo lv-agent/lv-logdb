@@ -145,12 +145,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Storage — wraps logdb with record encode/decode
     let storage = Arc::new(Storage::new(db, num_shards));
 
+    // Shared subscriber hub — Indexer publishes, Subscribe RPC reads
+    let subscribe_hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let consumer_tracker = Arc::new(ConsumerTracker::new());
+
     // Cache — per-stream SQLite query cache (Indexer background thread)
     let cache_indexer = Arc::new(logdbd::cache::Indexer::new(
         storage.db_arc(),
         Arc::clone(&catalog),
         config.cache.dir.clone(),
         &config.cache,
+        Arc::clone(&subscribe_hub),
     ));
     cache_indexer.clone().start();
 
@@ -159,7 +164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         Arc::clone(&catalog),
-        Arc::new(ConsumerTracker::new()),
+        Arc::clone(&consumer_tracker),
+        Arc::clone(&subscribe_hub),
         hostname,
         role_str,
         config.cache.dir.clone(),

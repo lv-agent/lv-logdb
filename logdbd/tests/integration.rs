@@ -58,6 +58,7 @@ async fn start_test_server() -> (SocketAddr, tempfile::TempDir) {
         Arc::clone(&storage),
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "test-node".into(),
         "primary".into(),
         cache_dir,
@@ -93,6 +94,7 @@ async fn start_node(role: &str, standby_addrs: Vec<String>) -> (SocketAddr, temp
         Arc::clone(&storage),
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         node_id.clone(),
         role.into(),
         cache_dir,
@@ -329,6 +331,7 @@ async fn standby_rejects_writes() {
         storage,
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "standby-node".into(),
         "standby".into(),
         PathBuf::from("/tmp"),
@@ -524,6 +527,7 @@ async fn start_server_with_auth(token: &str) -> (SocketAddr, tempfile::TempDir) 
         storage,
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "auth-node".into(),
         "primary".into(),
         PathBuf::from("/tmp"),
@@ -580,6 +584,7 @@ async fn tls_server_accepts_tls_client_and_rejects_plaintext() {
         storage,
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "tls-node".into(),
         "primary".into(),
         PathBuf::from("/tmp"),
@@ -811,6 +816,7 @@ async fn catalog_survives_server_restart() {
         storage,
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "restart-node".into(),
         "primary".into(),
         PathBuf::from("/tmp"),
@@ -1029,6 +1035,7 @@ async fn out_of_retention_graceful() {
         storage,
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "ret-node".into(),
         "primary".into(),
         PathBuf::from("/tmp"),
@@ -1125,6 +1132,7 @@ async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cac
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
+            Arc::new(logdbd::subscribe::SubscribeHub::new()),
     ));
     indexer.clone().start();
 
@@ -1132,6 +1140,7 @@ async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cac
         Arc::clone(&storage),
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "cache-test".into(),
         "primary".into(),
         cache_dir,
@@ -1202,6 +1211,7 @@ async fn cache_query_after_append() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
     ));
     indexer.clone().start();
 
@@ -1209,6 +1219,7 @@ async fn cache_query_after_append() {
         Arc::clone(&storage),
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "cache-test".into(),
         "primary".into(),
         cache_dir.clone(),
@@ -1557,6 +1568,7 @@ async fn cache_query_with_metadata_index() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
     ));
     indexer.clone().start();
 
@@ -1564,6 +1576,7 @@ async fn cache_query_with_metadata_index() {
         Arc::clone(&storage),
         catalog,
         Arc::new(ConsumerTracker::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "meta-idx-test".into(),
         "primary".into(),
         cache_dir.clone(),
@@ -1635,6 +1648,108 @@ async fn cache_query_with_metadata_index() {
         "metadata index on turn_id should exist: {:?}",
         index_resp.rows
     );
+
+    indexer.stop();
+}
+
+// ── Subscribe (event-type push) Tests ────────────────────────────────────────
+
+#[tokio::test]
+async fn subscribe_receives_matching_event_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        ..Default::default()
+    };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+        Arc::clone(&hub),
+    ));
+    indexer.clone().start();
+
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage),
+        catalog,
+        Arc::new(ConsumerTracker::new()),
+        Arc::clone(&hub),
+        "subscribe-test".into(),
+        "primary".into(),
+        cache_dir,
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Subscribe to tool.call only
+    let sub_resp = client
+        .subscribe(pb::SubscribeRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_types: vec!["tool.call".into()],
+            consumer_group: "sandbox".into(),
+            consumer_id: "w1".into(),
+        })
+        .await
+        .unwrap();
+    let mut sub_stream = sub_resp.into_inner();
+
+    // Append mixed event types
+    client.append(pb::AppendRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_type: "user.input".into(), content: b"hello".to_vec(),
+        ..Default::default()
+    }).await.unwrap();
+    client.append(pb::AppendRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_type: "tool.call".into(), content: b"tool-exec".to_vec(),
+        ..Default::default()
+    }).await.unwrap();
+    client.append(pb::AppendRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_type: "llm.call".into(), content: b"llm-resp".to_vec(),
+        ..Default::default()
+    }).await.unwrap();
+
+    // Should receive only the tool.call record
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let rec = match tokio::time::timeout_at(deadline, sub_stream.message()).await {
+        Ok(Ok(Some(msg))) => msg,
+        other => panic!("expected tool.call record, got: {:?}", other),
+    };
+
+    assert_eq!(rec.event_type, "tool.call");
+    assert_eq!(rec.content, b"tool-exec");
 
     indexer.stop();
 }

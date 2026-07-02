@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
 use crate::catalog::Catalog;
@@ -8,6 +9,7 @@ use crate::consumer::ConsumerTracker;
 use crate::pb;
 use crate::pb::log_db_service_server::LogDbService;
 use crate::storage::Storage;
+use crate::subscribe::SubscribeHub;
 
 /// Convert protobuf map to BTreeMap for record encoding.
 fn to_btree(hm: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -23,6 +25,7 @@ pub struct LogDbServiceImpl {
     storage: Arc<Storage>,
     catalog: Arc<Catalog>,
     consumer_tracker: Arc<ConsumerTracker>,
+    subscribe_hub: Arc<SubscribeHub>,
     hostname: String,
     role: String,
     cache_dir: PathBuf,
@@ -33,6 +36,7 @@ impl LogDbServiceImpl {
         storage: Arc<Storage>,
         catalog: Arc<Catalog>,
         consumer_tracker: Arc<ConsumerTracker>,
+        subscribe_hub: Arc<SubscribeHub>,
         hostname: String,
         role: String,
         cache_dir: PathBuf,
@@ -41,6 +45,7 @@ impl LogDbServiceImpl {
             storage,
             catalog,
             consumer_tracker,
+            subscribe_hub,
             hostname,
             role,
             cache_dir,
@@ -602,5 +607,104 @@ impl LogDbService for LogDbServiceImpl {
             Ok(rows) => Ok(Response::new(pb::QueryResponse { rows })),
             Err(e) => Err(Status::invalid_argument(e.to_string())),
         }
+    }
+
+    type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<pb::Record, Status>>;
+
+    async fn subscribe(
+        &self,
+        req: Request<pb::SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let r = req.get_ref();
+        let (_ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
+
+        let event_types: std::collections::HashSet<String> =
+            r.event_types.iter().cloned().collect();
+
+        if event_types.is_empty() {
+            return Err(Status::invalid_argument("event_types must not be empty"));
+        }
+
+        let ns = r.namespace.clone();
+        let stream = r.stream.clone();
+        let group = r.consumer_group.clone();
+        let consumer_id = r.consumer_id.clone();
+
+        // Get last committed offset — where to resume from
+        let last_committed = self.consumer_tracker.get(&ns, &stream, &group, &consumer_id);
+
+        // Clone what we need for the spawned task
+        let storage = Arc::clone(&self.storage);
+        let hub = Arc::clone(&self.subscribe_hub);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+        tokio::spawn(async move {
+            // Phase 1: replay missed records (from last_committed+1 to durable)
+            if last_committed > 0 {
+                let from_gid = 0u64; // simplified: scan all and filter by seq > last_committed
+                match storage.scan(from_gid, u64::MAX) {
+                    Ok(all) => {
+                        for rec in all {
+                            if rec.seq > last_committed && event_types.contains(&rec.event_type) {
+                                let pb_rec = pb::Record {
+                                    namespace_id: rec.namespace_id,
+                                    stream_id: rec.stream_id,
+                                    seq: rec.seq,
+                                    event_type: rec.event_type.clone(),
+                                    timestamp_ns: rec.timestamp_ns,
+                                    content_type: rec.content_type.clone(),
+                                    metadata: crate::service::to_hashmap(&rec.metadata),
+                                    content: rec.user_content.clone(),
+                                };
+                                if tx.send(Ok(pb_rec)).await.is_err() {
+                                    return; // client disconnected
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("replay scan: {}", e))))
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            // Phase 2: subscribe to real-time hub
+            let mut handle = hub.subscribe(stream_id, event_types);
+            loop {
+                match handle.next_matching().await {
+                    Ok(rec) => {
+                        let pb_rec = pb::Record {
+                            namespace_id: rec.namespace_id,
+                            stream_id: rec.stream_id,
+                            seq: rec.seq,
+                            event_type: rec.event_type.clone(),
+                            timestamp_ns: rec.timestamp_ns,
+                            content_type: rec.content_type.clone(),
+                            metadata: crate::service::to_hashmap(&rec.metadata),
+                            content: rec.user_content.clone(),
+                        };
+                        if tx.send(Ok(pb_rec)).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            ns = ns, stream = stream,
+                            skipped = n,
+                            "subscribe client lagging, records skipped"
+                        );
+                        // Keep going — skipped records are still in the segment
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return; // hub shut down
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }

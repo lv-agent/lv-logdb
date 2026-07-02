@@ -639,10 +639,9 @@ impl LogDbService for LogDbServiceImpl {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         tokio::spawn(async move {
-            // Phase 1: replay missed records (from last_committed+1 to durable)
-            if last_committed > 0 {
-                let from_gid = 0u64; // simplified: scan all and filter by seq > last_committed
-                match storage.scan(from_gid, u64::MAX) {
+            // Phase 1: replay missed records (seq > last_committed)
+            {
+                match storage.scan(0, u64::MAX) {
                     Ok(all) => {
                         for rec in all {
                             if rec.seq > last_committed && event_types.contains(&rec.event_type) {

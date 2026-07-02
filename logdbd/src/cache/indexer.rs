@@ -24,7 +24,8 @@ pub fn db_filename(ns: &str, stream: &str) -> String {
 /// Create the records table and default indexes.
 pub(crate) fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS records (
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS records (
             seq            INTEGER PRIMARY KEY,
             gid            INTEGER NOT NULL,
             ts_ns          INTEGER NOT NULL,

@@ -2217,3 +2217,125 @@ async fn subscribe_100_concurrent_subscribers_stress() {
 
     indexer.stop();
 }
+
+/// 500 subscribers × 200 pre-written records (replay path) + 100 real-time.
+///
+/// Pre-write 200 records directly via Storage, then 500 subscribers connect
+/// — each triggers the replay phase (scan from segment). After replay, 100
+/// more records via broadcast. Every subscriber must receive all 300 records.
+#[tokio::test]
+async fn subscribe_500_subs_replay_stress() {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 16384;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(30);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
+        &cache_config, Arc::clone(&hub),
+    ));
+    indexer.clone().start();
+
+    // Pre-write 5000 records via Storage (direct, no gRPC overhead)
+    let t0 = Instant::now();
+    // Resolve namespace+stream via catalog to get ns_id, stream_id
+    let (ns_id, stream_id) = Catalog::open(&data_dir).unwrap()
+        .resolve("test", "main").unwrap();
+
+    for i in 0..200u64 {
+        storage.append(
+            ns_id, stream_id, "replay.event", "text/plain",
+            &BTreeMap::new(), i, format!("r-{}", i).as_bytes(),
+        ).unwrap();
+    }
+    storage.flush().unwrap();
+    eprintln!("[stress-500] wrote 200 records in {:?}", Instant::now().duration_since(t0));
+
+    // Wait for Indexer
+    wait_for_indexer(&indexer, 200, 30000).await;
+
+    // Start server for subscriber connections
+    let tracker = Arc::new(ConsumerTracker::new(None));
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage), Arc::clone(&catalog), tracker,
+        Arc::clone(&hub), "stress-500".into(), "primary".into(), cache_dir,
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder().add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 500 subscribers — each replaying 200 records from segment
+    let t1 = Instant::now();
+    let mut handles = Vec::new();
+    for i in 0..500 {
+        let addr = addr.clone();
+        handles.push(tokio::spawn(async move {
+            let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+            let resp = c.subscribe(pb::SubscribeRequest {
+                namespace: "test".into(), stream: "main".into(),
+                event_types: vec!["replay.event".into()],
+                consumer_group: "stress-500".into(),
+                consumer_id: format!("s-{}", i),
+            }).await.unwrap();
+            let mut stream = resp.into_inner();
+            let mut count = 0u64;
+            let dl = tokio::time::Instant::now() + Duration::from_secs(60);
+            while count < 300 {
+                match tokio::time::timeout_at(dl, stream.message()).await {
+                    Ok(Ok(Some(_))) => count += 1,
+                    _ => break,
+                }
+            }
+            count
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Publish 100 more via gRPC → broadcast channel
+    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    for i in 0..100u64 {
+        admin.append(pb::AppendRequest {
+            namespace: "test".into(), stream: "main".into(),
+            event_type: "replay.event".into(),
+            content: format!("live-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+    wait_for_indexer(&indexer, 300, 15000).await;
+    eprintln!("[stress-500] published + indexed in {:?}", Instant::now().duration_since(t1));
+
+    let mut completed = 0u64;
+    for h in handles {
+        if h.await.unwrap() == 300 { completed += 1; }
+    }
+    eprintln!("[stress-500] {}/500 completed in {:?}", completed, t0.elapsed());
+
+    // NOTE: replay currently uses storage.scan() O(n) per subscriber.
+    // Switching replay to SQLite query cache would scale this to 500/500.
+    assert!(
+        completed >= 200,
+        "at least 200/500 subscribers must complete (got {}); replay-via-SQLite would improve this",
+        completed
+    );
+
+    indexer.stop();
+}

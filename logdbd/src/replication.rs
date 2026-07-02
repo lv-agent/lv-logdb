@@ -33,7 +33,12 @@ pub struct ReplicationServiceImpl {
 
 impl ReplicationServiceImpl {
     pub fn new(storage: Arc<Storage>, cluster_id: String, epoch: u64) -> Self {
-        Self { storage, cluster_id, epoch, lock: Arc::new(tokio::sync::Mutex::new(())) }
+        Self {
+            storage,
+            cluster_id,
+            epoch,
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 }
 
@@ -67,7 +72,8 @@ impl ReplicationService for ReplicationServiceImpl {
 
         let mut last_gid: u64 = 0;
         for rec in &r.records {
-            self.storage.replicate(rec.gid, rec.timestamp_ns, &rec.content)
+            self.storage
+                .replicate(rec.gid, rec.timestamp_ns, &rec.content)
                 .map_err(|e| Status::internal(format!("replicate gid={}: {}", rec.gid, e)))?;
             last_gid = rec.gid;
         }
@@ -93,11 +99,19 @@ pub async fn run_primary_sync(
     )> = Vec::new();
     for s in &repl_config.standbys {
         let tls_ca = s.tls.ca_file.as_ref().and_then(|p| std::fs::read(p).ok());
-        let token = s.auth_token_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let token = s
+            .auth_token_file
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
         match connect_standby(&s.addr, tls_ca.as_deref()).await {
             Some(channel) => {
-                clients.push((s.addr.clone(), pb::replication_service_client::ReplicationServiceClient::new(channel), token));
+                clients.push((
+                    s.addr.clone(),
+                    pb::replication_service_client::ReplicationServiceClient::new(channel),
+                    token,
+                ));
             }
             None => {
                 tracing::warn!(addr = %s.addr, "initial standby connection failed");
@@ -167,11 +181,18 @@ pub async fn run_primary_sync(
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(addr = %addr, error = %e, "push failed, reconnecting");
-                    if let Some(ch) = connect_standby(addr, repl_config.standbys.iter()
-                        .find(|s| &s.addr == addr)
-                        .and_then(|s| s.tls.ca_file.as_ref())
-                        .and_then(|p| std::fs::read(p).ok()).as_deref()
-                    ).await {
+                    if let Some(ch) = connect_standby(
+                        addr,
+                        repl_config
+                            .standbys
+                            .iter()
+                            .find(|s| &s.addr == addr)
+                            .and_then(|s| s.tls.ca_file.as_ref())
+                            .and_then(|p| std::fs::read(p).ok())
+                            .as_deref(),
+                    )
+                    .await
+                    {
                         *client = pb::replication_service_client::ReplicationServiceClient::new(ch);
                         // keep the existing token
                     }
@@ -200,7 +221,11 @@ pub async fn run_primary_sync(
             tokio::time::sleep(reconnect_backoff).await;
             reconnect_backoff = (reconnect_backoff * 2).min(Duration::from_secs(30));
         } else if repl_config.on_sync_timeout == OnSyncTimeout::AsyncWarn {
-            tracing::warn!(acked = acked_count, required, "sync degraded: advancing despite insufficient acks");
+            tracing::warn!(
+                acked = acked_count,
+                required,
+                "sync degraded: advancing despite insufficient acks"
+            );
             if last_acked > push_seq {
                 push_seq = last_acked;
                 storage.advance_replicated(push_seq);
@@ -217,11 +242,17 @@ async fn connect_standby(addr: &str, tls_ca: Option<&[u8]>) -> Option<Channel> {
         let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca.to_vec()));
         let uri: tonic::transport::Uri = match format!("https://{}", addr).parse() {
             Ok(u) => u,
-            Err(e) => { tracing::warn!(addr = %addr, error = %e, "invalid URI"); return None; }
+            Err(e) => {
+                tracing::warn!(addr = %addr, error = %e, "invalid URI");
+                return None;
+            }
         };
         match Endpoint::from(uri).tls_config(tls) {
             Ok(ep) => Some(ep.connect_lazy()),
-            Err(e) => { tracing::warn!(addr = %addr, error = %e, "TLS config"); None }
+            Err(e) => {
+                tracing::warn!(addr = %addr, error = %e, "TLS config");
+                None
+            }
         }
     } else {
         let uri: tonic::transport::Uri = match format!("http://{}", addr).parse() {
@@ -237,7 +268,9 @@ fn read_durable_batch(
     from_gid: u64,
     to_gid: u64,
 ) -> Result<Vec<pb::ReplicationRecord>, String> {
-    let iter = storage.db_arc().scan(from_gid, to_gid)
+    let iter = storage
+        .db_arc()
+        .scan(from_gid, to_gid)
         .map_err(|e| format!("scan: {:?}", e))?;
     let mut records = Vec::new();
     for r in iter {

@@ -21,5 +21,7 @@ impl Sink for StdoutSink {
         Ok(())
     }
 
-    fn name(&self) -> &str { "stdout" }
+    fn name(&self) -> &str {
+        "stdout"
+    }
 }

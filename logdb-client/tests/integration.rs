@@ -1,14 +1,14 @@
 //! Integration tests for logdb-client SDK against a real logdbd server.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 use logdb_client::Client;
 use logdbd::catalog::Catalog;
 use logdbd::consumer::ConsumerTracker;
 use logdbd::pb::log_db_service_server::LogDbServiceServer;
 use logdbd::service::LogDbServiceImpl;
 use logdbd::storage::Storage;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
@@ -30,16 +30,23 @@ async fn start_server() -> (String, tempfile::TempDir) {
     let storage = Arc::new(test_storage(dir.path()));
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let svc = LogDbServiceImpl::new(
-        storage, catalog, Arc::new(ConsumerTracker::new()),
-        "test-node".into(), "primary".into(),
+        storage,
+        catalog,
+        Arc::new(ConsumerTracker::new()),
+        "test-node".into(),
+        "primary".into(),
+        dir.path().join("cache"),
     );
     let svc = LogDbServiceServer::new(svc);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
-        Server::builder().add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     (addr, dir)
@@ -48,7 +55,9 @@ async fn start_server() -> (String, tempfile::TempDir) {
 async fn wait_durable(client: &mut Client, ns: &str, stream: &str, min: u64) {
     for _ in 0..50 {
         if let Ok(wm) = client.watermark(ns, stream).await {
-            if wm.durable_seq >= min { break; }
+            if wm.durable_seq >= min {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -64,7 +73,10 @@ async fn append_and_read() {
     let (addr, _dir) = start_server().await;
     let mut client = Client::connect(&addr).await.unwrap();
 
-    let seq = client.append(NS, STREAM, "test.event", b"hello-world").await.unwrap();
+    let seq = client
+        .append(NS, STREAM, "test.event", b"hello-world")
+        .await
+        .unwrap();
     assert_eq!(seq, 1);
     wait_durable(&mut client, NS, STREAM, 1).await;
 
@@ -83,7 +95,18 @@ async fn append_with_metadata() {
     meta.insert("model".into(), "claude-sonnet-5".into());
     meta.insert("provider".into(), "anthropic".into());
 
-    let resp = client.append_full(NS, STREAM, "llm.call", "application/json", &meta, 1_000_000, b"{}").await.unwrap();
+    let resp = client
+        .append_full(
+            NS,
+            STREAM,
+            "llm.call",
+            "application/json",
+            &meta,
+            1_000_000,
+            b"{}",
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.seq, 1);
     wait_durable(&mut client, NS, STREAM, 1).await;
 
@@ -107,7 +130,10 @@ async fn scan_all() {
     let mut client = Client::connect(&addr).await.unwrap();
 
     for i in 0..10u64 {
-        client.append(NS, STREAM, "test", format!("rec-{}", i).as_bytes()).await.unwrap();
+        client
+            .append(NS, STREAM, "test", format!("rec-{}", i).as_bytes())
+            .await
+            .unwrap();
     }
     wait_durable(&mut client, NS, STREAM, 10).await;
 
@@ -124,12 +150,21 @@ async fn tail_subscription() {
 
     // Write some records first
     for i in 0..5u64 {
-        client.append(NS, STREAM, "test", format!("r-{}", i).as_bytes()).await.unwrap();
+        client
+            .append(NS, STREAM, "test", format!("r-{}", i).as_bytes())
+            .await
+            .unwrap();
     }
     wait_durable(&mut client, NS, STREAM, 5).await;
 
     // Subscribe from seq 1 — use timeout because Tail is a long-lived stream
-    let mut stream = client.tail(NS, STREAM).from_seq(1).batch_size(10).start(&mut client).await.unwrap();
+    let mut stream = client
+        .tail(NS, STREAM)
+        .from_seq(1)
+        .batch_size(10)
+        .start(&mut client)
+        .await
+        .unwrap();
     let mut count = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while count < 5 {
@@ -153,23 +188,35 @@ async fn consumer_group_commit_and_resume() {
 
     // Write records
     for i in 0..5u64 {
-        client.append(NS, STREAM, "test", format!("r-{}", i).as_bytes()).await.unwrap();
+        client
+            .append(NS, STREAM, "test", format!("r-{}", i).as_bytes())
+            .await
+            .unwrap();
     }
     wait_durable(&mut client, NS, STREAM, 5).await;
 
     // Commit offset 3
-    client.commit_offset(NS, STREAM, "workers", "w1", 3).await.unwrap();
+    client
+        .commit_offset(NS, STREAM, "workers", "w1", 3)
+        .await
+        .unwrap();
 
     // Read back committed offset
-    let offset = client.committed_offset(NS, STREAM, "workers", "w1").await.unwrap();
+    let offset = client
+        .committed_offset(NS, STREAM, "workers", "w1")
+        .await
+        .unwrap();
     assert_eq!(offset, 3);
 
     // Tail with consumer group — should auto-resume from 4 (offset + 1) when from_seq=0
-    let mut stream = client.tail(NS, STREAM)
+    let mut stream = client
+        .tail(NS, STREAM)
         .consumer_group("workers", "w1")
-        .from_seq(0)  // auto-resume
+        .from_seq(0) // auto-resume
         .batch_size(10)
-        .start(&mut client).await.unwrap();
+        .start(&mut client)
+        .await
+        .unwrap();
 
     let mut first_seq = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -218,7 +265,10 @@ async fn verify_chain() {
     let mut client = Client::connect(&addr).await.unwrap();
 
     for i in 0..5u64 {
-        client.append(NS, STREAM, "test", format!("r-{}", i).as_bytes()).await.unwrap();
+        client
+            .append(NS, STREAM, "test", format!("r-{}", i).as_bytes())
+            .await
+            .unwrap();
     }
     wait_durable(&mut client, NS, STREAM, 5).await;
 
@@ -234,11 +284,32 @@ async fn batch_append() {
     let (addr, _dir) = start_server().await;
     let mut client = Client::connect(&addr).await.unwrap();
 
-    let resp = client.append_batch(vec![
-        AppendRequest { namespace: NS.into(), stream: STREAM.into(), event_type: "batch".into(), content: b"a".to_vec(), ..Default::default() },
-        AppendRequest { namespace: NS.into(), stream: STREAM.into(), event_type: "batch".into(), content: b"b".to_vec(), ..Default::default() },
-        AppendRequest { namespace: NS.into(), stream: STREAM.into(), event_type: "batch".into(), content: b"c".to_vec(), ..Default::default() },
-    ]).await.unwrap();
+    let resp = client
+        .append_batch(vec![
+            AppendRequest {
+                namespace: NS.into(),
+                stream: STREAM.into(),
+                event_type: "batch".into(),
+                content: b"a".to_vec(),
+                ..Default::default()
+            },
+            AppendRequest {
+                namespace: NS.into(),
+                stream: STREAM.into(),
+                event_type: "batch".into(),
+                content: b"b".to_vec(),
+                ..Default::default()
+            },
+            AppendRequest {
+                namespace: NS.into(),
+                stream: STREAM.into(),
+                event_type: "batch".into(),
+                content: b"c".to_vec(),
+                ..Default::default()
+            },
+        ])
+        .await
+        .unwrap();
 
     assert!(resp.error.is_none());
     assert_eq!(resp.records.len(), 3);
@@ -254,10 +325,16 @@ async fn multi_stream_per_stream_seq() {
 
     // Stream A: 3 records, Stream B: 5 records
     for i in 0..3u64 {
-        client.append("iso", "stream-a", "test", format!("a-{}", i).as_bytes()).await.unwrap();
+        client
+            .append("iso", "stream-a", "test", format!("a-{}", i).as_bytes())
+            .await
+            .unwrap();
     }
     for i in 0..5u64 {
-        client.append("iso", "stream-b", "test", format!("b-{}", i).as_bytes()).await.unwrap();
+        client
+            .append("iso", "stream-b", "test", format!("b-{}", i).as_bytes())
+            .await
+            .unwrap();
     }
     wait_durable(&mut client, "iso", "stream-a", 3).await;
     wait_durable(&mut client, "iso", "stream-b", 5).await;

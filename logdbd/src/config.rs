@@ -560,8 +560,7 @@ impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigLoadError> {
         let raw = std::fs::read_to_string(path.as_ref()).map_err(ConfigLoadError::Io)?;
         let substituted = substitute_env(&raw)?;
-        let config: Self =
-            serde_yaml::from_str(&substituted).map_err(ConfigLoadError::Parse)?;
+        let config: Self = serde_yaml::from_str(&substituted).map_err(ConfigLoadError::Parse)?;
         config.validate()?;
         Ok(config)
     }
@@ -580,8 +579,14 @@ fn substitute_env(raw: &str) -> Result<String, ConfigLoadError> {
             result.push(ch);
             continue;
         }
-        if !in_comment && ch == '#' && (result.ends_with('\n') || result.is_empty()
-            || result.as_bytes().last().map_or(false, |&b| b == b' ' || b == b'\t'))
+        if !in_comment
+            && ch == '#'
+            && (result.ends_with('\n')
+                || result.is_empty()
+                || result
+                    .as_bytes()
+                    .last()
+                    .map_or(false, |&b| b == b' ' || b == b'\t'))
         {
             // Start of a YAML comment — pass through everything until EOL, no substitution
             in_comment = true;
@@ -602,9 +607,8 @@ fn substitute_env(raw: &str) -> Result<String, ConfigLoadError> {
                 }
                 var_name.push(c);
             }
-            let val = std::env::var(&var_name).map_err(|_| {
-                ConfigLoadError::MissingEnv(var_name.clone())
-            })?;
+            let val = std::env::var(&var_name)
+                .map_err(|_| ConfigLoadError::MissingEnv(var_name.clone()))?;
             result.push_str(&val);
         } else {
             result.push(ch);
@@ -652,7 +656,9 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NodeIdEmpty => write!(f, "node.id must not be empty"),
-            Self::InvalidClusterId(s) => write!(f, "node.cluster_id '{}' must be [a-z0-9_-], 1-64 chars", s),
+            Self::InvalidClusterId(s) => {
+                write!(f, "node.cluster_id '{}' must be [a-z0-9_-], 1-64 chars", s)
+            }
             Self::InvalidEpoch(e) => write!(f, "node.epoch must be >= 1, got {}", e),
             Self::NamespaceName(s) => write!(f, "namespace name '{}' invalid", s),
             Self::StreamName(s) => write!(f, "stream name '{}' invalid", s),
@@ -670,12 +676,15 @@ impl Config {
         }
 
         // node.cluster_id: [a-z0-9_-], 1-64
-        validate_name(&self.node.cluster_id, 1, 64, false)
-            .map_err(|_| ConfigLoadError::Invalid(ConfigError::InvalidClusterId(self.node.cluster_id.clone())))?;
+        validate_name(&self.node.cluster_id, 1, 64, false).map_err(|_| {
+            ConfigLoadError::Invalid(ConfigError::InvalidClusterId(self.node.cluster_id.clone()))
+        })?;
 
         // node.epoch >= 1
         if self.node.epoch < 1 {
-            return Err(ConfigLoadError::Invalid(ConfigError::InvalidEpoch(self.node.epoch)));
+            return Err(ConfigLoadError::Invalid(ConfigError::InvalidEpoch(
+                self.node.epoch,
+            )));
         }
 
         Ok(())
@@ -718,7 +727,12 @@ pub fn validate_name(
             return Err(format!("stream name '{}' must not contain '//'", name));
         }
         for ch in name.chars() {
-            if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '_' && ch != '-' && ch != '/' {
+            if !ch.is_ascii_lowercase()
+                && !ch.is_ascii_digit()
+                && ch != '_'
+                && ch != '-'
+                && ch != '/'
+            {
                 return Err(format!(
                     "stream name '{}' contains invalid character '{}'",
                     name, ch
@@ -760,8 +774,7 @@ pub fn validate_event_type(name: &str) -> Result<(), String> {
         ));
     }
     for ch in name.chars() {
-        if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '_' && ch != '-' && ch != '.'
-        {
+        if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '_' && ch != '-' && ch != '.' {
             return Err(format!(
                 "event_type '{}' contains invalid character '{}'",
                 name, ch
@@ -781,8 +794,7 @@ pub fn validate_metadata_key(key: &str) -> Result<(), String> {
         ));
     }
     for ch in key.chars() {
-        if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '_' && ch != '-' && ch != '.'
-        {
+        if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '_' && ch != '-' && ch != '.' {
             return Err(format!(
                 "metadata key '{}' contains invalid character '{}'",
                 key, ch

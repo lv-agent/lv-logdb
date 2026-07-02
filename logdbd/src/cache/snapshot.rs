@@ -253,11 +253,7 @@ mod tests {
         let remaining = fs::read_dir(cache_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".snap_")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".snap_"))
             .count();
         assert_eq!(remaining, 2, "should retain at most 2 snapshots");
     }
@@ -284,11 +280,7 @@ mod tests {
         let remaining = fs::read_dir(cache_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains(".snap_")
-            })
+            .filter(|e| e.file_name().to_string_lossy().contains(".snap_"))
             .count();
         assert_eq!(remaining, 1);
     }

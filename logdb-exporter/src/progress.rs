@@ -22,11 +22,20 @@ pub struct Progress {
 
 impl Progress {
     pub fn new(
-        cluster_id: String, epoch: u64,
-        namespace: String, stream: String,
+        cluster_id: String,
+        epoch: u64,
+        namespace: String,
+        stream: String,
         path: PathBuf,
     ) -> Self {
-        Self { cluster_id, epoch, namespace, stream, last_seq: 0, path }
+        Self {
+            cluster_id,
+            epoch,
+            namespace,
+            stream,
+            last_seq: 0,
+            path,
+        }
     }
 }
 
@@ -41,32 +50,48 @@ impl Progress {
         }
 
         let crc_off = data.len() - 4;
-        let stored = u32::from_le_bytes([data[crc_off], data[crc_off+1], data[crc_off+2], data[crc_off+3]]);
+        let stored = u32::from_le_bytes([
+            data[crc_off],
+            data[crc_off + 1],
+            data[crc_off + 2],
+            data[crc_off + 3],
+        ]);
         if crc32c::crc32c(&data[..crc_off]) != stored {
             return Err("progress CRC mismatch".into());
         }
 
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        if magic != MAGIC { return Err("bad progress magic".into()); }
+        if magic != MAGIC {
+            return Err("bad progress magic".into());
+        }
 
         let ver = u16::from_le_bytes([data[4], data[5]]);
-        if ver != VERSION { return Err(format!("unsupported version {}", ver)); }
+        if ver != VERSION {
+            return Err(format!("unsupported version {}", ver));
+        }
 
         let epoch = read_u64(&data, 8)?;
         let last_seq = read_u64(&data, 16)?;
         let _updated = read_u64(&data, 24)?;
         let cl_len = u16::from_le_bytes([data[32], data[33]]) as usize;
-        let cluster_id = String::from_utf8_lossy(&data[34..34+cl_len]).to_string();
+        let cluster_id = String::from_utf8_lossy(&data[34..34 + cl_len]).to_string();
         let mut pos = 34 + cl_len;
-        let ns_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+        let ns_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
-        let namespace = String::from_utf8_lossy(&data[pos..pos+ns_len]).to_string();
+        let namespace = String::from_utf8_lossy(&data[pos..pos + ns_len]).to_string();
         pos += ns_len;
-        let s_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+        let s_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
-        let stream = String::from_utf8_lossy(&data[pos..pos+s_len]).to_string();
+        let stream = String::from_utf8_lossy(&data[pos..pos + s_len]).to_string();
 
-        Ok(Some(Self { cluster_id, epoch, namespace, stream, last_seq, path: path.to_path_buf() }))
+        Ok(Some(Self {
+            cluster_id,
+            epoch,
+            namespace,
+            stream,
+            last_seq,
+            path: path.to_path_buf(),
+        }))
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -77,7 +102,9 @@ impl Progress {
         buf.extend_from_slice(&self.epoch.to_le_bytes());
         buf.extend_from_slice(&self.last_seq.to_le_bytes());
         let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
         buf.extend_from_slice(&now.to_le_bytes());
 
         let cl = self.cluster_id.as_bytes();
@@ -106,10 +133,18 @@ impl Progress {
 }
 
 fn read_u64(data: &[u8], offset: usize) -> Result<u64, String> {
-    if offset + 8 > data.len() { return Err("truncated".into()); }
+    if offset + 8 > data.len() {
+        return Err("truncated".into());
+    }
     Ok(u64::from_le_bytes([
-        data[offset], data[offset+1], data[offset+2], data[offset+3],
-        data[offset+4], data[offset+5], data[offset+6], data[offset+7],
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
     ]))
 }
 
@@ -121,7 +156,13 @@ mod tests {
     fn roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("progress.dat");
-        let mut prog = Progress::new("test-cluster".into(), 1, "test".into(), "main".into(), p.clone());
+        let mut prog = Progress::new(
+            "test-cluster".into(),
+            1,
+            "test".into(),
+            "main".into(),
+            p.clone(),
+        );
         prog.last_seq = 42;
         prog.save().unwrap();
 

@@ -48,10 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Structured logging
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    tracing_subscriber::EnvFilter::new(config.observability.log_level.as_str())
-                }),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(config.observability.log_level.as_str())
+            }),
         )
         .with_target(true)
         .try_init();
@@ -89,13 +88,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(token.trim().to_string())
         }
-        None => std::env::var("LOGDBD_AUTH_TOKEN").ok().filter(|t| !t.is_empty()),
+        None => std::env::var("LOGDBD_AUTH_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty()),
     };
 
     let _tls_ca: Option<Vec<u8>> = match config.server.tls.ca_file.as_ref() {
         Some(p) => {
-            let ca = std::fs::read(p)
-                .map_err(|e| format!("cannot read TLS CA file {p}: {e}"))?;
+            let ca = std::fs::read(p).map_err(|e| format!("cannot read TLS CA file {p}: {e}"))?;
             Some(ca)
         }
         None => None,
@@ -108,7 +108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "cannot create data directory '{}': {}. \
              If running as non-root, set logdb.data_dir to a writable path, e.g.:\n  \
              logdb:\n    data_dir: ./data",
-            data_dir.display(), e
+            data_dir.display(),
+            e
         )
     })?;
 
@@ -119,8 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db_config.segment_size = config.logdb.segment_size;
     db_config.ring_size = config.logdb.ring_size;
     db_config.durability_mode = map_durability(config.logdb.durability_mode);
-    db_config.flush_timeout =
-        std::time::Duration::from_millis(config.logdb.flush_timeout_ms);
+    db_config.flush_timeout = std::time::Duration::from_millis(config.logdb.flush_timeout_ms);
     db_config.hash_enabled = config.audit.hash_chain;
     db_config.compression_enabled = config.storage.compression.enabled;
 
@@ -140,9 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Catalog — namespace & stream name → ID mapping
-    let catalog = Arc::new(
-        Catalog::open(&data_dir).map_err(|e| format!("catalog open: {}", e))?
-    );
+    let catalog = Arc::new(Catalog::open(&data_dir).map_err(|e| format!("catalog open: {}", e))?);
 
     // Storage — wraps logdb with record encode/decode
     let storage = Arc::new(Storage::new(db, num_shards));
@@ -238,7 +236,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = match interceptor {
         Some(i) => builder
             .add_service(LogDbServiceServer::with_interceptor(log_svc, i.clone()))
-            .add_service(ReplicationServiceServer::with_interceptor(repl_svc, i.clone()))
+            .add_service(ReplicationServiceServer::with_interceptor(
+                repl_svc,
+                i.clone(),
+            ))
             .add_service(SnapshotServiceServer::with_interceptor(snap_svc, i))
             .add_service(health_svc),
         None => builder
@@ -298,9 +299,7 @@ fn map_durability(mode: logdbd::config::DurabilityMode) -> logdb::DurabilityMode
 }
 
 /// Load server TLS from config.
-fn load_server_tls(
-    config: &Config,
-) -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
+fn load_server_tls(config: &Config) -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
     if config.server.tls.mode == logdbd::config::TlsMode::Disabled {
         return Ok(None);
     }
@@ -322,9 +321,8 @@ fn load_server_tls(
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = sigterm.recv() => {}

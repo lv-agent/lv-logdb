@@ -216,9 +216,7 @@ impl LogDb {
             } else {
                 // Fresh shard.
                 #[cfg(feature = "hash-chain")]
-                let hi = {
-                    derived_chain_key.unwrap_or_else(generate_hash_init)
-                };
+                let hi = { derived_chain_key.unwrap_or_else(generate_hash_init) };
                 #[cfg(not(feature = "hash-chain"))]
                 let hi = generate_hash_init();
 

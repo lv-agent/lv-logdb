@@ -19,7 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cmd = &args[1];
     let addr = &args[2];
-    let url = if addr.starts_with("http") { addr.clone() } else { format!("http://{}", addr) };
+    let url = if addr.starts_with("http") {
+        addr.clone()
+    } else {
+        format!("http://{}", addr)
+    };
 
     let mut client = LogDbServiceClient::connect(url).await?;
 
@@ -51,14 +55,22 @@ fn usage(prog: &str) {
     eprintln!("  {} append   <addr> <namespace> <stream> <message>", prog);
 }
 
-async fn cmd_status(client: &mut LogDbServiceClient<tonic::transport::Channel>) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_status(
+    client: &mut LogDbServiceClient<tonic::transport::Channel>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client.status(StatusRequest {}).await?.into_inner();
     println!("Node:       {}", resp.node_id);
     println!("Durable:    {}", resp.durable_sequence);
     println!("Checkpoint: {}", resp.checkpoint);
-    println!("WAL used:   {} / {}", resp.wal_bytes_used, resp.wal_bytes_total);
+    println!(
+        "WAL used:   {} / {}",
+        resp.wal_bytes_used, resp.wal_bytes_total
+    );
     if resp.wal_bytes_total > 0 {
-        println!("WAL %:      {:.1}%", resp.wal_bytes_used as f64 / resp.wal_bytes_total as f64 * 100.0);
+        println!(
+            "WAL %:      {:.1}%",
+            resp.wal_bytes_used as f64 / resp.wal_bytes_total as f64 * 100.0
+        );
     }
 
     // Also try to get namespace/stream info
@@ -75,8 +87,13 @@ async fn cmd_status(client: &mut LogDbServiceClient<tonic::transport::Channel>) 
     Ok(())
 }
 
-async fn cmd_list(client: &mut LogDbServiceClient<tonic::transport::Channel>) -> Result<(), Box<dyn std::error::Error>> {
-    let resp = client.list_namespaces(ListNamespacesRequest {}).await?.into_inner();
+async fn cmd_list(
+    client: &mut LogDbServiceClient<tonic::transport::Channel>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client
+        .list_namespaces(ListNamespacesRequest {})
+        .await?
+        .into_inner();
     if resp.namespaces.is_empty() {
         println!("No namespaces found.");
     } else {
@@ -87,33 +104,59 @@ async fn cmd_list(client: &mut LogDbServiceClient<tonic::transport::Channel>) ->
     Ok(())
 }
 
-async fn cmd_streams(client: &mut LogDbServiceClient<tonic::transport::Channel>, ns: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let resp = client.list_streams(ListStreamsRequest { namespace: ns.into() }).await?.into_inner();
+async fn cmd_streams(
+    client: &mut LogDbServiceClient<tonic::transport::Channel>,
+    ns: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client
+        .list_streams(ListStreamsRequest {
+            namespace: ns.into(),
+        })
+        .await?
+        .into_inner();
     if resp.streams.is_empty() {
         println!("No streams in namespace '{}'", ns);
     } else {
         for s in &resp.streams {
-            println!("{:>8}  {}  (seq 1-{}, {} records)",
-                s.id, s.name, s.durable_seq, s.record_count);
+            println!(
+                "{:>8}  {}  (seq 1-{}, {} records)",
+                s.id, s.name, s.durable_seq, s.record_count
+            );
         }
     }
     Ok(())
 }
 
-async fn cmd_ping(client: &mut LogDbServiceClient<tonic::transport::Channel>) -> Result<(), Box<dyn std::error::Error>> {
+async fn cmd_ping(
+    client: &mut LogDbServiceClient<tonic::transport::Channel>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let resp = client.status(StatusRequest {}).await?.into_inner();
-    println!("OK  node={} durable={}", resp.node_id, resp.durable_sequence);
+    println!(
+        "OK  node={} durable={}",
+        resp.node_id, resp.durable_sequence
+    );
     Ok(())
 }
 
-async fn cmd_append(client: &mut LogDbServiceClient<tonic::transport::Channel>, ns: &str, stream: &str, msg: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let resp = client.append(AppendRequest {
-        namespace: ns.into(),
-        stream: stream.into(),
-        event_type: "admin.cli".into(),
-        content: msg.as_bytes().to_vec(),
-        ..Default::default()
-    }).await?.into_inner();
-    println!("Appended: namespace_id={} stream_id={} seq={} gid={}", resp.namespace_id, resp.stream_id, resp.seq, resp.gid);
+async fn cmd_append(
+    client: &mut LogDbServiceClient<tonic::transport::Channel>,
+    ns: &str,
+    stream: &str,
+    msg: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = client
+        .append(AppendRequest {
+            namespace: ns.into(),
+            stream: stream.into(),
+            event_type: "admin.cli".into(),
+            content: msg.as_bytes().to_vec(),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    println!(
+        "Appended: namespace_id={} stream_id={} seq={} gid={}",
+        resp.namespace_id, resp.stream_id, resp.seq, resp.gid
+    );
     Ok(())
 }

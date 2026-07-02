@@ -3,9 +3,9 @@
 //! Uses insert_deduplication_token for block-level dedup and relies on
 //! ReplacingMergeTree for long-tail dedup at the table level.
 
-use base64::Engine;
 use crate::config::ClickHouseConfig;
 use crate::sink::Sink;
+use base64::Engine;
 use logdbd_proto::pb::Record;
 use std::time::Duration;
 
@@ -69,7 +69,8 @@ impl ClickHouseSink {
         }
 
         let count = self.buffer.len();
-        let resp = self.client
+        let resp = self
+            .client
             .post(&self.url)
             .header("Content-Type", "application/json")
             .query(&[("insert_deduplication_token", dedup_token)])
@@ -94,11 +95,14 @@ impl Sink for ClickHouseSink {
     fn push(&mut self, records: &[Record]) -> Result<(), String> {
         self.buffer.extend_from_slice(records);
 
-        if self.buffer.len() >= self.batch_size || self.last_flush.elapsed() >= self.flush_interval {
+        if self.buffer.len() >= self.batch_size || self.last_flush.elapsed() >= self.flush_interval
+        {
             self.flush()?;
         }
         Ok(())
     }
 
-    fn name(&self) -> &str { "clickhouse" }
+    fn name(&self) -> &str {
+        "clickhouse"
+    }
 }

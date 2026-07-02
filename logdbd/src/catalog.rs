@@ -82,23 +82,35 @@ impl Catalog {
 
         // Lookup or create namespace
         let ns_id = {
-            let ns_map = self.namespaces.read().unwrap_or_else(PoisonError::into_inner);
+            let ns_map = self
+                .namespaces
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(&id) = ns_map.get(ns) {
                 id
             } else {
                 drop(ns_map);
-                let mut ns_map = self.namespaces.write().unwrap_or_else(PoisonError::into_inner);
+                let mut ns_map = self
+                    .namespaces
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
                 if let Some(&id) = ns_map.get(ns) {
                     id
                 } else {
                     let id = {
-                        let mut next = self.next_ns_id.write().unwrap_or_else(PoisonError::into_inner);
+                        let mut next = self
+                            .next_ns_id
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner);
                         let id = *next;
                         *next += 1;
                         id
                     };
                     ns_map.insert(ns.to_string(), id);
-                    self.namespace_names.write().unwrap_or_else(PoisonError::into_inner).insert(id, ns.to_string());
+                    self.namespace_names
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(id, ns.to_string());
                     created = true;
                     id
                 }
@@ -118,13 +130,19 @@ impl Catalog {
                     id
                 } else {
                     let id = {
-                        let mut next = self.next_stream_id.write().unwrap_or_else(PoisonError::into_inner);
+                        let mut next = self
+                            .next_stream_id
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner);
                         let id = *next;
                         *next += 1;
                         id
                     };
                     stream_map.insert(key.clone(), id);
-                    self.stream_info.write().unwrap_or_else(PoisonError::into_inner).insert(id, (ns_id, stream.to_string()));
+                    self.stream_info
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(id, (ns_id, stream.to_string()));
                     created = true;
                     id
                 }
@@ -142,26 +160,34 @@ impl Catalog {
 
     /// Lookup namespace name by id.
     pub fn namespace_name(&self, id: u32) -> Option<String> {
-        self.namespace_names.read().unwrap_or_else(PoisonError::into_inner).get(&id).cloned()
+        self.namespace_names
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned()
     }
 
     /// Lookup stream info by id → (namespace_id, name).
     pub fn stream_info_by_id(&self, id: u64) -> Option<(u32, String)> {
-        self.stream_info.read().unwrap_or_else(PoisonError::into_inner).get(&id).cloned()
+        self.stream_info
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+            .cloned()
     }
 
     /// List all namespaces (excluding _system).
     pub fn list_namespaces(&self) -> Vec<NamespaceSummary> {
-        let ns_map = self.namespaces.read().unwrap_or_else(PoisonError::into_inner);
+        let ns_map = self
+            .namespaces
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let stream_map = self.streams.read().unwrap_or_else(PoisonError::into_inner);
         ns_map
             .iter()
             .filter(|(name, _)| !name.starts_with('_'))
             .map(|(name, &id)| {
-                let count = stream_map
-                    .keys()
-                    .filter(|(nid, _)| *nid == id)
-                    .count() as u64;
+                let count = stream_map.keys().filter(|(nid, _)| *nid == id).count() as u64;
                 NamespaceSummary {
                     name: name.clone(),
                     id,
@@ -173,7 +199,10 @@ impl Catalog {
 
     /// List all streams in a namespace.
     pub fn list_streams(&self, ns: &str) -> Result<Vec<StreamSummary>, CatalogError> {
-        let ns_map = self.namespaces.read().unwrap_or_else(PoisonError::into_inner);
+        let ns_map = self
+            .namespaces
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         let ns_id = ns_map
             .get(ns)
             .ok_or_else(|| CatalogError::NamespaceNotFound(ns.to_string()))?;
@@ -236,7 +265,10 @@ impl Catalog {
     pub fn save_snapshot(&self) -> Result<(), CatalogError> {
         // Serialize under locks
         let buf = {
-            let ns_map = self.namespaces.read().unwrap_or_else(PoisonError::into_inner);
+            let ns_map = self
+                .namespaces
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             let stream_map = self.streams.read().unwrap_or_else(PoisonError::into_inner);
             let buf = Self::serialize(&ns_map, &stream_map)?;
             buf
@@ -297,7 +329,8 @@ impl Catalog {
             if pos + 4 > crc_offset {
                 return Err(CatalogError::Corrupted("truncated".into()));
             }
-            let ns_id = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            let ns_id =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
             max_ns_id = max_ns_id.max(ns_id);
 
@@ -317,19 +350,32 @@ impl Catalog {
             if pos + 4 > crc_offset {
                 return Err(CatalogError::Corrupted("truncated".into()));
             }
-            let stream_count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            let stream_count =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
 
-            self.namespaces.write().unwrap_or_else(PoisonError::into_inner).insert(name.clone(), ns_id);
-            self.namespace_names.write().unwrap_or_else(PoisonError::into_inner).insert(ns_id, name);
+            self.namespaces
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(name.clone(), ns_id);
+            self.namespace_names
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(ns_id, name);
 
             for _ in 0..stream_count {
                 if pos + 8 > crc_offset {
                     return Err(CatalogError::Corrupted("truncated".into()));
                 }
                 let stream_id = u64::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                    data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
                 ]);
                 pos += 8;
                 max_stream_id = max_stream_id.max(stream_id);
@@ -348,13 +394,25 @@ impl Catalog {
                 pos += sname_len;
 
                 let key = (ns_id, sname.clone());
-                self.streams.write().unwrap_or_else(PoisonError::into_inner).insert(key, stream_id);
-                self.stream_info.write().unwrap_or_else(PoisonError::into_inner).insert(stream_id, (ns_id, sname));
+                self.streams
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key, stream_id);
+                self.stream_info
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(stream_id, (ns_id, sname));
             }
         }
 
-        *self.next_ns_id.write().unwrap_or_else(PoisonError::into_inner) = max_ns_id + 1;
-        *self.next_stream_id.write().unwrap_or_else(PoisonError::into_inner) = max_stream_id + 1;
+        *self
+            .next_ns_id
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = max_ns_id + 1;
+        *self
+            .next_stream_id
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = max_stream_id + 1;
 
         Ok(())
     }

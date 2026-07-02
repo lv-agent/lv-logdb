@@ -32,7 +32,9 @@ pub struct SourceConfig {
     pub tls: TlsConfig,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,7 +49,9 @@ pub struct TlsConfig {
     pub ca_file: Option<String>,
 }
 
-fn default_tls_mode() -> TlsMode { TlsMode::Disabled }
+fn default_tls_mode() -> TlsMode {
+    TlsMode::Disabled
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -85,7 +89,9 @@ pub struct StdoutConfig {
     pub format: String,
 }
 
-fn default_json_line() -> String { "json_line".into() }
+fn default_json_line() -> String {
+    "json_line".into()
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,8 +108,12 @@ pub struct ClickHouseConfig {
     pub flush_interval_ms: u64,
 }
 
-fn default_batch_size() -> usize { 10000 }
-fn default_flush_interval_ms() -> u64 { 5000 }
+fn default_batch_size() -> usize {
+    10000
+}
+fn default_flush_interval_ms() -> u64 {
+    5000
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,7 +127,9 @@ pub struct ProgressConfig {
 fn default_progress_file() -> PathBuf {
     PathBuf::from("/var/lib/logdb-exporter/progress.dat")
 }
-fn default_checkpoint_interval_ms() -> u64 { 1000 }
+fn default_checkpoint_interval_ms() -> u64 {
+    1000
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,7 +140,9 @@ pub struct ReportProgressConfig {
     pub interval_ms: u64,
 }
 
-fn default_report_interval_ms() -> u64 { 5000 }
+fn default_report_interval_ms() -> u64 {
+    5000
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,12 +153,19 @@ pub struct PipelineConfig {
     pub tail_batch_size: u32,
 }
 
-fn default_scan_batch() -> usize { 10000 }
-fn default_tail_batch() -> u32 { 1000 }
+fn default_scan_batch() -> usize {
+    10000
+}
+fn default_tail_batch() -> u32 {
+    1000
+}
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self { scan_batch_size: 10000, tail_batch_size: 1000 }
+        Self {
+            scan_batch_size: 10000,
+            tail_batch_size: 1000,
+        }
     }
 }
 

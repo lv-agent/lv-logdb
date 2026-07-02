@@ -33,7 +33,8 @@ impl SnapshotServiceImpl {
 
 #[tonic::async_trait]
 impl SnapshotService for SnapshotServiceImpl {
-    type PullSnapshotStream = tokio_stream::wrappers::ReceiverStream<Result<pb::SnapshotChunk, Status>>;
+    type PullSnapshotStream =
+        tokio_stream::wrappers::ReceiverStream<Result<pb::SnapshotChunk, Status>>;
 
     async fn pull_snapshot(
         &self,
@@ -48,7 +49,9 @@ impl SnapshotService for SnapshotServiceImpl {
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }
 
@@ -63,7 +66,8 @@ fn stream_segments(
             Ok(e) => {
                 let path = e.path();
                 if path.extension().map_or(false, |ext| ext == "log")
-                    && path.file_name()
+                    && path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .map_or(false, |n| !n.contains("-active"))
                 {
@@ -76,7 +80,8 @@ fn stream_segments(
     files.sort();
 
     for path in &files {
-        let name = path.file_name()
+        let name = path
+            .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| format!("non-UTF-8 filename: {:?}", path.file_name()))?
             .to_string();
@@ -85,12 +90,15 @@ fn stream_segments(
         for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
             let last_file = path == files.last().unwrap();
             let last_chunk = i == (data.len().saturating_sub(1) / CHUNK_SIZE);
-            if tx.blocking_send(Ok(pb::SnapshotChunk {
-                file_name: name.clone(),
-                offset: (i * CHUNK_SIZE) as u64,
-                data: chunk.to_vec(),
-                last: last_file && last_chunk,
-            })).is_err() {
+            if tx
+                .blocking_send(Ok(pb::SnapshotChunk {
+                    file_name: name.clone(),
+                    offset: (i * CHUNK_SIZE) as u64,
+                    data: chunk.to_vec(),
+                    last: last_file && last_chunk,
+                }))
+                .is_err()
+            {
                 return Ok(()); // client disconnected
             }
         }
@@ -115,9 +123,17 @@ pub async fn receive_snapshot(
     let mut files_received: Vec<String> = Vec::new();
 
     use tokio_stream::StreamExt;
-    while let Some(chunk) = stream.next().await.transpose().map_err(|e| format!("recv: {}", e))? {
+    while let Some(chunk) = stream
+        .next()
+        .await
+        .transpose()
+        .map_err(|e| format!("recv: {}", e))?
+    {
         // Open new file if needed
-        if current_file.as_ref().map_or(true, |(n, _)| *n != chunk.file_name) {
+        if current_file
+            .as_ref()
+            .map_or(true, |(n, _)| *n != chunk.file_name)
+        {
             // Close previous file
             if let Some((_, f)) = current_file.take() {
                 f.sync_all().map_err(|e| format!("sync: {}", e))?;
@@ -131,7 +147,12 @@ pub async fn receive_snapshot(
 
         // Write chunk
         use std::io::Write;
-        current_file.as_mut().unwrap().1.write_all(&chunk.data).map_err(|e| format!("write: {}", e))?;
+        current_file
+            .as_mut()
+            .unwrap()
+            .1
+            .write_all(&chunk.data)
+            .map_err(|e| format!("write: {}", e))?;
 
         if chunk.last {
             tracing::info!(files = files_received.len(), "snapshot received");
@@ -149,11 +170,7 @@ pub async fn receive_snapshot(
     Err("snapshot stream ended without last chunk".into())
 }
 
-fn install_snapshot(
-    target_dir: &Path,
-    tmp_dir: &Path,
-    files: &[String],
-) -> Result<(), String> {
+fn install_snapshot(target_dir: &Path, tmp_dir: &Path, files: &[String]) -> Result<(), String> {
     // Remove existing log files
     for entry in std::fs::read_dir(target_dir).map_err(|e| format!("read_dir: {}", e))? {
         let entry = entry.map_err(|e| format!("entry: {}", e))?;

@@ -37,7 +37,14 @@ impl LogDbServiceImpl {
         role: String,
         cache_dir: PathBuf,
     ) -> Self {
-        Self { storage, catalog, consumer_tracker, hostname, role, cache_dir }
+        Self {
+            storage,
+            catalog,
+            consumer_tracker,
+            hostname,
+            role,
+            cache_dir,
+        }
     }
 
     fn check_write(&self) -> Result<(), Status> {
@@ -50,9 +57,9 @@ impl LogDbServiceImpl {
 
     /// Resolve namespace + stream → IDs.
     fn resolve(&self, ns: &str, stream: &str) -> Result<(u32, u64), Status> {
-        self.catalog.resolve(ns, stream).map_err(|e| {
-            Status::invalid_argument(format!("invalid namespace/stream: {}", e))
-        })
+        self.catalog
+            .resolve(ns, stream)
+            .map_err(|e| Status::invalid_argument(format!("invalid namespace/stream: {}", e)))
     }
 }
 
@@ -70,14 +77,21 @@ impl LogDbService for LogDbServiceImpl {
         let (ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 
         let meta = to_btree(&r.metadata);
-        let ts = if r.timestamp_ns > 0 { r.timestamp_ns } else { 0 };
-        let ct = if r.content_type.is_empty() { "application/json" } else { &r.content_type };
+        let ts = if r.timestamp_ns > 0 {
+            r.timestamp_ns
+        } else {
+            0
+        };
+        let ct = if r.content_type.is_empty() {
+            "application/json"
+        } else {
+            &r.content_type
+        };
 
-        let result = self.storage.append(
-            ns_id, stream_id,
-            &r.event_type, ct, &meta,
-            ts, &r.content,
-        ).map_err(|e| Status::internal(e.to_string()))?;
+        let result = self
+            .storage
+            .append(ns_id, stream_id, &r.event_type, ct, &meta, ts, &r.content)
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(pb::AppendResponse {
             namespace_id: ns_id,
@@ -97,7 +111,10 @@ impl LogDbService for LogDbServiceImpl {
         // For now, batch is implemented as sequential appends within the same stream.
         // Future optimization: use logdb.append_batch() for true atomicity.
         if r.requests.is_empty() {
-            return Ok(Response::new(pb::AppendBatchResponse { records: vec![], error: None }));
+            return Ok(Response::new(pb::AppendBatchResponse {
+                records: vec![],
+                error: None,
+            }));
         }
 
         // All requests must target the same namespace+stream for atomicity
@@ -106,7 +123,7 @@ impl LogDbService for LogDbServiceImpl {
         for req in &r.requests[1..] {
             if req.namespace != *first_ns || req.stream != *first_stream {
                 return Err(Status::invalid_argument(
-                    "BatchAppend requires all requests in the same namespace+stream"
+                    "BatchAppend requires all requests in the same namespace+stream",
                 ));
             }
         }
@@ -116,12 +133,29 @@ impl LogDbService for LogDbServiceImpl {
 
         for req in &r.requests {
             let meta = to_btree(&req.metadata);
-            let ts = if req.timestamp_ns > 0 { req.timestamp_ns } else { 0 };
-            let ct = if req.content_type.is_empty() { "application/json" } else { &req.content_type };
+            let ts = if req.timestamp_ns > 0 {
+                req.timestamp_ns
+            } else {
+                0
+            };
+            let ct = if req.content_type.is_empty() {
+                "application/json"
+            } else {
+                &req.content_type
+            };
 
-            let result = self.storage.append(
-                ns_id, stream_id, &req.event_type, ct, &meta, ts, &req.content,
-            ).map_err(|e| Status::internal(e.to_string()))?;
+            let result = self
+                .storage
+                .append(
+                    ns_id,
+                    stream_id,
+                    &req.event_type,
+                    ct,
+                    &meta,
+                    ts,
+                    &req.content,
+                )
+                .map_err(|e| Status::internal(e.to_string()))?;
 
             responses.push(pb::AppendResponse {
                 namespace_id: ns_id,
@@ -131,7 +165,10 @@ impl LogDbService for LogDbServiceImpl {
             });
         }
 
-        Ok(Response::new(pb::AppendBatchResponse { records: responses, error: None }))
+        Ok(Response::new(pb::AppendBatchResponse {
+            records: responses,
+            error: None,
+        }))
     }
 
     // ── Read ───────────────────────────────────────────────────────────
@@ -157,7 +194,10 @@ impl LogDbService for LogDbServiceImpl {
                 }),
                 found: true,
             })),
-            Ok(None) => Ok(Response::new(pb::ReadResponse { record: None, found: false })),
+            Ok(None) => Ok(Response::new(pb::ReadResponse {
+                record: None,
+                found: false,
+            })),
             Err(e) => Err(Status::internal(e.to_string())),
         }
     }
@@ -171,7 +211,11 @@ impl LogDbService for LogDbServiceImpl {
         let r = req.get_ref();
         let (_ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
         let from = r.from_seq;
-        let limit = if r.limit == 0 { 10000 } else { r.limit as usize };
+        let limit = if r.limit == 0 {
+            10000
+        } else {
+            r.limit as usize
+        };
 
         let storage = Arc::clone(&self.storage);
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -194,30 +238,39 @@ impl LogDbService for LogDbServiceImpl {
 
             let total_chunks = stream_records.len().div_ceil(limit);
             for (chunk_idx, chunk) in stream_records.chunks(limit).enumerate() {
-                let records: Vec<pb::Record> = chunk.iter().map(|r| pb::Record {
-                    namespace_id: r.namespace_id,
-                    stream_id: r.stream_id,
-                    seq: r.seq,
-                    event_type: r.event_type.clone(),
-                    timestamp_ns: r.timestamp_ns,
-                    content_type: r.content_type.clone(),
-                    metadata: to_hashmap(&r.metadata),
-                    content: r.user_content.clone(),
-                }).collect();
+                let records: Vec<pb::Record> = chunk
+                    .iter()
+                    .map(|r| pb::Record {
+                        namespace_id: r.namespace_id,
+                        stream_id: r.stream_id,
+                        seq: r.seq,
+                        event_type: r.event_type.clone(),
+                        timestamp_ns: r.timestamp_ns,
+                        content_type: r.content_type.clone(),
+                        metadata: to_hashmap(&r.metadata),
+                        content: r.user_content.clone(),
+                    })
+                    .collect();
 
                 let last_seq = records.last().map(|r| r.seq).unwrap_or(0);
                 let has_more = chunk_idx + 1 < total_chunks;
-                if tx.send(Ok(pb::ScanResponse {
-                    records,
-                    next_seq: last_seq + 1,
-                    has_more,
-                })).await.is_err() {
+                if tx
+                    .send(Ok(pb::ScanResponse {
+                        records,
+                        next_seq: last_seq + 1,
+                        has_more,
+                    }))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     type TailStream = tokio_stream::wrappers::ReceiverStream<Result<pb::TailResponse, Status>>;
@@ -249,7 +302,11 @@ impl LogDbService for LogDbServiceImpl {
             r.from_seq
         };
 
-        let batch_size = if r.batch_size == 0 { 100u32 } else { r.batch_size };
+        let batch_size = if r.batch_size == 0 {
+            100u32
+        } else {
+            r.batch_size
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
@@ -272,41 +329,54 @@ impl LogDbService for LogDbServiceImpl {
 
                 if new_records.is_empty() {
                     // Send heartbeat
-                    if tx.send(Ok(pb::TailResponse {
-                        records: vec![],
-                        durable_seq: durable,
-                        heartbeat: true,
-                    })).await.is_err() {
+                    if tx
+                        .send(Ok(pb::TailResponse {
+                            records: vec![],
+                            durable_seq: durable,
+                            heartbeat: true,
+                        }))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
 
-                let records: Vec<pb::Record> = new_records.iter().map(|r| pb::Record {
-                    namespace_id: r.namespace_id,
-                    stream_id: r.stream_id,
-                    seq: r.seq,
-                    event_type: r.event_type.clone(),
-                    timestamp_ns: r.timestamp_ns,
-                    content_type: r.content_type.clone(),
-                    metadata: to_hashmap(&r.metadata),
-                    content: r.user_content.clone(),
-                }).collect();
+                let records: Vec<pb::Record> = new_records
+                    .iter()
+                    .map(|r| pb::Record {
+                        namespace_id: r.namespace_id,
+                        stream_id: r.stream_id,
+                        seq: r.seq,
+                        event_type: r.event_type.clone(),
+                        timestamp_ns: r.timestamp_ns,
+                        content_type: r.content_type.clone(),
+                        metadata: to_hashmap(&r.metadata),
+                        content: r.user_content.clone(),
+                    })
+                    .collect();
 
                 last_seq = records.last().unwrap().seq + 1;
 
-                if tx.send(Ok(pb::TailResponse {
-                    records,
-                    durable_seq: durable,
-                    heartbeat: false,
-                })).await.is_err() {
+                if tx
+                    .send(Ok(pb::TailResponse {
+                        records,
+                        durable_seq: durable,
+                        heartbeat: false,
+                    }))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     // ── Watermark ───────────────────────────────────────────────────────
@@ -317,7 +387,11 @@ impl LogDbService for LogDbServiceImpl {
     ) -> Result<Response<pb::Watermark>, Status> {
         let r = req.get_ref();
         let ns = &r.namespace;
-        let stream_opt = if r.stream.is_empty() { None } else { Some(r.stream.as_str()) };
+        let stream_opt = if r.stream.is_empty() {
+            None
+        } else {
+            Some(r.stream.as_str())
+        };
 
         let durable = self.storage.durable_gid();
         let replicated = self.storage.replicated_gid();
@@ -353,19 +427,25 @@ impl LogDbService for LogDbServiceImpl {
         let from = r.from_seq;
         let to = if r.to_seq == 0 { u64::MAX } else { r.to_seq };
 
-        let all = self.storage.scan(0, u64::MAX).map_err(|e| {
-            Status::internal(format!("scan: {}", e))
-        })?;
+        let all = self
+            .storage
+            .scan(0, u64::MAX)
+            .map_err(|e| Status::internal(format!("scan: {}", e)))?;
 
         let records: Vec<_> = all
             .iter()
-            .filter(|r| r.stream_id == stream_id && r.seq >= from && (to == u64::MAX || r.seq <= to))
+            .filter(|r| {
+                r.stream_id == stream_id && r.seq >= from && (to == u64::MAX || r.seq <= to)
+            })
             .collect();
 
         if records.is_empty() {
             return Ok(Response::new(pb::VerifyChainResponse {
-                ok: true, verified_from: 0, verified_to: 0,
-                error_at_seq: 0, error_message: String::new(),
+                ok: true,
+                verified_from: 0,
+                verified_to: 0,
+                error_at_seq: 0,
+                error_message: String::new(),
             }));
         }
 
@@ -377,18 +457,24 @@ impl LogDbService for LogDbServiceImpl {
         for rec in &records {
             if rec.stream_id != stream_id {
                 return Ok(Response::new(pb::VerifyChainResponse {
-                    ok: false, verified_from: first, verified_to: last,
+                    ok: false,
+                    verified_from: first,
+                    verified_to: last,
                     error_at_seq: rec.seq,
                     error_message: format!("stream_id mismatch at seq={}", rec.seq),
                 }));
             }
             if rec.seq != expected {
                 return Ok(Response::new(pb::VerifyChainResponse {
-                    ok: false, verified_from: first, verified_to: last,
+                    ok: false,
+                    verified_from: first,
+                    verified_to: last,
                     error_at_seq: expected,
                     error_message: format!(
                         "seq gap: expected {}, got {} ({} records verified before gap)",
-                        expected, rec.seq, (expected - first)
+                        expected,
+                        rec.seq,
+                        (expected - first)
                     ),
                 }));
             }
@@ -404,7 +490,10 @@ impl LogDbService for LogDbServiceImpl {
             verified_from: first,
             verified_to: last,
             error_at_seq: 0,
-            error_message: format!("{} records verified (storage-level hash chain managed by logdb)", records.len()),
+            error_message: format!(
+                "{} records verified (storage-level hash chain managed by logdb)",
+                records.len()
+            ),
         }))
     }
 
@@ -414,9 +503,16 @@ impl LogDbService for LogDbServiceImpl {
     ) -> Result<Response<pb::CommitOffsetResponse>, Status> {
         let r = req.get_ref();
         self.consumer_tracker.commit(
-            &r.namespace, &r.stream, &r.consumer_group, &r.consumer_id, r.committed_seq,
+            &r.namespace,
+            &r.stream,
+            &r.consumer_group,
+            &r.consumer_id,
+            r.committed_seq,
         );
-        Ok(Response::new(pb::CommitOffsetResponse { ok: true, message: String::new() }))
+        Ok(Response::new(pb::CommitOffsetResponse {
+            ok: true,
+            message: String::new(),
+        }))
     }
 
     async fn get_committed_offset(
@@ -424,10 +520,12 @@ impl LogDbService for LogDbServiceImpl {
         req: Request<pb::GetCommittedOffsetRequest>,
     ) -> Result<Response<pb::GetCommittedOffsetResponse>, Status> {
         let r = req.get_ref();
-        let seq = self.consumer_tracker.get(
-            &r.namespace, &r.stream, &r.consumer_group, &r.consumer_id,
-        );
-        Ok(Response::new(pb::GetCommittedOffsetResponse { committed_seq: seq }))
+        let seq =
+            self.consumer_tracker
+                .get(&r.namespace, &r.stream, &r.consumer_group, &r.consumer_id);
+        Ok(Response::new(pb::GetCommittedOffsetResponse {
+            committed_seq: seq,
+        }))
     }
 
     async fn status(
@@ -467,9 +565,10 @@ impl LogDbService for LogDbServiceImpl {
         req: Request<pb::ListStreamsRequest>,
     ) -> Result<Response<pb::ListStreamsResponse>, Status> {
         let ns = &req.get_ref().namespace;
-        let streams = self.catalog.list_streams(ns).map_err(|e| {
-            Status::not_found(e.to_string())
-        })?;
+        let streams = self
+            .catalog
+            .list_streams(ns)
+            .map_err(|e| Status::not_found(e.to_string()))?;
         let streams: Vec<pb::StreamInfo> = streams
             .into_iter()
             .map(|s| pb::StreamInfo {

@@ -96,11 +96,7 @@ impl std::fmt::Display for LockError {
                 "active.lock at {} is held by another process",
                 p.display()
             ),
-            Self::Failed(p, e) => write!(
-                f,
-                "cannot acquire active.lock at {}: {}",
-                p.display(), e
-            ),
+            Self::Failed(p, e) => write!(f, "cannot acquire active.lock at {}: {}", p.display(), e),
         }
     }
 }

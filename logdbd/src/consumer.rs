@@ -28,7 +28,9 @@ pub struct ConsumerTracker {
 
 impl ConsumerTracker {
     pub fn new() -> Self {
-        Self { offsets: RwLock::new(HashMap::new()) }
+        Self {
+            offsets: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Commit an offset for a consumer.
@@ -46,7 +48,10 @@ impl ConsumerTracker {
             consumer_group.to_string(),
             consumer_id.to_string(),
         );
-        let mut map = self.offsets.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .offsets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.insert(key, seq);
     }
 
@@ -64,7 +69,10 @@ impl ConsumerTracker {
             consumer_group.to_string(),
             consumer_id.to_string(),
         );
-        let map = self.offsets.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .offsets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(&key).copied().unwrap_or(0)
     }
 
@@ -75,7 +83,10 @@ impl ConsumerTracker {
         stream: &str,
         consumer_group: &str,
     ) -> Vec<(String, u64)> {
-        let map = self.offsets.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .offsets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prefix = (
             namespace.to_string(),
             stream.to_string(),

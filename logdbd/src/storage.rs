@@ -68,8 +68,14 @@ impl Storage {
                     total_records = map.values().map(|m| m.len() as u64).sum::<u64>(),
                     "rebuilt per-stream seq→gid mapping from logdb"
                 );
-                *self.seq_map.write().unwrap_or_else(std::sync::PoisonError::into_inner) = map;
-                *self.next_seqs.write().unwrap_or_else(std::sync::PoisonError::into_inner) = nexts;
+                *self
+                    .seq_map
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = map;
+                *self
+                    .next_seqs
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = nexts;
             }
             Err(e) => {
                 tracing::warn!(error = ?e, "failed to rebuild seq→gid mapping on startup; point reads may return None until new data is appended");
@@ -95,7 +101,10 @@ impl Storage {
     ) -> Result<AppendResult, StorageError> {
         // Allocate next per-stream seq
         let seq = {
-            let mut nexts = self.next_seqs.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut nexts = self
+                .next_seqs
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let next = nexts.entry(stream_id).or_insert(1);
             let s = *next;
             *next += 1;
@@ -104,42 +113,67 @@ impl Storage {
 
         // Encode record
         let encoded = record::encode_record(
-            namespace_id, stream_id, seq,
-            event_type, content_type, metadata,
-            timestamp_ns, user_content,
-        ).map_err(StorageError::Record)?;
+            namespace_id,
+            stream_id,
+            seq,
+            event_type,
+            content_type,
+            metadata,
+            timestamp_ns,
+            user_content,
+        )
+        .map_err(StorageError::Record)?;
 
         // Append to logdb
-        let gid = self.db.append(&encoded)
+        let gid = self
+            .db
+            .append(&encoded)
             .map_err(|e| StorageError::LogDb(format!("append: {:?}", e)))?;
 
         // Store mapping
         {
-            let mut map = self.seq_map.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self
+                .seq_map
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.entry(stream_id)
                 .or_insert_with(BTreeMap::new)
                 .insert(seq, gid);
         }
 
-        Ok(AppendResult { gid, stream_seq: seq })
+        Ok(AppendResult {
+            gid,
+            stream_seq: seq,
+        })
     }
 
     /// Force durable (fsync).
     pub fn flush(&self) -> Result<(), StorageError> {
-        self.db.flush().map_err(|e| StorageError::LogDb(format!("flush: {:?}", e)))
+        self.db
+            .flush()
+            .map_err(|e| StorageError::LogDb(format!("flush: {:?}", e)))
     }
 
     /// Read a record by (stream_id, stream_seq).
-    pub fn read(&self, stream_id: u64, stream_seq: u64) -> Result<Option<DecodedRecord>, StorageError> {
+    pub fn read(
+        &self,
+        stream_id: u64,
+        stream_seq: u64,
+    ) -> Result<Option<DecodedRecord>, StorageError> {
         let gid = {
-            let map = self.seq_map.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = self
+                .seq_map
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.get(&stream_id)
                 .and_then(|m| m.get(&stream_seq).copied())
         };
         match gid {
             None => Ok(None),
             Some(gid) => {
-                let raw = self.db.read(gid)
+                let raw = self
+                    .db
+                    .read(gid)
                     .map_err(|e| StorageError::LogDb(format!("read: {:?}", e)))?;
                 match raw {
                     None => Ok(None),
@@ -151,7 +185,9 @@ impl Storage {
 
     /// Scan records in gid range, decoding each.
     pub fn scan(&self, from_gid: u64, to_gid: u64) -> Result<Vec<DecodedRecord>, StorageError> {
-        let iter = self.db.scan(from_gid, to_gid)
+        let iter = self
+            .db
+            .scan(from_gid, to_gid)
             .map_err(|e| StorageError::LogDb(format!("scan: {:?}", e)))?;
         let mut results = Vec::new();
         for r in iter {
@@ -186,7 +222,10 @@ impl Storage {
         let mut cur = self.replicated_seq.load(Ordering::Acquire);
         while gid > cur {
             match self.replicated_seq.compare_exchange_weak(
-                cur, gid, Ordering::Release, Ordering::Acquire,
+                cur,
+                gid,
+                Ordering::Release,
+                Ordering::Acquire,
             ) {
                 Ok(_) => break,
                 Err(v) => cur = v,
@@ -206,19 +245,25 @@ impl Storage {
         raw_content: &[u8],
     ) -> Result<(), StorageError> {
         // Write to logdb at the exact gid
-        self.db.replicate(gid, timestamp_ns, raw_content)
+        self.db
+            .replicate(gid, timestamp_ns, raw_content)
             .map_err(|e| StorageError::LogDb(format!("replicate: {:?}", e)))?;
 
         // Decode header to rebuild seq→gid mapping
-        let decoded = record::decode_record(raw_content)
-            .map_err(|e| StorageError::Record(e))?;
+        let decoded = record::decode_record(raw_content).map_err(|e| StorageError::Record(e))?;
 
-        let mut map = self.seq_map.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .seq_map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(decoded.stream_id)
             .or_insert_with(BTreeMap::new)
             .insert(decoded.seq, gid);
         // Update next_seq if needed
-        let mut nexts = self.next_seqs.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut nexts = self
+            .next_seqs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cur = nexts.entry(decoded.stream_id).or_insert(1);
         if decoded.seq >= *cur {
             *cur = decoded.seq + 1;
@@ -284,8 +329,20 @@ mod tests {
         let mut meta = BTreeMap::new();
         meta.insert("model".into(), "test".into());
 
-        let r1 = st.append(1, 42, "llm.call", "application/json", &meta, 1000, b"hello").unwrap();
-        let r2 = st.append(1, 42, "tool.call", "application/json", &BTreeMap::new(), 2000, b"world").unwrap();
+        let r1 = st
+            .append(1, 42, "llm.call", "application/json", &meta, 1000, b"hello")
+            .unwrap();
+        let r2 = st
+            .append(
+                1,
+                42,
+                "tool.call",
+                "application/json",
+                &BTreeMap::new(),
+                2000,
+                b"world",
+            )
+            .unwrap();
 
         assert_eq!(r1.stream_seq, 1);
         assert_eq!(r2.stream_seq, 2);
@@ -294,7 +351,9 @@ mod tests {
         st.flush().unwrap();
         // Wait for durable
         for _ in 0..50 {
-            if st.durable_gid() >= r2.gid + 1 { break; }
+            if st.durable_gid() >= r2.gid + 1 {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
 
@@ -314,11 +373,22 @@ mod tests {
     fn scan_decodes_records() {
         let (st, _dir) = test_storage();
         for i in 0..5u64 {
-            st.append(1, 1, "test", "text/plain", &BTreeMap::new(), i, format!("r-{}", i).as_bytes()).unwrap();
+            st.append(
+                1,
+                1,
+                "test",
+                "text/plain",
+                &BTreeMap::new(),
+                i,
+                format!("r-{}", i).as_bytes(),
+            )
+            .unwrap();
         }
         st.flush().unwrap();
         for _ in 0..50 {
-            if st.durable_gid() >= 5 { break; }
+            if st.durable_gid() >= 5 {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
 

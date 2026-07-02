@@ -25,11 +25,7 @@ impl std::error::Error for QueryError {}
 /// Validate that `sql` is a read-only SELECT statement.
 fn validate_sql(sql: &str) -> Result<(), QueryError> {
     let trimmed = sql.trim();
-    let prefix = trimmed
-        .chars()
-        .take(6)
-        .collect::<String>()
-        .to_uppercase();
+    let prefix = trimmed.chars().take(6).collect::<String>().to_uppercase();
     if prefix != "SELECT" {
         return Err(QueryError::NotSelect);
     }
@@ -112,7 +108,12 @@ mod tests {
                 namespace_id: 1,
                 stream_id: 1,
                 seq: i + 1,
-                event_type: if i % 2 == 0 { "user.input" } else { "tool.call" }.into(),
+                event_type: if i % 2 == 0 {
+                    "user.input"
+                } else {
+                    "tool.call"
+                }
+                .into(),
                 content_type: "text/plain".into(),
                 metadata: {
                     let mut m = BTreeMap::new();
@@ -148,7 +149,11 @@ mod tests {
             "SELECT seq, event_type FROM records WHERE event_type = 'user.input' ORDER BY seq",
         )
         .unwrap();
-        assert_eq!(rows.len(), 3, "should find 3 user.input records (seq 1,3,5)");
+        assert_eq!(
+            rows.len(),
+            3,
+            "should find 3 user.input records (seq 1,3,5)"
+        );
 
         let rows = execute_query(
             &db_path,
@@ -283,6 +288,9 @@ mod tests {
 
         let rows = execute_query(&db_path, "SELECT content FROM records WHERE seq = 1").unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].contains("null"), "NULL content should serialize as null");
+        assert!(
+            rows[0].contains("null"),
+            "NULL content should serialize as null"
+        );
     }
 }

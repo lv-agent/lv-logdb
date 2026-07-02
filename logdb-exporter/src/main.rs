@@ -24,7 +24,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "clickhouse")]
             {
                 Box::new(logdb_exporter::sink::clickhouse::ClickHouseSink::new(
-                    &config.sink.clickhouse, ns, stream,
+                    &config.sink.clickhouse,
+                    ns,
+                    stream,
                 ))
             }
             #[cfg(not(feature = "clickhouse"))]

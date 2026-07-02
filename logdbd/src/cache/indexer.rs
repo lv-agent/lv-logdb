@@ -63,11 +63,7 @@ pub(crate) fn insert_record(
 }
 
 /// Insert a tombstone — mark the target record as deleted.
-fn insert_tombstone(
-    conn: &Connection,
-    gid: u64,
-    target_seq: u64,
-) -> Result<(), rusqlite::Error> {
+fn insert_tombstone(conn: &Connection, gid: u64, target_seq: u64) -> Result<(), rusqlite::Error> {
     // Insert the tombstone itself with a unique seq
     conn.execute(
         "INSERT OR IGNORE INTO records (seq, gid, ts_ns, event_type, content_type, metadata_json, content, deleted)
@@ -186,7 +182,10 @@ impl Indexer {
 
         // Final flush before exit
         self.flush_all();
-        tracing::info!(last_gid = self.last_gid.load(Ordering::Acquire), "cache indexer stopped");
+        tracing::info!(
+            last_gid = self.last_gid.load(Ordering::Acquire),
+            "cache indexer stopped"
+        );
     }
 
     /// Decode and route one record to the correct stream's SQLite db.
@@ -260,10 +259,7 @@ impl Indexer {
     fn flush_all(&self) {
         let streams = self.streams.lock().unwrap_or_else(|e| e.into_inner());
         for (_id, s) in streams.iter() {
-            if let Err(e) = s
-                .conn
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            {
+            if let Err(e) = s.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
                 tracing::warn!(error = %e, "cache indexer WAL checkpoint failed");
             }
         }
@@ -297,7 +293,10 @@ mod tests {
     #[test]
     fn db_filename_replaces_backslashes() {
         let name = db_filename("ns", "a\\b");
-        assert!(!name.contains('\\'), "filename must not contain backslashes");
+        assert!(
+            !name.contains('\\'),
+            "filename must not contain backslashes"
+        );
     }
 
     #[test]
@@ -364,8 +363,14 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, 1);
         assert_eq!(row.1, "user.input");
-        assert!(row.2.contains("claude"), "metadata_json should contain 'claude'");
-        assert!(row.2.contains("model"), "metadata_json should contain 'model'");
+        assert!(
+            row.2.contains("claude"),
+            "metadata_json should contain 'claude'"
+        );
+        assert!(
+            row.2.contains("model"),
+            "metadata_json should contain 'model'"
+        );
     }
 
     #[test]
@@ -393,11 +398,9 @@ mod tests {
         insert_record(&conn, 1, &rec2).unwrap();
 
         let content: Vec<u8> = conn
-            .query_row(
-                "SELECT content FROM records WHERE seq = 5",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT content FROM records WHERE seq = 5", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(content, b"first", "duplicate INSERT must be ignored");
     }
@@ -422,11 +425,9 @@ mod tests {
 
         // Verify not deleted
         let deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM records WHERE seq = 10",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT deleted FROM records WHERE seq = 10", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(deleted, 0);
 
@@ -435,11 +436,9 @@ mod tests {
 
         // Verify marked deleted
         let deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM records WHERE seq = 10",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT deleted FROM records WHERE seq = 10", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(deleted, 1, "tombstone must mark target as deleted");
     }
@@ -474,6 +473,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 4, "4 out of 5 records should be non-deleted after tombstone");
+        assert_eq!(
+            count, 4,
+            "4 out of 5 records should be non-deleted after tombstone"
+        );
     }
 }

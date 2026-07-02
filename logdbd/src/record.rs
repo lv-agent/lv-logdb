@@ -81,12 +81,23 @@ pub fn encode_record(
         return Err(RecordError::ContentTooLarge(user_content.len()));
     }
 
-    let header_size: usize = 2 + 1 + 1 + 4 + 8 + 8
-        + 2 + event_type.len()
-        + 2 + content_type.len()
+    let header_size: usize = 2
         + 1
-        + metadata.iter().map(|(k, v)| 1 + k.len() + 2 + v.len()).sum::<usize>()
-        + 8 + 4;
+        + 1
+        + 4
+        + 8
+        + 8
+        + 2
+        + event_type.len()
+        + 2
+        + content_type.len()
+        + 1
+        + metadata
+            .iter()
+            .map(|(k, v)| 1 + k.len() + 2 + v.len())
+            .sum::<usize>()
+        + 8
+        + 4;
 
     let total = header_size + user_content.len();
     let mut buf = Vec::with_capacity(total);
@@ -210,8 +221,14 @@ fn read_u64(raw: &[u8], pos: &mut usize) -> Result<u64, RecordError> {
         return Err(RecordError::Truncated);
     }
     let v = u64::from_le_bytes([
-        raw[*pos], raw[*pos + 1], raw[*pos + 2], raw[*pos + 3],
-        raw[*pos + 4], raw[*pos + 5], raw[*pos + 6], raw[*pos + 7],
+        raw[*pos],
+        raw[*pos + 1],
+        raw[*pos + 2],
+        raw[*pos + 3],
+        raw[*pos + 4],
+        raw[*pos + 5],
+        raw[*pos + 6],
+        raw[*pos + 7],
     ]);
     *pos += 8;
     Ok(v)
@@ -221,8 +238,7 @@ fn read_str<'a>(raw: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a str, R
     if *pos + len > raw.len() {
         return Err(RecordError::Truncated);
     }
-    let s = std::str::from_utf8(&raw[*pos..*pos + len])
-        .map_err(|_| RecordError::InvalidUtf8)?;
+    let s = std::str::from_utf8(&raw[*pos..*pos + len]).map_err(|_| RecordError::InvalidUtf8)?;
     *pos += len;
     Ok(s)
 }
@@ -257,8 +273,14 @@ impl std::fmt::Display for RecordError {
             Self::UnsupportedVersion(v) => write!(f, "unsupported version: {}", v),
             Self::InvalidUtf8 => write!(f, "invalid UTF-8 in record field"),
             Self::ContentTooLarge(s) => write!(f, "content too large: {} bytes", s),
-            Self::MetadataTooMany(n) => write!(f, "too many metadata: {} (max {})", n, MAX_METADATA_COUNT),
-            Self::MetadataTooLarge(s) => write!(f, "metadata too large: {} bytes (max {})", s, MAX_METADATA_BYTES),
+            Self::MetadataTooMany(n) => {
+                write!(f, "too many metadata: {} (max {})", n, MAX_METADATA_COUNT)
+            }
+            Self::MetadataTooLarge(s) => write!(
+                f,
+                "metadata too large: {} bytes (max {})",
+                s, MAX_METADATA_BYTES
+            ),
         }
     }
 }
@@ -277,9 +299,16 @@ mod tests {
         meta.insert("model".into(), "claude-sonnet-5".into());
 
         let encoded = encode_record(
-            1, 42, 1, "llm.call", "application/json",
-            &meta, 1000000, b"hello world",
-        ).unwrap();
+            1,
+            42,
+            1,
+            "llm.call",
+            "application/json",
+            &meta,
+            1000000,
+            b"hello world",
+        )
+        .unwrap();
 
         let decoded = decode_record(&encoded).unwrap();
         assert_eq!(decoded.namespace_id, 1);
@@ -294,9 +323,8 @@ mod tests {
 
     #[test]
     fn encode_decode_no_metadata() {
-        let encoded = encode_record(
-            1, 1, 5, "test", "text/plain", &BTreeMap::new(), 0, b"x",
-        ).unwrap();
+        let encoded =
+            encode_record(1, 1, 5, "test", "text/plain", &BTreeMap::new(), 0, b"x").unwrap();
         let decoded = decode_record(&encoded).unwrap();
         assert_eq!(decoded.metadata.len(), 0);
     }

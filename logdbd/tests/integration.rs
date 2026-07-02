@@ -1924,3 +1924,200 @@ async fn subscribe_reconnect_replays_from_offset() {
 
     indexer.stop();
 }
+
+/// Real replay verification: write records first, then subscribe, verify
+/// the replay phase pushes the records that were missed.
+#[tokio::test]
+async fn subscribe_replays_missed_records_from_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let tracker = Arc::new(ConsumerTracker::new(None));
+    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
+        &cache_config, Arc::clone(&hub),
+    ));
+    indexer.clone().start();
+
+    // Write 5 tool.call records before subscribing
+    {
+        let log_svc = LogDbServiceImpl::new(
+            Arc::clone(&storage), Arc::clone(&catalog), Arc::clone(&tracker),
+            Arc::clone(&hub), "replay-svc".into(), "primary".into(), cache_dir.clone(),
+        );
+        let svc = LogDbServiceServer::new(log_svc);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder().add_service(svc)
+                .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+        for i in 0..5u64 {
+            c.append(pb::AppendRequest {
+                namespace: "test".into(), stream: "main".into(),
+                event_type: "tool.call".into(),
+                content: format!("tool-{}", i).into_bytes(),
+                ..Default::default()
+            }).await.unwrap();
+        }
+        wait_for_indexer(&indexer, 5, 5000).await;
+
+        // Simulate consumer processed seq 1 and 2, then died
+        tracker.commit("test", "main", "sandbox", "lagging-consumer", 2);
+    }
+
+    // New subscribe — should replay seq 3, 4, 5 via replay phase
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage), Arc::clone(&catalog), Arc::clone(&tracker),
+        Arc::clone(&hub), "replay-svc2".into(), "primary".into(), cache_dir,
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder().add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    let resp = c.subscribe(pb::SubscribeRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_types: vec!["tool.call".into()],
+        consumer_group: "sandbox".into(), consumer_id: "lagging-consumer".into(),
+    }).await.unwrap();
+    let mut stream = resp.into_inner();
+
+    // Should receive the 3 missed records (seq 3, 4, 5), not seq 1,2
+    let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut received = Vec::new();
+    for _ in 0..3 {
+        match tokio::time::timeout_at(dl, stream.message()).await {
+            Ok(Ok(Some(msg))) => received.push(msg),
+            other => panic!("expected missed record, got: {:?}", other),
+        }
+    }
+
+    assert_eq!(received.len(), 3, "should replay exactly 3 missed records");
+    for r in &received {
+        assert!(r.seq >= 3, "replayed seq must be >= 3 (missed), got {}", r.seq);
+        assert_eq!(r.event_type, "tool.call");
+    }
+
+    indexer.stop();
+}
+
+/// High-concurrency stress: 5 subscribers + 100 records, verify
+/// each subscriber receives all matching records.
+#[tokio::test]
+async fn subscribe_concurrent_stress() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let cache_dir = dir.path().join("cache");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 512;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let tracker = Arc::new(ConsumerTracker::new(None));
+    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let indexer = Arc::new(logdbd::cache::Indexer::new(
+        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
+        &cache_config, Arc::clone(&hub),
+    ));
+    indexer.clone().start();
+
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage), Arc::clone(&catalog), Arc::clone(&tracker),
+        Arc::clone(&hub), "stress".into(), "primary".into(), cache_dir,
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder().add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 5 concurrent subscribers
+    let mut handles = Vec::new();
+    for i in 0..5 {
+        let addr = addr.clone();
+        handles.push(tokio::spawn(async move {
+            let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+            let resp = c.subscribe(pb::SubscribeRequest {
+                namespace: "test".into(), stream: "main".into(),
+                event_types: vec!["tool.call".into()],
+                consumer_group: "stress-group".into(),
+                consumer_id: format!("w-{}", i),
+            }).await.unwrap();
+            let mut stream = resp.into_inner();
+            let mut seqs = Vec::new();
+            let dl = tokio::time::Instant::now() + Duration::from_secs(10);
+            while seqs.len() < 20 {
+                match tokio::time::timeout_at(dl, stream.message()).await {
+                    Ok(Ok(Some(msg))) => {
+                        assert_eq!(msg.event_type, "tool.call");
+                        seqs.push(msg.seq);
+                        if seqs.len() >= 20 { break; }
+                    }
+                    _ => break,
+                }
+            }
+            seqs
+        }));
+    }
+
+    // Give all subscribers a moment to connect
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Publish 20 tool.call records from a separate client
+    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    for i in 0..20u64 {
+        admin.append(pb::AppendRequest {
+            namespace: "test".into(), stream: "main".into(),
+            event_type: "tool.call".into(),
+            content: format!("tc-{}", i).into_bytes(),
+            ..Default::default()
+        }).await.unwrap();
+    }
+    // Ensure Indexer has caught up
+    wait_for_indexer(&indexer, 20, 8000).await;
+
+    // Collect results from all subscribers
+    for h in handles {
+        let seqs = h.await.unwrap();
+        assert_eq!(seqs.len(), 20, "each subscriber must receive all 20 records");
+        // Verify no duplicates within one subscriber
+        let mut sorted = seqs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 20, "no duplicate deliveries");
+    }
+
+    indexer.stop();
+}

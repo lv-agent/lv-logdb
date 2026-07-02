@@ -21,6 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

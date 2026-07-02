@@ -166,6 +166,29 @@ impl Client {
         Ok(all)
     }
 
+    // ── Query ──────────────────────────────────────────────────────────
+
+    /// Execute a read-only SQL query against a stream's query cache.
+    ///
+    /// Only SELECT statements are allowed. The connection is opened read-only
+    /// at the SQLite level — any write operation is rejected by the kernel.
+    pub async fn query(
+        &mut self,
+        namespace: &str,
+        stream: &str,
+        sql: &str,
+    ) -> Result<Vec<String>, tonic::Status> {
+        let resp = self
+            .inner
+            .query(QueryRequest {
+                namespace: namespace.into(),
+                stream: stream.into(),
+                sql: sql.into(),
+            })
+            .await?;
+        Ok(resp.into_inner().rows)
+    }
+
     // ── Tail ───────────────────────────────────────────────────────────
 
     /// Create a tail subscription.

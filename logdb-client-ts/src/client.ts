@@ -175,6 +175,22 @@ export class Client {
     return new TailStream(call, convertRecord);
   }
 
+  // ── Query ──────────────────────────────────────────────────────────
+
+  /** Execute a read-only SQL query against a stream's query cache.
+   *
+   * Only SELECT is allowed — enforced at the SQLite kernel level.
+   * Each row is returned as a JSON string.
+   */
+  query(namespace: string, stream: string, sql: string): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      this.client.Query({ namespace, stream, sql }, (err: any, resp: any) => {
+        if (err) return reject(err);
+        resolve(resp.rows || []);
+      });
+    });
+  }
+
   // ── Watermark ──────────────────────────────────────────────────────
 
   /** Get the watermark for a namespace/stream. */

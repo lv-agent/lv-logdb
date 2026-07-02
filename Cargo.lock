@@ -1117,7 +1117,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "logdb"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "logdbd"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "crc32c",
  "fs2",

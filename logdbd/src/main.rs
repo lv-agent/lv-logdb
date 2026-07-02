@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => std::env::var("LOGDBD_AUTH_TOKEN").ok().filter(|t| !t.is_empty()),
     };
 
-    let tls_ca: Option<Vec<u8>> = match config.server.tls.ca_file.as_ref() {
+    let _tls_ca: Option<Vec<u8>> = match config.server.tls.ca_file.as_ref() {
         Some(p) => {
             let ca = std::fs::read(p)
                 .map_err(|e| format!("cannot read TLS CA file {p}: {e}"))?;

@@ -211,14 +211,13 @@ impl Client {
 
 pub struct ClientBuilder {
     addr: Option<String>,
-    tls_config: Option<()>, // placeholder for TLS
     consumer_group: Option<String>,
     consumer_id: Option<String>,
 }
 
 impl ClientBuilder {
     fn new() -> Self {
-        Self { addr: None, tls_config: None, consumer_group: None, consumer_id: None }
+        Self { addr: None, consumer_group: None, consumer_id: None }
     }
 
     pub fn addr(mut self, addr: impl Into<String>) -> Self {

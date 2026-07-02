@@ -20,7 +20,7 @@ pub struct ClickHouseSink {
 }
 
 impl ClickHouseSink {
-    pub fn new(config: &ClickHouseConfig, namespace: &str, stream: &str) -> Self {
+    pub fn new(config: &ClickHouseConfig, _namespace: &str, _stream: &str) -> Self {
         let url = format!(
             "{}/?database={}&query=INSERT+INTO+{}+FORMAT+JSONEachRow",
             config.url.trim_end_matches('/'),

@@ -159,3 +159,137 @@ pub fn cleanup_snapshots(cache_dir: &Path, retain: usize) {
         }
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch_db(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, b"mock sqlite db").unwrap();
+    }
+
+    #[test]
+    fn recover_or_create_returns_existing_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        let active = cache_dir.join("my-app.stream1.db");
+        touch_db(&active);
+
+        let result = recover_or_create(cache_dir, "my-app", "stream1");
+        assert_eq!(result, active);
+    }
+
+    #[test]
+    fn recover_or_create_uses_newest_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        // Create two snapshots
+        let snap1 = cache_dir.join("my-app.stream1.snap_1000.db");
+        let snap2 = cache_dir.join("my-app.stream1.snap_2000.db");
+        touch_db(&snap1);
+        touch_db(&snap2);
+
+        // No active db — should recover from snap_2000 (newest)
+        let result = recover_or_create(cache_dir, "my-app", "stream1");
+        assert!(result.exists(), "recovered db must exist");
+        assert_eq!(result, cache_dir.join("my-app.stream1.db"));
+    }
+
+    #[test]
+    fn recover_or_create_fresh_when_nothing_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        let result = recover_or_create(cache_dir, "ns", "stream");
+        assert_eq!(result, cache_dir.join("ns.stream.db"));
+    }
+
+    #[test]
+    fn create_snapshot_returns_none_when_no_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        let result = create_snapshot(cache_dir, "ns", "noexist");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn create_snapshot_copies_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        let active = cache_dir.join("ns.stream.db");
+        touch_db(&active);
+
+        let snap = create_snapshot(cache_dir, "ns", "stream");
+        assert!(snap.is_some());
+        assert!(snap.unwrap().exists());
+        // Active still there
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn cleanup_removes_excess_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        // Create 5 snapshots for one stream
+        for ts in [1000, 2000, 3000, 4000, 5000] {
+            let snap = cache_dir.join(format!("ns.stream.snap_{}.db", ts));
+            touch_db(&snap);
+        }
+
+        // Retain only 2
+        cleanup_snapshots(cache_dir, 2);
+
+        // Count surviving snapshots
+        let remaining = fs::read_dir(cache_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".snap_")
+            })
+            .count();
+        assert_eq!(remaining, 2, "should retain at most 2 snapshots");
+    }
+
+    #[test]
+    fn cleanup_ignores_active_dbs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+
+        let active = cache_dir.join("ns.stream.db");
+        touch_db(&active);
+
+        for ts in [1000, 2000] {
+            let snap = cache_dir.join(format!("ns.stream.snap_{}.db", ts));
+            touch_db(&snap);
+        }
+
+        cleanup_snapshots(cache_dir, 1);
+
+        // Active db must NOT be deleted
+        assert!(active.exists(), "active db must survive cleanup");
+
+        // Only 1 snapshot must survive
+        let remaining = fs::read_dir(cache_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".snap_")
+            })
+            .count();
+        assert_eq!(remaining, 1);
+    }
+}

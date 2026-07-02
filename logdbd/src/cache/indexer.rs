@@ -21,7 +21,7 @@ pub fn db_filename(ns: &str, stream: &str) -> String {
 }
 
 /// Create the records table and default indexes.
-fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+pub(crate) fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS records (
             seq            INTEGER PRIMARY KEY,
@@ -40,7 +40,7 @@ fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 }
 
 /// Insert a decoded record into the records table.
-fn insert_record(
+pub(crate) fn insert_record(
     conn: &Connection,
     gid: u64,
     rec: &record::DecodedRecord,
@@ -256,5 +256,203 @@ impl Indexer {
     /// Get the current progress (last processed gid).
     pub fn last_gid(&self) -> u64 {
         self.last_gid.load(Ordering::Acquire)
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn db_filename_replaces_slashes() {
+        let name = db_filename("my-app", "user-1/session-abc");
+        assert_eq!(name, "my-app.user-1_session-abc.db");
+        assert!(!name.contains('/'), "filename must not contain slashes");
+    }
+
+    #[test]
+    fn db_filename_replaces_backslashes() {
+        let name = db_filename("ns", "a\\b");
+        assert!(!name.contains('\\'), "filename must not contain backslashes");
+    }
+
+    #[test]
+    fn create_schema_succeeds() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Verify table exists
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='records'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "records table must exist");
+
+        // Verify indexes exist
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='records'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 2, "two default indexes must exist");
+    }
+
+    #[test]
+    fn create_schema_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+        create_schema(&conn).unwrap(); // second call must not error
+    }
+
+    #[test]
+    fn insert_and_read_record() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let rec = record::DecodedRecord {
+            namespace_id: 1,
+            stream_id: 42,
+            seq: 1,
+            event_type: "user.input".into(),
+            content_type: "text/plain".into(),
+            metadata: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("model".into(), "claude".into());
+                m
+            },
+            timestamp_ns: 1000,
+            user_content: b"hello world".to_vec(),
+        };
+
+        insert_record(&conn, 0, &rec).unwrap();
+
+        let row: (i64, String, String) = conn
+            .query_row(
+                "SELECT seq, event_type, metadata_json FROM records WHERE seq = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1, "user.input");
+        assert!(row.2.contains("claude"), "metadata_json should contain 'claude'");
+        assert!(row.2.contains("model"), "metadata_json should contain 'model'");
+    }
+
+    #[test]
+    fn insert_record_ignore_duplicate() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        let rec = record::DecodedRecord {
+            namespace_id: 0,
+            stream_id: 0,
+            seq: 5,
+            event_type: "test".into(),
+            content_type: "text/plain".into(),
+            metadata: std::collections::BTreeMap::new(),
+            timestamp_ns: 0,
+            user_content: b"first".to_vec(),
+        };
+        insert_record(&conn, 0, &rec).unwrap();
+
+        // Insert same seq again — should be ignored
+        let rec2 = record::DecodedRecord {
+            user_content: b"second".to_vec(),
+            ..rec
+        };
+        insert_record(&conn, 1, &rec2).unwrap();
+
+        let content: Vec<u8> = conn
+            .query_row(
+                "SELECT content FROM records WHERE seq = 5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, b"first", "duplicate INSERT must be ignored");
+    }
+
+    #[test]
+    fn tombstone_marks_record_deleted() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        // Insert target record
+        let rec = record::DecodedRecord {
+            namespace_id: 0,
+            stream_id: 0,
+            seq: 10,
+            event_type: "msg".into(),
+            content_type: "text/plain".into(),
+            metadata: std::collections::BTreeMap::new(),
+            timestamp_ns: 0,
+            user_content: b"important".to_vec(),
+        };
+        insert_record(&conn, 100, &rec).unwrap();
+
+        // Verify not deleted
+        let deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM records WHERE seq = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, 0);
+
+        // Apply tombstone
+        insert_tombstone(&conn, 200, 10).unwrap();
+
+        // Verify marked deleted
+        let deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM records WHERE seq = 10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, 1, "tombstone must mark target as deleted");
+    }
+
+    #[test]
+    fn delete_is_queryable() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_schema(&conn).unwrap();
+
+        for i in 0..5u64 {
+            let rec = record::DecodedRecord {
+                namespace_id: 0,
+                stream_id: 0,
+                seq: i + 1,
+                event_type: "test".into(),
+                content_type: "text/plain".into(),
+                metadata: std::collections::BTreeMap::new(),
+                timestamp_ns: i,
+                user_content: format!("r-{}", i).into_bytes(),
+            };
+            insert_record(&conn, i, &rec).unwrap();
+        }
+
+        // Tombstone seq 2
+        insert_tombstone(&conn, 100, 2).unwrap();
+
+        // Query only non-deleted
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM records WHERE deleted = 0 AND event_type != 'logdb.tombstone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 4, "4 out of 5 records should be non-deleted after tombstone");
     }
 }

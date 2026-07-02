@@ -1,5 +1,5 @@
 {
-  "name": "logdb-client",
+  "name": "@lv-agent/logdb-client",
   "version": "0.1.0",
   "description": "TypeScript SDK for logdbd — append-only audit log database",
   "main": "dist/index.js",

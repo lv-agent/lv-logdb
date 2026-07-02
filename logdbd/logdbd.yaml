@@ -43,7 +43,7 @@ storage:
     algorithm: aes-256-gcm
     # keys:
     #   - key_id: "2026-07"
-    #     key_hex: "${LOGDBD_KEY_2026_07}"
+    #     key_hex: "<your-32-byte-key-in-hex>"
     active_key_id: ""
 
 audit:

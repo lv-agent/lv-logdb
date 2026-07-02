@@ -1,15 +1,15 @@
-# logdb-client — TypeScript SDK for logdbd
+# @lv-agent/logdb-client — TypeScript SDK for logdbd
 
 ## Install
 
 ```bash
-npm install logdb-client
+npm install @lv-agent/logdb-client
 ```
 
 ## Quick Start
 
 ```typescript
-import { Client } from 'logdb-client';
+import { Client } from '@lv-agent/logdb-client';
 
 const client = new Client('127.0.0.1:50051');
 

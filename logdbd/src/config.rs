@@ -569,8 +569,28 @@ impl Config {
 fn substitute_env(raw: &str) -> Result<String, ConfigLoadError> {
     let mut result = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
+    let mut in_comment = false;
 
     while let Some(ch) = chars.next() {
+        // Track YAML comments (# after whitespace or at line start)
+        if ch == '\n' {
+            in_comment = false;
+            result.push(ch);
+            continue;
+        }
+        if !in_comment && ch == '#' && (result.ends_with('\n') || result.is_empty()
+            || result.as_bytes().last().map_or(false, |&b| b == b' ' || b == b'\t'))
+        {
+            // Start of a YAML comment — pass through everything until EOL, no substitution
+            in_comment = true;
+            result.push(ch);
+            continue;
+        }
+        if in_comment {
+            result.push(ch);
+            continue;
+        }
+
         if ch == '$' && chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let mut var_name = String::new();

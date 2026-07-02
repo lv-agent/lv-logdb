@@ -637,7 +637,7 @@ async fn tls_server_accepts_tls_client_and_rejects_plaintext() {
 async fn concurrent_appends_produce_gap_free_sequences() {
     let (addr, _dir) = start_test_server().await;
 
-    let mut handles = Vec::new(); 
+    let mut handles = Vec::new();
     for t in 0..4 {
         let addr = addr.clone();
         handles.push(tokio::spawn(async move {
@@ -1132,7 +1132,7 @@ async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cac
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-            Arc::new(logdbd::subscribe::SubscribeHub::new()),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
     ));
     indexer.clone().start();
 
@@ -1436,7 +1436,7 @@ async fn cache_query_concurrent_reads() {
     wait_for_indexer(&indexer, 50, 5000).await;
 
     // Multiple concurrent queries
-    let mut handles = Vec::new(); 
+    let mut handles = Vec::new();
     for filter_val in 0..5 {
         let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
             .await
@@ -1725,21 +1725,36 @@ async fn subscribe_receives_matching_event_types() {
     let mut sub_stream = sub_resp.into_inner();
 
     // Append mixed event types
-    client.append(pb::AppendRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_type: "user.input".into(), content: b"hello".to_vec(),
-        ..Default::default()
-    }).await.unwrap();
-    client.append(pb::AppendRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_type: "tool.call".into(), content: b"tool-exec".to_vec(),
-        ..Default::default()
-    }).await.unwrap();
-    client.append(pb::AppendRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_type: "llm.call".into(), content: b"llm-resp".to_vec(),
-        ..Default::default()
-    }).await.unwrap();
+    client
+        .append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "user.input".into(),
+            content: b"hello".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    client
+        .append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "tool.call".into(),
+            content: b"tool-exec".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    client
+        .append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "llm.call".into(),
+            content: b"llm-resp".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 
     // Should receive only the tool.call record
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1772,68 +1787,116 @@ async fn subscribe_multi_consumer_same_group() {
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
     let tracker = Arc::new(ConsumerTracker::new(None));
-    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        ..Default::default()
+    };
     let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
-        &cache_config, Arc::clone(&hub),
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+        Arc::clone(&hub),
     ));
     indexer.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
-        Arc::clone(&storage), catalog, Arc::clone(&tracker),
-        Arc::clone(&hub), "multi-cons".into(), "primary".into(), cache_dir,
+        Arc::clone(&storage),
+        catalog,
+        Arc::clone(&tracker),
+        Arc::clone(&hub),
+        "multi-cons".into(),
+        "primary".into(),
+        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        Server::builder().add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
 
     // Two subscribers in the same group, each subscribing to different event types
-    let mut c1 = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
-    let mut c2 = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    let mut c1 = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+    let mut c2 = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
 
-    let resp1 = c1.subscribe(pb::SubscribeRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_types: vec!["tool.call".into()],
-        consumer_group: "sandbox".into(), consumer_id: "executor-1".into(),
-    }).await.unwrap();
+    let resp1 = c1
+        .subscribe(pb::SubscribeRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_types: vec!["tool.call".into()],
+            consumer_group: "sandbox".into(),
+            consumer_id: "executor-1".into(),
+        })
+        .await
+        .unwrap();
     let mut s1 = resp1.into_inner();
 
-    let resp2 = c2.subscribe(pb::SubscribeRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_types: vec!["llm.call".into()],
-        consumer_group: "sandbox".into(), consumer_id: "llm-watcher".into(),
-    }).await.unwrap();
+    let resp2 = c2
+        .subscribe(pb::SubscribeRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_types: vec!["llm.call".into()],
+            consumer_group: "sandbox".into(),
+            consumer_id: "llm-watcher".into(),
+        })
+        .await
+        .unwrap();
     let mut s2 = resp2.into_inner();
 
     // Append one of each
-    admin.append(pb::AppendRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_type: "tool.call".into(), content: b"tc".to_vec(),
-        ..Default::default()
-    }).await.unwrap();
-    admin.append(pb::AppendRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_type: "llm.call".into(), content: b"lc".to_vec(),
-        ..Default::default()
-    }).await.unwrap();
+    admin
+        .append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "tool.call".into(),
+            content: b"tc".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    admin
+        .append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "llm.call".into(),
+            content: b"lc".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 
     let dl = tokio::time::Instant::now() + Duration::from_secs(3);
 
     // executor-1 should receive tool.call
-    let r1 = tokio::time::timeout_at(dl, s1.message()).await.unwrap().unwrap().unwrap();
+    let r1 = tokio::time::timeout_at(dl, s1.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(r1.event_type, "tool.call");
     assert_eq!(r1.content, b"tc");
 
     // llm-watcher should receive llm.call
-    let r2 = tokio::time::timeout_at(dl, s2.message()).await.unwrap().unwrap().unwrap();
+    let r2 = tokio::time::timeout_at(dl, s2.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(r2.event_type, "llm.call");
     assert_eq!(r2.content, b"lc");
 
@@ -1857,11 +1920,13 @@ async fn subscribe_reconnect_replays_from_offset() {
                 committed_seq INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (consumer_group, consumer_id)
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO consumer_offsets VALUES ('sandbox', 'reconn', 2)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     let mut db_config = DbConfig::default();
@@ -1876,45 +1941,74 @@ async fn subscribe_reconnect_replays_from_offset() {
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
     let tracker = Arc::new(ConsumerTracker::new(Some(cache_dir.clone())));
-    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        ..Default::default()
+    };
     let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
-        &cache_config, Arc::clone(&hub),
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+        Arc::clone(&hub),
     ));
     indexer.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
-        Arc::clone(&storage), catalog, Arc::clone(&tracker),
-        Arc::clone(&hub), "reconn-test".into(), "primary".into(), cache_dir,
+        Arc::clone(&storage),
+        catalog,
+        Arc::clone(&tracker),
+        Arc::clone(&hub),
+        "reconn-test".into(),
+        "primary".into(),
+        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        Server::builder().add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
 
     // Simulating reconnect: subscribe with the same consumer_group/id
-    let resp = c.subscribe(pb::SubscribeRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_types: vec!["tool.call".into()],
-        consumer_group: "sandbox".into(), consumer_id: "reconn".into(),
-    }).await.unwrap();
+    let resp = c
+        .subscribe(pb::SubscribeRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_types: vec!["tool.call".into()],
+            consumer_group: "sandbox".into(),
+            consumer_id: "reconn".into(),
+        })
+        .await
+        .unwrap();
     let mut stream = resp.into_inner();
 
     // Append a new record — should still receive in real-time
     c.append(pb::AppendRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_type: "tool.call".into(), content: b"after-reconnect".to_vec(),
+        namespace: "test".into(),
+        stream: "main".into(),
+        event_type: "tool.call".into(),
+        content: b"after-reconnect".to_vec(),
         ..Default::default()
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
     let dl = tokio::time::Instant::now() + Duration::from_secs(3);
-    let rec = tokio::time::timeout_at(dl, stream.message()).await.unwrap().unwrap().unwrap();
+    let rec = tokio::time::timeout_at(dl, stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(rec.event_type, "tool.call");
     assert_eq!(rec.content, b"after-reconnect");
 
@@ -1945,36 +2039,55 @@ async fn subscribe_replays_missed_records_from_offset() {
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
     let tracker = Arc::new(ConsumerTracker::new(None));
-    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        ..Default::default()
+    };
     let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
-        &cache_config, Arc::clone(&hub),
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+        Arc::clone(&hub),
     ));
     indexer.clone().start();
 
     // Write 5 tool.call records before subscribing
     {
         let log_svc = LogDbServiceImpl::new(
-            Arc::clone(&storage), Arc::clone(&catalog), Arc::clone(&tracker),
-            Arc::clone(&hub), "replay-svc".into(), "primary".into(), cache_dir.clone(),
+            Arc::clone(&storage),
+            Arc::clone(&catalog),
+            Arc::clone(&tracker),
+            Arc::clone(&hub),
+            "replay-svc".into(),
+            "primary".into(),
+            cache_dir.clone(),
         );
         let svc = LogDbServiceServer::new(log_svc);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            Server::builder().add_service(svc)
-                .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+            Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+        let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+            .await
+            .unwrap();
         for i in 0..5u64 {
             c.append(pb::AppendRequest {
-                namespace: "test".into(), stream: "main".into(),
+                namespace: "test".into(),
+                stream: "main".into(),
                 event_type: "tool.call".into(),
                 content: format!("tool-{}", i).into_bytes(),
                 ..Default::default()
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
         wait_for_indexer(&indexer, 5, 5000).await;
 
@@ -1984,24 +2097,39 @@ async fn subscribe_replays_missed_records_from_offset() {
 
     // New subscribe — should replay seq 3, 4, 5 via replay phase
     let log_svc = LogDbServiceImpl::new(
-        Arc::clone(&storage), Arc::clone(&catalog), Arc::clone(&tracker),
-        Arc::clone(&hub), "replay-svc2".into(), "primary".into(), cache_dir,
+        Arc::clone(&storage),
+        Arc::clone(&catalog),
+        Arc::clone(&tracker),
+        Arc::clone(&hub),
+        "replay-svc2".into(),
+        "primary".into(),
+        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        Server::builder().add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
-    let resp = c.subscribe(pb::SubscribeRequest {
-        namespace: "test".into(), stream: "main".into(),
-        event_types: vec!["tool.call".into()],
-        consumer_group: "sandbox".into(), consumer_id: "lagging-consumer".into(),
-    }).await.unwrap();
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+    let resp = c
+        .subscribe(pb::SubscribeRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_types: vec!["tool.call".into()],
+            consumer_group: "sandbox".into(),
+            consumer_id: "lagging-consumer".into(),
+        })
+        .await
+        .unwrap();
     let mut stream = resp.into_inner();
 
     // Should receive the 3 missed records (seq 3, 4, 5), not seq 1,2
@@ -2016,7 +2144,11 @@ async fn subscribe_replays_missed_records_from_offset() {
 
     assert_eq!(received.len(), 3, "should replay exactly 3 missed records");
     for r in &received {
-        assert!(r.seq >= 3, "replayed seq must be >= 3 (missed), got {}", r.seq);
+        assert!(
+            r.seq >= 3,
+            "replayed seq must be >= 3 (missed), got {}",
+            r.seq
+        );
         assert_eq!(r.event_type, "tool.call");
     }
 
@@ -2043,38 +2175,58 @@ async fn subscribe_concurrent_stress() {
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
     let tracker = Arc::new(ConsumerTracker::new(None));
-    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        ..Default::default()
+    };
     let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
-        &cache_config, Arc::clone(&hub),
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+        Arc::clone(&hub),
     ));
     indexer.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
-        Arc::clone(&storage), Arc::clone(&catalog), Arc::clone(&tracker),
-        Arc::clone(&hub), "stress".into(), "primary".into(), cache_dir,
+        Arc::clone(&storage),
+        Arc::clone(&catalog),
+        Arc::clone(&tracker),
+        Arc::clone(&hub),
+        "stress".into(),
+        "primary".into(),
+        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        Server::builder().add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 5 concurrent subscribers
-    let mut handles = Vec::new(); 
+    let mut handles = Vec::new();
     for i in 0..5 {
         let addr = addr.clone();
         handles.push(tokio::spawn(async move {
-            let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
-            let resp = c.subscribe(pb::SubscribeRequest {
-                namespace: "test".into(), stream: "main".into(),
-                event_types: vec!["tool.call".into()],
-                consumer_group: "stress-group".into(),
-                consumer_id: format!("w-{}", i),
-            }).await.unwrap();
+            let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+                .await
+                .unwrap();
+            let resp = c
+                .subscribe(pb::SubscribeRequest {
+                    namespace: "test".into(),
+                    stream: "main".into(),
+                    event_types: vec!["tool.call".into()],
+                    consumer_group: "stress-group".into(),
+                    consumer_id: format!("w-{}", i),
+                })
+                .await
+                .unwrap();
             let mut stream = resp.into_inner();
             let mut seqs = Vec::new();
             let dl = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -2083,7 +2235,9 @@ async fn subscribe_concurrent_stress() {
                     Ok(Ok(Some(msg))) => {
                         assert_eq!(msg.event_type, "tool.call");
                         seqs.push(msg.seq);
-                        if seqs.len() >= 20 { break; }
+                        if seqs.len() >= 20 {
+                            break;
+                        }
                     }
                     _ => break,
                 }
@@ -2096,14 +2250,20 @@ async fn subscribe_concurrent_stress() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Publish 20 tool.call records from a separate client
-    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
     for i in 0..20u64 {
-        admin.append(pb::AppendRequest {
-            namespace: "test".into(), stream: "main".into(),
-            event_type: "tool.call".into(),
-            content: format!("tc-{}", i).into_bytes(),
-            ..Default::default()
-        }).await.unwrap();
+        admin
+            .append(pb::AppendRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                event_type: "tool.call".into(),
+                content: format!("tc-{}", i).into_bytes(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
     }
     // Ensure Indexer has caught up
     wait_for_indexer(&indexer, 20, 8000).await;
@@ -2111,7 +2271,11 @@ async fn subscribe_concurrent_stress() {
     // Collect results from all subscribers
     for h in handles {
         let seqs = h.await.unwrap();
-        assert_eq!(seqs.len(), 20, "each subscriber must receive all 20 records");
+        assert_eq!(
+            seqs.len(),
+            20,
+            "each subscriber must receive all 20 records"
+        );
         // Verify no duplicates within one subscriber
         let mut sorted = seqs.clone();
         sorted.sort();
@@ -2141,39 +2305,58 @@ async fn subscribe_100_concurrent_subscribers_stress() {
     let catalog = test_catalog(&data_dir);
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
-    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        ..Default::default()
+    };
     let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
-        &cache_config, Arc::clone(&hub),
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+        Arc::clone(&hub),
     ));
     indexer.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
-        Arc::clone(&storage), Arc::clone(&catalog),
+        Arc::clone(&storage),
+        Arc::clone(&catalog),
         Arc::new(ConsumerTracker::new(None)),
-        Arc::clone(&hub), "stress-100".into(), "primary".into(), cache_dir,
+        Arc::clone(&hub),
+        "stress-100".into(),
+        "primary".into(),
+        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        Server::builder().add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 100 subscribers
-    let mut handles = Vec::new(); 
+    let mut handles = Vec::new();
     for i in 0..100 {
         let addr = addr.clone();
         handles.push(tokio::spawn(async move {
-            let mut c = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
-            let resp = c.subscribe(pb::SubscribeRequest {
-                namespace: "test".into(), stream: "main".into(),
-                event_types: vec!["bench.event".into()],
-                consumer_group: "load-test".into(),
-                consumer_id: format!("sub-{}", i),
-            }).await.unwrap();
+            let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+                .await
+                .unwrap();
+            let resp = c
+                .subscribe(pb::SubscribeRequest {
+                    namespace: "test".into(),
+                    stream: "main".into(),
+                    event_types: vec!["bench.event".into()],
+                    consumer_group: "load-test".into(),
+                    consumer_id: format!("sub-{}", i),
+                })
+                .await
+                .unwrap();
             let mut stream = resp.into_inner();
             let mut seqs = Vec::new();
             let dl = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -2193,14 +2376,20 @@ async fn subscribe_100_concurrent_subscribers_stress() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Publish 50 records
-    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
     for i in 0..50u64 {
-        admin.append(pb::AppendRequest {
-            namespace: "test".into(), stream: "main".into(),
-            event_type: "bench.event".into(),
-            content: format!("data-{}", i).into_bytes(),
-            ..Default::default()
-        }).await.unwrap();
+        admin
+            .append(pb::AppendRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                event_type: "bench.event".into(),
+                content: format!("data-{}", i).into_bytes(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
     }
     wait_for_indexer(&indexer, 50, 10000).await;
 
@@ -2208,7 +2397,11 @@ async fn subscribe_100_concurrent_subscribers_stress() {
     let mut total_recv = 0u64;
     for h in handles {
         let seqs = h.await.unwrap();
-        assert_eq!(seqs.len(), 50, "each subscriber must receive all 50 records");
+        assert_eq!(
+            seqs.len(),
+            50,
+            "each subscriber must receive all 50 records"
+        );
         assert_eq!(seqs[0], 1);
         assert_eq!(seqs[49], 50);
         total_recv += 1;
@@ -2243,10 +2436,16 @@ async fn subscribe_500_subs_replay_stress() {
     let catalog = test_catalog(&data_dir);
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
-    let cache_config = logdbd::config::CacheConfig { dir: cache_dir.clone(), ..Default::default() };
+    let cache_config = logdbd::config::CacheConfig {
+        dir: cache_dir.clone(),
+        ..Default::default()
+    };
     let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(), Arc::clone(&catalog), cache_dir.clone(),
-        &cache_config, Arc::clone(&hub),
+        storage.db_arc(),
+        Arc::clone(&catalog),
+        cache_dir.clone(),
+        &cache_config,
+        Arc::clone(&hub),
     ));
     indexer.clone().start();
 
@@ -2255,13 +2454,23 @@ async fn subscribe_500_subs_replay_stress() {
     let (ns_id, stream_id) = catalog.resolve("test", "main").unwrap();
 
     for i in 0..200u64 {
-        storage.append(
-            ns_id, stream_id, "replay.event", "text/plain",
-            &BTreeMap::new(), i, format!("r-{}", i).as_bytes(),
-        ).unwrap();
+        storage
+            .append(
+                ns_id,
+                stream_id,
+                "replay.event",
+                "text/plain",
+                &BTreeMap::new(),
+                i,
+                format!("r-{}", i).as_bytes(),
+            )
+            .unwrap();
     }
     storage.flush().unwrap();
-    eprintln!("[stress-500] wrote 200 records in {:?}", Instant::now().duration_since(t0));
+    eprintln!(
+        "[stress-500] wrote 200 records in {:?}",
+        Instant::now().duration_since(t0)
+    );
 
     // Wait for Indexer
     wait_for_indexer(&indexer, 200, 30000).await;
@@ -2269,15 +2478,23 @@ async fn subscribe_500_subs_replay_stress() {
     // Start server for subscriber connections
     let tracker = Arc::new(ConsumerTracker::new(None));
     let log_svc = LogDbServiceImpl::new(
-        Arc::clone(&storage), Arc::clone(&catalog), tracker,
-        Arc::clone(&hub), "stress-500".into(), "primary".into(), cache_dir,
+        Arc::clone(&storage),
+        Arc::clone(&catalog),
+        tracker,
+        Arc::clone(&hub),
+        "stress-500".into(),
+        "primary".into(),
+        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        Server::builder().add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2291,18 +2508,25 @@ async fn subscribe_500_subs_replay_stress() {
             let mut c = None;
             for attempt in 0..5 {
                 match LogDbServiceClient::connect(format!("http://{}", addr)).await {
-                    Ok(client) => { c = Some(client); break; }
+                    Ok(client) => {
+                        c = Some(client);
+                        break;
+                    }
                     Err(_) if attempt < 4 => tokio::time::sleep(Duration::from_millis(50)).await,
                     Err(_) => return 0u64,
                 }
             }
             let mut c = c.unwrap();
-            let resp = match c.subscribe(pb::SubscribeRequest {
-                namespace: "test".into(), stream: "main".into(),
-                event_types: vec!["replay.event".into()],
-                consumer_group: "stress-200".into(),
-                consumer_id: format!("s-{}", i),
-            }).await {
+            let resp = match c
+                .subscribe(pb::SubscribeRequest {
+                    namespace: "test".into(),
+                    stream: "main".into(),
+                    event_types: vec!["replay.event".into()],
+                    consumer_group: "stress-200".into(),
+                    consumer_id: format!("s-{}", i),
+                })
+                .await
+            {
                 Ok(r) => r,
                 Err(_) => return 0u64,
             };
@@ -2321,23 +2545,38 @@ async fn subscribe_500_subs_replay_stress() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Publish 100 more via gRPC → broadcast channel
-    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+    let mut admin = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
     for i in 0..100u64 {
-        admin.append(pb::AppendRequest {
-            namespace: "test".into(), stream: "main".into(),
-            event_type: "replay.event".into(),
-            content: format!("live-{}", i).into_bytes(),
-            ..Default::default()
-        }).await.unwrap();
+        admin
+            .append(pb::AppendRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                event_type: "replay.event".into(),
+                content: format!("live-{}", i).into_bytes(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
     }
     wait_for_indexer(&indexer, 300, 15000).await;
-    eprintln!("[stress-500] published + indexed in {:?}", Instant::now().duration_since(t1));
+    eprintln!(
+        "[stress-500] published + indexed in {:?}",
+        Instant::now().duration_since(t1)
+    );
 
     let mut completed = 0u64;
     for h in handles {
-        if h.await.unwrap() == 300 { completed += 1; }
+        if h.await.unwrap() == 300 {
+            completed += 1;
+        }
     }
-    eprintln!("[stress-500] {}/500 completed in {:?}", completed, t0.elapsed());
+    eprintln!(
+        "[stress-500] {}/500 completed in {:?}",
+        completed,
+        t0.elapsed()
+    );
 
     // NOTE: replay currently uses storage.scan() O(n) per subscriber.
     // Switching replay to SQLite query cache would scale this to 500/500.

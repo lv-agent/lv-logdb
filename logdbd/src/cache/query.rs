@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{Connection, params_from_iter};
 
 /// Error returned by query execution.
 #[derive(Debug)]
@@ -55,8 +55,7 @@ pub fn replay_records(
 
     let conn = Connection::open_with_flags(
         db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(QueryError::Sqlite)?;
 
@@ -109,8 +108,7 @@ pub fn replay_records(
 pub fn execute_query(db_path: &Path, sql: &str) -> Result<Vec<String>, QueryError> {
     let conn = Connection::open_with_flags(
         db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(QueryError::Sqlite)?;
 
@@ -266,8 +264,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = setup_test_db(dir.path());
 
-        let rows =
-            execute_query(&db_path, "SELECT seq FROM records ORDER BY seq LIMIT 2").unwrap();
+        let rows = execute_query(&db_path, "SELECT seq FROM records ORDER BY seq LIMIT 2").unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -313,8 +310,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = setup_test_db(dir.path());
 
-        let err =
-            execute_query(&db_path, "DELETE FROM records WHERE seq = 1").unwrap_err();
+        let err = execute_query(&db_path, "DELETE FROM records WHERE seq = 1").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("readonly") || msg.contains("READONLY"),
@@ -328,11 +324,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = setup_test_db(dir.path());
 
-        let err = execute_query(
-            &db_path,
-            "UPDATE records SET deleted = 1 WHERE seq = 1",
-        )
-        .unwrap_err();
+        let err =
+            execute_query(&db_path, "UPDATE records SET deleted = 1 WHERE seq = 1").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("readonly") || msg.contains("READONLY"),
@@ -382,6 +375,9 @@ mod tests {
 
         let rows = execute_query(&db_path, "SELECT content FROM records WHERE seq = 1").unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].contains("null"), "NULL content should serialize as null");
+        assert!(
+            rows[0].contains("null"),
+            "NULL content should serialize as null"
+        );
     }
 }

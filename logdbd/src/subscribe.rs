@@ -46,12 +46,10 @@ impl SubscribeHub {
     /// matches the given set.
     pub fn subscribe(&self, stream_id: u64, event_types: HashSet<String>) -> SubscribeHandle {
         let mut map = self.senders.write().unwrap_or_else(|e| e.into_inner());
-        let sender = map
-            .entry(stream_id)
-            .or_insert_with(|| {
-                let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-                tx
-            });
+        let sender = map.entry(stream_id).or_insert_with(|| {
+            let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+            tx
+        });
         let receiver = sender.subscribe();
         SubscribeHandle {
             receiver,
@@ -108,13 +106,10 @@ mod tests {
         // Subscribe first to create the channel, then publish
         let mut handle = hub.subscribe(42, ets);
         hub.publish(42, &make_record(42, 1, "tool.call"));
-        let rec = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle.next_matching(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let rec = tokio::time::timeout(std::time::Duration::from_secs(1), handle.next_matching())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.event_type, "tool.call");
         assert_eq!(rec.seq, 1);
     }
@@ -128,13 +123,10 @@ mod tests {
         // Publish non-matching, then matching
         hub.publish(1, &make_record(1, 1, "user.input"));
         hub.publish(1, &make_record(1, 2, "tool.call"));
-        let rec = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle.next_matching(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let rec = tokio::time::timeout(std::time::Duration::from_secs(1), handle.next_matching())
+            .await
+            .unwrap()
+            .unwrap();
         // Should skip "user.input" and get "tool.call"
         assert_eq!(rec.event_type, "tool.call");
         assert_eq!(rec.seq, 2);
@@ -183,22 +175,16 @@ mod tests {
         hub.publish(1, &make_record(1, 1, "tool.call"));
         hub.publish(2, &make_record(2, 1, "tool.call"));
 
-        let r1 = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle_s1.next_matching(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let r1 = tokio::time::timeout(std::time::Duration::from_secs(1), handle_s1.next_matching())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(r1.stream_id, 1);
 
-        let r2 = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle_s2.next_matching(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let r2 = tokio::time::timeout(std::time::Duration::from_secs(1), handle_s2.next_matching())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(r2.stream_id, 2);
     }
 

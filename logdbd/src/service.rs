@@ -631,7 +631,9 @@ impl LogDbService for LogDbServiceImpl {
         let consumer_id = r.consumer_id.clone();
 
         // Get last committed offset — where to resume from
-        let last_committed = self.consumer_tracker.get(&ns, &stream, &group, &consumer_id);
+        let last_committed = self
+            .consumer_tracker
+            .get(&ns, &stream, &group, &consumer_id);
 
         // Clone what we need for the spawned task
         let storage = Arc::clone(&self.storage);
@@ -666,8 +668,7 @@ impl LogDbService for LogDbServiceImpl {
                     match storage.scan(0, u64::MAX) {
                         Ok(all) => {
                             for rec in all {
-                                if rec.seq > last_committed
-                                    && event_types.contains(&rec.event_type)
+                                if rec.seq > last_committed && event_types.contains(&rec.event_type)
                                 {
                                     let pb_rec = pb::Record {
                                         namespace_id: rec.namespace_id,
@@ -716,7 +717,8 @@ impl LogDbService for LogDbServiceImpl {
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(
-                            ns = ns, stream = stream,
+                            ns = ns,
+                            stream = stream,
                             skipped = n,
                             "subscribe client lagging, records skipped"
                         );
@@ -729,6 +731,8 @@ impl LogDbService for LogDbServiceImpl {
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }

@@ -10,5 +10,5 @@ pub mod query;
 pub mod snapshot;
 
 pub use indexer::Indexer;
-pub use query::execute_query;
+pub use query::{execute_query, replay_records};
 pub use snapshot::{cleanup_snapshots, create_snapshot, recover_or_create};

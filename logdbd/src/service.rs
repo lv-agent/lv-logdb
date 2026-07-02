@@ -616,7 +616,7 @@ impl LogDbService for LogDbServiceImpl {
         req: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let r = req.get_ref();
-        let (_ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
+        let (ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 
         let event_types: std::collections::HashSet<String> =
             r.event_types.iter().cloned().collect();
@@ -638,34 +638,59 @@ impl LogDbService for LogDbServiceImpl {
         let hub = Arc::clone(&self.subscribe_hub);
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
+        let db_name = crate::cache::indexer::db_filename(&ns, &stream);
+        let db_path = self.cache_dir.join(db_name);
+
         tokio::spawn(async move {
-            // Phase 1: replay missed records (seq > last_committed)
-            {
-                match storage.scan(0, u64::MAX) {
-                    Ok(all) => {
-                        for rec in all {
-                            if rec.seq > last_committed && event_types.contains(&rec.event_type) {
-                                let pb_rec = pb::Record {
-                                    namespace_id: rec.namespace_id,
-                                    stream_id: rec.stream_id,
-                                    seq: rec.seq,
-                                    event_type: rec.event_type.clone(),
-                                    timestamp_ns: rec.timestamp_ns,
-                                    content_type: rec.content_type.clone(),
-                                    metadata: crate::service::to_hashmap(&rec.metadata),
-                                    content: rec.user_content.clone(),
-                                };
-                                if tx.send(Ok(pb_rec)).await.is_err() {
-                                    return; // client disconnected
+            // Phase 1: replay missed records from SQLite cache (fast) or segment (fallback)
+            match crate::cache::replay_records(&db_path, last_committed, &event_types) {
+                Ok(records) => {
+                    for rec in records {
+                        let pb_rec = pb::Record {
+                            namespace_id: ns_id,
+                            stream_id,
+                            seq: rec.seq,
+                            event_type: rec.event_type.clone(),
+                            timestamp_ns: rec.ts_ns,
+                            content_type: rec.content_type.clone(),
+                            metadata: crate::service::to_hashmap(&rec.metadata),
+                            content: rec.content.clone(),
+                        };
+                        if tx.send(Ok(pb_rec)).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Fallback: segment scan
+                    match storage.scan(0, u64::MAX) {
+                        Ok(all) => {
+                            for rec in all {
+                                if rec.seq > last_committed
+                                    && event_types.contains(&rec.event_type)
+                                {
+                                    let pb_rec = pb::Record {
+                                        namespace_id: rec.namespace_id,
+                                        stream_id: rec.stream_id,
+                                        seq: rec.seq,
+                                        event_type: rec.event_type.clone(),
+                                        timestamp_ns: rec.timestamp_ns,
+                                        content_type: rec.content_type.clone(),
+                                        metadata: crate::service::to_hashmap(&rec.metadata),
+                                        content: rec.user_content.clone(),
+                                    };
+                                    if tx.send(Ok(pb_rec)).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!("replay scan: {}", e))))
-                            .await;
-                        return;
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Status::internal(format!("replay: {}", e))))
+                                .await;
+                            return;
+                        }
                     }
                 }
             }

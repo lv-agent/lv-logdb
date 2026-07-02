@@ -4,9 +4,10 @@
 //! rejects any write (INSERT, UPDATE, DELETE, DROP, etc.) at the engine level —
 //! stronger than string-based prefix checks.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{params_from_iter, Connection};
 
 /// Error returned by query execution.
 #[derive(Debug)]
@@ -23,6 +24,82 @@ impl std::fmt::Display for QueryError {
 }
 
 impl std::error::Error for QueryError {}
+
+/// A record queried from the cache for replay.
+#[derive(Debug)]
+pub struct ReplayRecord {
+    pub seq: u64,
+    pub gid: u64,
+    pub ts_ns: u64,
+    pub event_type: String,
+    pub content_type: String,
+    pub metadata: BTreeMap<String, String>,
+    pub content: Vec<u8>,
+}
+
+/// Replay records from the SQLite cache for Subscribe catch-up.
+///
+/// Much faster than segment scan — uses the primary key index.
+/// Falls back gracefully: returns an empty vec if the db doesn't exist yet.
+pub fn replay_records(
+    db_path: &Path,
+    last_seq: u64,
+    event_types: &HashSet<String>,
+) -> Result<Vec<ReplayRecord>, QueryError> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    if event_types.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(QueryError::Sqlite)?;
+
+    let placeholders: Vec<String> = event_types.iter().map(|_| "?".to_string()).collect();
+    let sql = format!(
+        "SELECT seq, gid, ts_ns, event_type, content_type, metadata_json, content
+         FROM records
+         WHERE seq > ?1 AND event_type IN ({})
+           AND deleted = 0 AND event_type != 'logdb.tombstone'
+         ORDER BY seq",
+        placeholders.join(",")
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    params.push(Box::new(last_seq as i64));
+    for et in event_types {
+        params.push(Box::new(et.clone()));
+    }
+
+    let mut stmt = conn.prepare(&sql).map_err(QueryError::Sqlite)?;
+    let rows = stmt
+        .query_map(params_from_iter(params.iter().map(|p| p.as_ref())), |row| {
+            let meta_str: String = row.get(5)?;
+            let metadata: BTreeMap<String, String> =
+                serde_json::from_str(&meta_str).unwrap_or_default();
+            Ok(ReplayRecord {
+                seq: row.get::<_, i64>(0)? as u64,
+                gid: row.get::<_, i64>(1)? as u64,
+                ts_ns: row.get::<_, i64>(2)? as u64,
+                event_type: row.get(3)?,
+                content_type: row.get(4)?,
+                metadata,
+                content: row.get(6)?,
+            })
+        })
+        .map_err(QueryError::Sqlite)?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(QueryError::Sqlite)?);
+    }
+    Ok(results)
+}
 
 /// Execute a read-only SQL statement against a db file.
 /// Returns rows as JSON strings.

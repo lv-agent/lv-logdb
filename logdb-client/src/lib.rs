@@ -21,7 +21,7 @@ mod record;
 pub use client::{Client, ClientBuilder, TailOptions};
 pub use record::RecordExt;
 
-use logdbd::pb;
+use logdbd_proto::pb;
 
 /// A decoded record from logdbd.
 pub type Record = pb::Record;

@@ -1,0 +1,15 @@
+[package]
+name = "logdbd-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Protobuf definitions for logdbd — the clustered audit log database"
+license = "Apache-2.0"
+repository = "https://github.com/lv-agent/lv-logdb"
+
+[dependencies]
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"

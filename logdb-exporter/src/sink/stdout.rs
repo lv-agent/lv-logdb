@@ -1,6 +1,6 @@
 use crate::sink::Sink;
 use base64::Engine;
-use logdbd::pb::Record;
+use logdbd_proto::pb::Record;
 
 pub struct StdoutSink;
 

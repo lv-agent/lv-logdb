@@ -1,4 +1,4 @@
-use logdbd::pb::Record;
+use logdbd_proto::pb::Record;
 
 pub trait Sink: Send {
     fn push(&mut self, records: &[Record]) -> Result<(), String>;

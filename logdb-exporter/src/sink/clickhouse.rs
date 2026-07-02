@@ -6,7 +6,7 @@
 use base64::Engine;
 use crate::config::ClickHouseConfig;
 use crate::sink::Sink;
-use logdbd::pb::Record;
+use logdbd_proto::pb::Record;
 use std::time::Duration;
 
 pub struct ClickHouseSink {

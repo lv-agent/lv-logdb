@@ -8,13 +8,13 @@ license = "Apache-2.0"
 repository = "https://github.com/lv-agent/lv-logdb"
 
 [dependencies]
-logdbd = { path = "../logdbd" }
+logdbd-proto = { path = "../logdbd-proto" }
 tonic = { version = "0.12", features = ["tls"] }
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
+logdbd = { path = "../logdbd" }
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
 tokio-stream = "0.1"
 tempfile = "3"
 logdb = { path = "../logdb" }
-logdbd = { path = "../logdbd" }

@@ -1143,6 +1143,7 @@ version = "0.1.0"
 dependencies = [
  "logdb",
  "logdbd",
+ "logdbd-proto",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1157,6 +1158,7 @@ dependencies = [
  "crc32c",
  "logdb",
  "logdbd",
+ "logdbd-proto",
  "reqwest",
  "serde",
  "serde_json",
@@ -1176,9 +1178,9 @@ dependencies = [
  "crc32c",
  "fs2",
  "logdb",
+ "logdbd-proto",
  "metrics",
  "metrics-exporter-prometheus",
- "prost",
  "rcgen",
  "serde",
  "serde_yaml",
@@ -1186,10 +1188,18 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-build",
  "tonic-health",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "logdbd-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

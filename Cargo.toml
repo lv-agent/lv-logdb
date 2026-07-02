@@ -9,5 +9,5 @@
 
 [workspace]
 resolver = "2"
-members = ["logdb", "logdbd", "logdb-exporter", "logdb-client"]
+members = ["logdb", "logdbd-proto", "logdbd", "logdb-exporter", "logdb-client"]
 exclude = ["logdb/fuzz"]

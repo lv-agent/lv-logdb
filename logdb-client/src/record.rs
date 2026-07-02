@@ -1,4 +1,4 @@
-use logdbd::pb::Record;
+use logdbd_proto::pb::Record;
 
 /// Extension methods for [`Record`].
 pub trait RecordExt {

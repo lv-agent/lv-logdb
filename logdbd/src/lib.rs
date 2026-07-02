@@ -1,6 +1,4 @@
-pub mod pb {
-    tonic::include_proto!("logdbd");
-}
+pub use logdbd_proto::pb;
 pub mod auth;
 pub mod catalog;
 pub mod config;

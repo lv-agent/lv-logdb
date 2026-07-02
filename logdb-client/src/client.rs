@@ -1,5 +1,5 @@
-use logdbd::pb::log_db_service_client::LogDbServiceClient;
-use logdbd::pb::*;
+use logdbd_proto::pb::log_db_service_client::LogDbServiceClient;
+use logdbd_proto::pb::*;
 use tonic::transport::Channel;
 
 /// Main client for logdbd.

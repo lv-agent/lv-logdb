@@ -1,8 +1,8 @@
 //! gRPC client for logdbd: connect, failover, Scan, Tail, GetWatermark.
 //! Supports TLS and mTLS via config.
 
-use logdbd::pb::log_db_service_client::LogDbServiceClient;
-use logdbd::pb::{ScanRequest, ScanResponse, TailRequest, TailResponse, GetWatermarkRequest, Watermark};
+use logdbd_proto::pb::log_db_service_client::LogDbServiceClient;
+use logdbd_proto::pb::{ScanRequest, ScanResponse, TailRequest, TailResponse, GetWatermarkRequest, Watermark};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use crate::config;

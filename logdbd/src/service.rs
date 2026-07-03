@@ -89,9 +89,10 @@ impl LogDbServiceImpl {
             if q.namespace == ns && q.stream == stream {
                 let db_name = crate::cache::indexer::db_filename(ns, stream);
                 let db_path = self.cache_dir.join(db_name);
-                if let Ok(rows) =
-                    crate::cache::execute_query(&db_path, "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(content)), 0) AS total_bytes FROM records WHERE deleted = 0 AND event_type != 'logdb.tombstone'")
-                {
+                if let Ok(rows) = crate::cache::execute_query(
+                    &db_path,
+                    "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(content)), 0) AS total_bytes FROM records WHERE deleted = 0 AND event_type != 'logdb.tombstone'",
+                ) {
                     if let Some(row) = rows.first() {
                         // Simple parse: first number is COUNT, second is total_bytes
                         // JSON row looks like: {"cnt":42,"total_bytes":12345}
@@ -849,7 +850,9 @@ impl LogDbService for LogDbServiceImpl {
                 "UPDATE records SET deleted = 1 WHERE deleted = 0 AND event_type != 'logdb.tombstone'",
                 [],
             ).map_err(|e| Status::internal(e.to_string()))? as u64
-        } else { 0 };
+        } else {
+            0
+        };
         Ok(Response::new(pb::DeleteStreamResponse {
             deleted: true,
             deleted_count: deleted,

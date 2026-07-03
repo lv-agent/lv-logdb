@@ -281,7 +281,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             repl_svc,
             interceptor.clone(),
         ))
-        .add_service(SnapshotServiceServer::with_interceptor(snap_svc, interceptor))
+        .add_service(SnapshotServiceServer::with_interceptor(
+            snap_svc,
+            interceptor,
+        ))
         .add_service(health_svc);
 
     let db_for_drain = storage.db_arc();

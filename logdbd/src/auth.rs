@@ -85,8 +85,9 @@ impl Interceptor for AuthInterceptor {
 
         match self.tokens.get(got) {
             Some(roles) => {
-                req.extensions_mut()
-                    .insert(AuthContext { roles: roles.clone() });
+                req.extensions_mut().insert(AuthContext {
+                    roles: roles.clone(),
+                });
                 Ok(req)
             }
             None => Err(Status::unauthenticated("missing or invalid auth token")),

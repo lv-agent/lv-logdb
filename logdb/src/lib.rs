@@ -2442,7 +2442,11 @@ mod tests {
         // Only records at or after the checkpoint should still be visible.
         let surviving = all_ids.iter().filter(|&&id| id >= cp).count() + more_ids.len();
         for attempt in 0..50 {
-            let count = db.scan(cp, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+            let count = db
+                .scan(cp, u64::MAX)
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .count();
             if count >= surviving {
                 break;
             }

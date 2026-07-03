@@ -168,10 +168,7 @@ async fn cmd_append(
 async fn cmd_checkpoint(
     client: &mut LogDbServiceClient<tonic::transport::Channel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let status = client
-        .status(StatusRequest {})
-        .await?
-        .into_inner();
+    let status = client.status(StatusRequest {}).await?.into_inner();
     let seq = status.durable_sequence;
     client
         .checkpoint(CheckpointRequest { sequence: seq })
@@ -185,10 +182,7 @@ async fn cmd_backup(
     client: &mut LogDbServiceClient<tonic::transport::Channel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Advance checkpoint to current durable position
-    let status = client
-        .status(StatusRequest {})
-        .await?
-        .into_inner();
+    let status = client.status(StatusRequest {}).await?.into_inner();
     let seq = status.durable_sequence;
     client
         .checkpoint(CheckpointRequest { sequence: seq })

@@ -78,20 +78,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TLS
     let tls_config = load_server_tls(&config)?;
 
-    // Auth token — fail if token_file is configured but unreadable (P1-6 fix)
-    let auth_token: Option<String> = match config.server.auth.token_file.as_ref() {
-        Some(p) => {
-            let token = std::fs::read_to_string(p)
-                .map_err(|e| format!("cannot read auth token_file {p}: {e}"))?;
-            if token.trim().is_empty() {
-                return Err(format!("auth token_file {p} is empty").into());
-            }
-            Some(token.trim().to_string())
+    // Auth token entries — RBAC with roles
+    let mut token_entries: Vec<logdbd::auth::TokenEntry> = Vec::new();
+
+    // Legacy single-token support (admin role)
+    if let Some(ref p) = config.server.auth.token_file {
+        let token = std::fs::read_to_string(p)
+            .map_err(|e| format!("cannot read auth token_file {p}: {e}"))?;
+        if token.trim().is_empty() {
+            return Err(format!("auth token_file {p} is empty").into());
         }
-        None => std::env::var("LOGDBD_AUTH_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty()),
-    };
+        token_entries.push(logdbd::auth::TokenEntry {
+            token: token.trim().to_string(),
+            roles: vec![logdbd::auth::Role::Admin],
+        });
+    }
+    if let Ok(t) = std::env::var("LOGDBD_AUTH_TOKEN") {
+        if !t.is_empty() {
+            token_entries.push(logdbd::auth::TokenEntry {
+                token: t,
+                roles: vec![logdbd::auth::Role::Admin],
+            });
+        }
+    }
+
+    // New multi-token RBAC
+    for tc in &config.server.auth.tokens {
+        let roles: Vec<logdbd::auth::Role> = tc
+            .roles
+            .iter()
+            .filter_map(|r| logdbd::auth::Role::from_str(r))
+            .collect();
+        if roles.is_empty() {
+            return Err(format!("token '{}' has no valid roles", tc.token).into());
+        }
+        token_entries.push(logdbd::auth::TokenEntry {
+            token: tc.token.clone(),
+            roles,
+        });
+    }
+
+    let auth_enabled = !token_entries.is_empty();
 
     let _tls_ca: Option<Vec<u8>> = match config.server.tls.ca_file.as_ref() {
         Some(p) => {
@@ -134,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         role = %config.node.role,
         epoch = config.node.epoch,
         tls = tls_enabled,
-        auth = auth_token.is_some(),
+        auth = auth_enabled,
         standbys = config.replication.standbys.len(),
         "logdbd starting"
     );
@@ -232,28 +259,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    let interceptor = auth_token.as_ref().map(|t| AuthInterceptor::new(t));
+    let interceptor = if auth_enabled {
+        logdbd::auth::AnyInterceptor::Auth(AuthInterceptor::new(&token_entries))
+    } else {
+        logdbd::auth::AnyInterceptor::NoAuth(logdbd::auth::NoAuthInterceptor)
+    };
 
     let mut builder = Server::builder();
     if let Some(tls) = tls_config {
         builder = builder.tls_config(tls)?;
     }
 
-    let server = match interceptor {
-        Some(i) => builder
-            .add_service(LogDbServiceServer::with_interceptor(log_svc, i.clone()))
-            .add_service(ReplicationServiceServer::with_interceptor(
-                repl_svc,
-                i.clone(),
-            ))
-            .add_service(SnapshotServiceServer::with_interceptor(snap_svc, i))
-            .add_service(health_svc),
-        None => builder
-            .add_service(LogDbServiceServer::new(log_svc))
-            .add_service(ReplicationServiceServer::new(repl_svc))
-            .add_service(SnapshotServiceServer::new(snap_svc))
-            .add_service(health_svc),
-    };
+    let server = builder
+        .add_service(LogDbServiceServer::with_interceptor(
+            log_svc,
+            interceptor.clone(),
+        ))
+        .add_service(ReplicationServiceServer::with_interceptor(
+            repl_svc,
+            interceptor.clone(),
+        ))
+        .add_service(SnapshotServiceServer::with_interceptor(snap_svc, interceptor))
+        .add_service(health_svc);
 
     let db_for_drain = storage.db_arc();
     let idx_for_drain = Arc::clone(&cache_indexer);

@@ -76,6 +76,7 @@ impl LogDbService for LogDbServiceImpl {
         &self,
         req: Request<pb::AppendRequest>,
     ) -> Result<Response<pb::AppendResponse>, Status> {
+        crate::auth::require_role(&req, crate::auth::Role::Writer)?;
         self.check_write()?;
         let r = req.get_ref();
 
@@ -182,6 +183,7 @@ impl LogDbService for LogDbServiceImpl {
         &self,
         req: Request<pb::ReadRequest>,
     ) -> Result<Response<pb::ReadResponse>, Status> {
+        crate::auth::require_role(&req, crate::auth::Role::Reader)?;
         let r = req.get_ref();
         let (_ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 
@@ -591,6 +593,7 @@ impl LogDbService for LogDbServiceImpl {
         &self,
         req: Request<pb::QueryRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
+        crate::auth::require_role(&req, crate::auth::Role::Reader)?;
         let r = req.get_ref();
 
         // Validate namespace + stream exist
@@ -615,6 +618,7 @@ impl LogDbService for LogDbServiceImpl {
         &self,
         req: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        crate::auth::require_role(&req, crate::auth::Role::Subscriber)?;
         let r = req.get_ref();
         let (ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 

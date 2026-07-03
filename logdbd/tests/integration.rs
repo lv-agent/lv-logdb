@@ -532,7 +532,8 @@ async fn start_server_with_auth(token: &str) -> (SocketAddr, tempfile::TempDir) 
         "primary".into(),
         PathBuf::from("/tmp"),
     );
-    let interceptor = AuthInterceptor::new(token);
+    let token_entry = logdbd::auth::TokenEntry { token: token.to_string(), roles: vec![logdbd::auth::Role::Admin] };
+    let interceptor = AuthInterceptor::new(&[token_entry]);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

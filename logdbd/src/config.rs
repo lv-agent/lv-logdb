@@ -125,6 +125,20 @@ pub struct AuthConfig {
     pub r#type: AuthType,
     #[serde(default)]
     pub token_file: Option<String>,
+    #[serde(default)]
+    pub tokens: Vec<TokenConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenConfig {
+    pub token: String,
+    #[serde(default = "default_token_roles")]
+    pub roles: Vec<String>,
+}
+
+fn default_token_roles() -> Vec<String> {
+    vec!["admin".into()]
 }
 
 fn default_auth_type() -> AuthType {
@@ -136,6 +150,7 @@ impl Default for AuthConfig {
         Self {
             r#type: AuthType::Token,
             token_file: None,
+            tokens: vec![],
         }
     }
 }

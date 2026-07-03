@@ -105,7 +105,25 @@ while let Some(rec) = stream.message().await? {
 | `verify_chain(ns, stream, from, to)` | Verify hash chain |
 | `commit_offset(...)` | Commit consumer offset |
 | `committed_offset(...)` | Get consumer offset |
+| `create_stream(ns, stream)` | Create namespace+stream (admin) |
+| `delete_stream(ns, stream)` | Soft-delete all records in stream (admin) |
 | `checkpoint(seq)` | Advance WAL checkpoint |
+
+## RBAC / Auth
+
+```rust
+// Token is passed via gRPC metadata. Set it on the client:
+use logdb_client::ClientBuilder;
+
+let mut client = ClientBuilder::new("logdbd.example.com:50051")
+    .auth_token("admin-secret-token")
+    .connect()
+    .await?;
+
+// Roles: admin (all), writer (append), reader (read/query), subscriber (subscribe)
+// RPCs are gated: append requires Writer, read/query requires Reader,
+// subscribe requires Subscriber, create/delete stream requires Admin.
+```
 
 ## License
 

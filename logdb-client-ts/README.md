@@ -62,6 +62,8 @@ sub.on('data', (rec) => {
 | `listStreams(ns)` | List streams in a namespace |
 | `status()` | Node status |
 | `verifyChain(ns, stream)` | Verify hash chain |
+| `createStream(ns, stream)` | Create a stream (admin) |
+| `deleteStream(ns, stream)` | Delete all records in a stream (admin) |
 | `commitOffset(...)` / `committedOffset(...)` | Consumer group offset management |
 
 ## TLS / mTLS
@@ -73,6 +75,17 @@ const client = new Client('logdbd.example.com:50051', {
   tlsCa: fs.readFileSync('/etc/certs/ca.crt'),
   tlsCert: fs.readFileSync('/etc/certs/client.crt'),  // mTLS
   tlsKey: fs.readFileSync('/etc/certs/client.key'),   // mTLS
+});
+```
+
+## RBAC / Auth
+
+Roles: `admin` (all), `writer` (append), `reader` (read/query), `subscriber` (subscribe).
+
+```typescript
+// Pass token via ClientOptions
+const client = new Client('logdbd.example.com:50051', {
+  authToken: 'admin-secret-token',
 });
 ```
 

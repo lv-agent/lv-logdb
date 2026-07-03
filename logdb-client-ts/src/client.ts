@@ -329,6 +329,26 @@ export class Client {
     });
   }
 
+  /** Create a stream (and namespace if needed). Requires admin token. */
+  createStream(namespace: string, stream: string): Promise<{ namespaceId: number; streamId: number; created: boolean }> {
+    return new Promise((resolve, reject) => {
+      this.client.CreateStream({ namespace, stream, maxRecords: 0, maxBytes: 0 }, (err: any, resp: any) => {
+        if (err) return reject(err);
+        resolve({ namespaceId: resp.namespaceId, streamId: resp.streamId, created: resp.created });
+      });
+    });
+  }
+
+  /** Mark all records in a stream as deleted. Requires admin token. */
+  deleteStream(namespace: string, stream: string): Promise<{ deleted: boolean; deletedCount: number }> {
+    return new Promise((resolve, reject) => {
+      this.client.DeleteStream({ namespace, stream }, (err: any, resp: any) => {
+        if (err) return reject(err);
+        resolve({ deleted: resp.deleted, deletedCount: Number(resp.deletedCount) });
+      });
+    });
+  }
+
   /** Close the client connection. */
   close(): void {
     if (!this.closed) {

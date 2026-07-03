@@ -9,6 +9,7 @@ pub struct Client {
     inner: LogDbServiceClient<Channel>,
     consumer_group: Option<String>,
     consumer_id: Option<String>,
+    auth_token: Option<String>,
 }
 
 impl Client {
@@ -24,6 +25,7 @@ impl Client {
             inner,
             consumer_group: None,
             consumer_id: None,
+            auth_token: None,
         })
     }
 
@@ -36,6 +38,11 @@ impl Client {
     pub fn set_consumer_group(&mut self, group: impl Into<String>, id: impl Into<String>) {
         self.consumer_group = Some(group.into());
         self.consumer_id = Some(id.into());
+    }
+
+    /// Set the Bearer auth token for all subsequent requests.
+    pub fn set_auth_token(&mut self, token: &str) {
+        self.auth_token = Some(token.to_string());
     }
 
     /// Get a reference to the underlying gRPC client.
@@ -337,6 +344,40 @@ impl Client {
             .await?;
         Ok(resp.into_inner().committed_seq)
     }
+
+    /// Create a stream (and namespace if needed). Requires admin role.
+    pub async fn create_stream(
+        &mut self,
+        namespace: &str,
+        stream: &str,
+    ) -> Result<CreateStreamResponse, tonic::Status> {
+        let resp = self
+            .inner
+            .create_stream(CreateStreamRequest {
+                namespace: namespace.into(),
+                stream: stream.into(),
+                max_records: 0,
+                max_bytes: 0,
+            })
+            .await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Mark all records in a stream as deleted. Requires admin role.
+    pub async fn delete_stream(
+        &mut self,
+        namespace: &str,
+        stream: &str,
+    ) -> Result<DeleteStreamResponse, tonic::Status> {
+        let resp = self
+            .inner
+            .delete_stream(DeleteStreamRequest {
+                namespace: namespace.into(),
+                stream: stream.into(),
+            })
+            .await?;
+        Ok(resp.into_inner())
+    }
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -345,6 +386,7 @@ pub struct ClientBuilder {
     addr: Option<String>,
     consumer_group: Option<String>,
     consumer_id: Option<String>,
+    auth_token: Option<String>,
 }
 
 impl ClientBuilder {
@@ -353,6 +395,7 @@ impl ClientBuilder {
             addr: None,
             consumer_group: None,
             consumer_id: None,
+            auth_token: None,
         }
     }
 
@@ -367,11 +410,19 @@ impl ClientBuilder {
         self
     }
 
+    pub fn auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
     pub async fn connect(self) -> Result<Client, tonic::transport::Error> {
         let addr = self.addr.unwrap_or_else(|| "127.0.0.1:50051".into());
         let mut client = Client::connect(&addr).await?;
         client.consumer_group = self.consumer_group;
         client.consumer_id = self.consumer_id;
+        if let Some(token) = self.auth_token {
+            client.set_auth_token(&token);
+        }
         Ok(client)
     }
 }

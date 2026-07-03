@@ -818,4 +818,41 @@ impl LogDbService for LogDbServiceImpl {
             rx,
         )))
     }
+
+    async fn create_stream(
+        &self,
+        req: Request<pb::CreateStreamRequest>,
+    ) -> Result<Response<pb::CreateStreamResponse>, Status> {
+        crate::auth::require_role(&req, crate::auth::Role::Admin)?;
+        let r = req.get_ref();
+        let (ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
+        Ok(Response::new(pb::CreateStreamResponse {
+            namespace_id: ns_id,
+            stream_id,
+            created: true,
+        }))
+    }
+
+    async fn delete_stream(
+        &self,
+        req: Request<pb::DeleteStreamRequest>,
+    ) -> Result<Response<pb::DeleteStreamResponse>, Status> {
+        crate::auth::require_role(&req, crate::auth::Role::Admin)?;
+        let r = req.get_ref();
+        let (_ns_id, _stream_id) = self.resolve(&r.namespace, &r.stream)?;
+        let db_name = crate::cache::indexer::db_filename(&r.namespace, &r.stream);
+        let db_path = self.cache_dir.join(db_name);
+        let deleted = if db_path.exists() {
+            let conn = rusqlite::Connection::open(&db_path)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            conn.execute(
+                "UPDATE records SET deleted = 1 WHERE deleted = 0 AND event_type != 'logdb.tombstone'",
+                [],
+            ).map_err(|e| Status::internal(e.to_string()))? as u64
+        } else { 0 };
+        Ok(Response::new(pb::DeleteStreamResponse {
+            deleted: true,
+            deleted_count: deleted,
+        }))
+    }
 }

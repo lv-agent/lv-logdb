@@ -41,6 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let msg = args.get(5).ok_or("message required")?;
             cmd_append(&mut client, ns, stream, msg).await?;
         }
+        "checkpoint" => cmd_checkpoint(&mut client).await?,
+        "backup" => cmd_backup(&mut client).await?,
         _ => usage(&args[0]),
     }
     Ok(())
@@ -48,11 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn usage(prog: &str) {
     eprintln!("Usage:");
-    eprintln!("  {} status   <addr>", prog);
-    eprintln!("  {} list     <addr>", prog);
-    eprintln!("  {} streams  <addr> <namespace>", prog);
-    eprintln!("  {} ping     <addr>", prog);
-    eprintln!("  {} append   <addr> <namespace> <stream> <message>", prog);
+    eprintln!("  {} status      <addr>", prog);
+    eprintln!("  {} list        <addr>", prog);
+    eprintln!("  {} streams     <addr> <namespace>", prog);
+    eprintln!("  {} ping        <addr>", prog);
+    eprintln!("  {} append      <addr> <ns> <stream> <message>", prog);
+    eprintln!("  {} checkpoint  <addr>", prog);
+    eprintln!("  {} backup      <addr>  (prints rsync instructions)", prog);
 }
 
 async fn cmd_status(
@@ -158,5 +162,52 @@ async fn cmd_append(
         "Appended: namespace_id={} stream_id={} seq={} gid={}",
         resp.namespace_id, resp.stream_id, resp.seq, resp.gid
     );
+    Ok(())
+}
+
+async fn cmd_checkpoint(
+    client: &mut LogDbServiceClient<tonic::transport::Channel>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = client
+        .status(StatusRequest {})
+        .await?
+        .into_inner();
+    let seq = status.durable_sequence;
+    client
+        .checkpoint(CheckpointRequest { sequence: seq })
+        .await?;
+    println!("WAL checkpoint advanced to {}", seq);
+    println!("Records with gid < {} are now safe to archive/backup.", seq);
+    Ok(())
+}
+
+async fn cmd_backup(
+    client: &mut LogDbServiceClient<tonic::transport::Channel>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Advance checkpoint to current durable position
+    let status = client
+        .status(StatusRequest {})
+        .await?
+        .into_inner();
+    let seq = status.durable_sequence;
+    client
+        .checkpoint(CheckpointRequest { sequence: seq })
+        .await?;
+
+    println!("# Backup Instructions");
+    println!("# WAL checkpoint advanced to {}", seq);
+    println!("# Run on the logdbd server:");
+    println!();
+    println!("  BACKUP_DIR=/backup/logdbd-$(date +%Y%m%d-%H%M%S)");
+    println!("  mkdir -p $BACKUP_DIR");
+    println!("  rsync -av --delete <DATA_DIR>/ $BACKUP_DIR/");
+    println!();
+    println!("# To restore:");
+    println!("  systemctl stop logdbd");
+    println!("  rsync -av $BACKUP_DIR/ <DATA_DIR>/");
+    println!("  systemctl start logdbd");
+    println!();
+    println!("# Segment files are immutable; rsync is safe because checkpoint");
+    println!("# ensures records before {} are fully durable.", seq);
     Ok(())
 }

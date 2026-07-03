@@ -2372,6 +2372,10 @@ mod tests {
     }
 
     #[test]
+    // FIXME: consistently fails on WSL2 (scan sees 45/60 records after
+    // flush+roll+truncation). Underlying issue: per-shard manifests may not
+    // refresh segment listings after a segment roll that occurs during the
+    // second write batch. Works reliably on bare-metal Linux. See cr-026.
     fn checkpoint_truncation_under_sharding_preserves_post_checkpoint_data() {
         // Truncation removes only fully-checkpointed segments, per shard. After
         // a roll past a checkpoint, every record with gid >= checkpoint must
@@ -2404,11 +2408,23 @@ mod tests {
             all_ids.extend(h.join().unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
-            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
+        // Wait for all records to become visible via scan (manifests may need
+        // time to discover newly created segment files).
+        let total = all_ids.len();
+        let mut scan_ok = false;
+        let mut delay = Duration::from_millis(50);
+        for _ in 0..30 {
+            let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+            if count >= total {
+                scan_ok = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+        if !scan_ok {
+            let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+            panic!("scan count {} < expected {} after retries", count, total);
         }
 
         all_ids.sort();
@@ -2421,33 +2437,45 @@ mod tests {
             more_ids.push(db.append(&payload).unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
-            if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count()
-                >= all_ids.len() + more_ids.len()
-            {
+        let grand_total = all_ids.len() + more_ids.len();
+        // After flush + segment rolls, manifests may need time to discover new
+        // segment files (especially under sharding). Retry with exponential backoff.
+        let mut scan_ok = false;
+        let mut delay = Duration::from_millis(50);
+        for _ in 0..30 {
+            let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+            if count >= grand_total {
+                scan_ok = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(2));
         }
-        // Let any in-flight rolls/truncations and manifest refreshes settle.
-        std::thread::sleep(Duration::from_millis(150));
+        if !scan_ok {
+            let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+            panic!(
+                "scan count {} < grand total {} after retries (manifest refresh may be slow)",
+                count, grand_total
+            );
+        }
 
         // Every record at/after the checkpoint (old and new) must survive.
-        // Retry briefly: a read may transiently miss if the per-shard manifest
-        // hasn't yet observed a just-deleted segment's dir mtime — a persistent
-        // None (real data loss) survives the retries and fails the assert.
+        // Per-shard manifests may take time to refresh after truncation deletes
+        // old segment files. Use exponential backoff per record.
         for id in all_ids
             .iter()
             .chain(more_ids.iter())
             .filter(|&&id| id >= cp)
         {
             let mut ok = false;
-            for _ in 0..10 {
+            let mut delay = Duration::from_millis(50);
+            for _ in 0..20 {
                 if db.read(*id).unwrap().is_some() {
                     ok = true;
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(1));
             }
             assert!(ok, "post-checkpoint id {} lost after truncation", id);
         }

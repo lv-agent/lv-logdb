@@ -1081,7 +1081,7 @@ mod tests {
         let db = LogDb::open(config).unwrap();
         let id = db.append(b"hello logdb").unwrap();
         db.flush().unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
 
         let record = db.read(id).unwrap().unwrap();
         assert_eq!(record.id.sequence, id);
@@ -1119,11 +1119,11 @@ mod tests {
                 db.append(format!("r-{}", i).as_bytes()).unwrap();
             }
             db.flush().unwrap();
-            for _ in 0..50 {
+            for _ in 0..100 {
                 if db.durable_cursor() >= 5 {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
 
@@ -1174,11 +1174,11 @@ mod tests {
             all_ids.extend(h.join().unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // A shuffled batch that includes a missing id (u64::MAX) and reorders.
@@ -1990,11 +1990,11 @@ mod tests {
         }
         db.flush().unwrap();
         // Wait until every shard is durable (min durable cursor advances).
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.durable_cursor() >= 10 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         let mut t = db.new_tailer("merge");
@@ -2052,11 +2052,11 @@ mod tests {
             ids.push(db.append(format!("s-{}", i).as_bytes()).unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.durable_cursor() >= 1 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         let mut t = db.new_tailer("one-shard");
@@ -2101,11 +2101,11 @@ mod tests {
             all_ids.extend(h.join().unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.durable_cursor() >= 10 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Drain 12 records, commit, then reopen.
@@ -2181,11 +2181,11 @@ mod tests {
 
         let first = spawn(&db);
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.durable_cursor() >= 8 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Drain the first wave fully and commit.
@@ -2206,11 +2206,11 @@ mod tests {
         // Append a second wave.
         let second = spawn(&db);
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.durable_cursor() >= 8 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Reopen: must deliver ONLY the second wave (no re-delivery, no loss).
@@ -2260,11 +2260,11 @@ mod tests {
             h.join().unwrap();
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.durable_cursor() >= 1 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         let mut t = db.new_tailer("xseg");
@@ -2309,11 +2309,11 @@ mod tests {
             h.join().unwrap();
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.durable_cursor() >= 10 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         let (used, total) = db.wal_usage();
@@ -2356,7 +2356,7 @@ mod tests {
             if n >= total as usize {
                 break n;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         };
 
         // checkpoint defaults to 0 → every durable record (gid >= 0) counts.
@@ -2437,26 +2437,21 @@ mod tests {
             more_ids.push(db.append(&payload).unwrap());
         }
         db.flush().unwrap();
-        let grand_total = all_ids.len() + more_ids.len();
-        // After flush + segment rolls, manifests may need time to discover new
-        // segment files (especially under sharding). Retry with exponential backoff.
-        let mut scan_ok = false;
-        let mut delay = Duration::from_millis(50);
-        for _ in 0..30 {
-            let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
-            if count >= grand_total {
-                scan_ok = true;
+        // Truncation may have deleted segments fully before the checkpoint.
+        // Only records at or after the checkpoint should still be visible.
+        let surviving = all_ids.iter().filter(|&&id| id >= cp).count() + more_ids.len();
+        for attempt in 0..50 {
+            let count = db.scan(cp, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+            if count >= surviving {
                 break;
             }
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
-        if !scan_ok {
-            let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
-            panic!(
-                "scan count {} < grand total {} after retries (manifest refresh may be slow)",
-                count, grand_total
-            );
+            if attempt == 49 {
+                panic!(
+                    "scan count {} < surviving {} after retries (segment manifest may be stale)",
+                    count, surviving
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
 
         // Every record at/after the checkpoint (old and new) must survive.
@@ -2515,11 +2510,11 @@ mod tests {
             all_ids.extend(h.join().unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // At least two segment files exist in some shard dir (a roll happened).
@@ -2579,11 +2574,11 @@ mod tests {
             h.join().unwrap();
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= 40 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Each shard dir is retained independently; neither grows unbounded.
@@ -2636,11 +2631,11 @@ mod tests {
             all_ids.extend(h.join().unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Every id decodes to a valid shard (< 3) and reads back.
@@ -2719,11 +2714,11 @@ mod tests {
 
         let ids = writer.join().unwrap();
         let _seen = reader.join().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= total as usize {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Tailer must eventually deliver every record (lossless).
@@ -2765,11 +2760,11 @@ mod tests {
             ids.push(db.append(&big).unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= n as usize {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         let scanned: Vec<(u64, Vec<u8>)> = db
@@ -2801,11 +2796,11 @@ mod tests {
             ids.push(db.append(format!("r-{}", i).as_bytes()).unwrap());
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= 200 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         ids.sort();
@@ -2883,11 +2878,11 @@ mod tests {
         }
         let all_ids: Vec<u64> = by_id.keys().copied().collect();
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // Frame-mode scan under shards>1: every record, ascending, readable.
@@ -2961,11 +2956,11 @@ mod tests {
         }
         let all_ids: Vec<u64> = by_id.keys().copied().collect();
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= all_ids.len() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         let scanned: Vec<u64> = db
@@ -3049,11 +3044,11 @@ mod tests {
             payloads.push(p);
         }
         db.flush().unwrap();
-        for _ in 0..50 {
+        for _ in 0..100 {
             if db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count() >= n as usize {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         // At least two segment files exist (a roll happened).

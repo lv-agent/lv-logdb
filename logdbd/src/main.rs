@@ -188,11 +188,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let hostname = node.id.clone();
     let role_str = node.role.to_string();
-    let log_svc = LogDbServiceImpl::new(
+    let quotas = config.limits.quotas.clone();
+    let log_svc = LogDbServiceImpl::with_quotas(
         Arc::clone(&storage),
         Arc::clone(&catalog),
         Arc::clone(&consumer_tracker),
         Arc::clone(&subscribe_hub),
+        quotas,
         hostname,
         role_str,
         config.cache.dir.clone(),

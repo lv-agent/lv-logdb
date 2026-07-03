@@ -26,6 +26,7 @@ pub struct LogDbServiceImpl {
     catalog: Arc<Catalog>,
     consumer_tracker: Arc<ConsumerTracker>,
     subscribe_hub: Arc<SubscribeHub>,
+    quotas: Vec<crate::config::StreamQuota>,
     hostname: String,
     role: String,
     cache_dir: PathBuf,
@@ -46,10 +47,87 @@ impl LogDbServiceImpl {
             catalog,
             consumer_tracker,
             subscribe_hub,
+            quotas: Vec::new(),
             hostname,
             role,
             cache_dir,
         }
+    }
+
+    /// Same as `new` but with stream quotas.
+    pub fn with_quotas(
+        storage: Arc<Storage>,
+        catalog: Arc<Catalog>,
+        consumer_tracker: Arc<ConsumerTracker>,
+        subscribe_hub: Arc<SubscribeHub>,
+        quotas: Vec<crate::config::StreamQuota>,
+        hostname: String,
+        role: String,
+        cache_dir: PathBuf,
+    ) -> Self {
+        Self {
+            storage,
+            catalog,
+            consumer_tracker,
+            subscribe_hub,
+            quotas,
+            hostname,
+            role,
+            cache_dir,
+        }
+    }
+
+    /// Check stream quota — reject append if over limit.
+    fn check_quota(
+        &self,
+        ns: &str,
+        stream: &str,
+        incoming_bytes: usize,
+        quotas: &[crate::config::StreamQuota],
+    ) -> Result<(), Status> {
+        for q in quotas {
+            if q.namespace == ns && q.stream == stream {
+                let db_name = crate::cache::indexer::db_filename(ns, stream);
+                let db_path = self.cache_dir.join(db_name);
+                if let Ok(rows) =
+                    crate::cache::execute_query(&db_path, "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(content)), 0) AS total_bytes FROM records WHERE deleted = 0 AND event_type != 'logdb.tombstone'")
+                {
+                    if let Some(row) = rows.first() {
+                        // Simple parse: first number is COUNT, second is total_bytes
+                        // JSON row looks like: {"cnt":42,"total_bytes":12345}
+                        if let Some(max_recs) = q.max_records {
+                            if let Some(cnt_start) = row.find("\"cnt\":") {
+                                let rest = &row[cnt_start + 6..];
+                                if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
+                                    let count: u64 = rest[..end].parse().unwrap_or(0);
+                                    if count >= max_recs {
+                                        return Err(Status::resource_exhausted(format!(
+                                            "stream {}/{} record limit reached: {}/{}",
+                                            ns, stream, count, max_recs
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(max_bytes) = q.max_bytes {
+                            if let Some(tb_start) = row.find("\"total_bytes\":") {
+                                let rest = &row[tb_start + 14..];
+                                if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
+                                    let used: u64 = rest[..end].parse().unwrap_or(0);
+                                    if used + incoming_bytes as u64 > max_bytes {
+                                        return Err(Status::resource_exhausted(format!(
+                                            "stream {}/{} byte limit reached: {}/{}",
+                                            ns, stream, used, max_bytes
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn check_write(&self) -> Result<(), Status> {
@@ -79,6 +157,7 @@ impl LogDbService for LogDbServiceImpl {
         crate::auth::require_role(&req, crate::auth::Role::Writer)?;
         self.check_write()?;
         let r = req.get_ref();
+        self.check_quota(&r.namespace, &r.stream, r.content.len(), &self.quotas)?;
 
         let (ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 

@@ -377,6 +377,19 @@ pub struct LimitsConfig {
     pub max_scan_limit: usize,
     #[serde(default = "default_max_tail_batch")]
     pub max_tail_batch_size: usize,
+    #[serde(default)]
+    pub quotas: Vec<StreamQuota>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamQuota {
+    pub namespace: String,
+    pub stream: String,
+    #[serde(default)]
+    pub max_records: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
 }
 
 fn default_max_record_size() -> usize {
@@ -403,6 +416,7 @@ impl Default for LimitsConfig {
             max_batch_bytes: 16 * 1024 * 1024,
             max_scan_limit: 10000,
             max_tail_batch_size: 10000,
+            quotas: vec![],
         }
     }
 }

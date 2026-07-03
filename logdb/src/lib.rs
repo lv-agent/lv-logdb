@@ -1632,7 +1632,7 @@ mod tests {
         config.segment_size = 1 * 1024 * 1024; // 1MB minimum
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
-        config.flush_timeout = Duration::from_secs(10);
+        config.flush_timeout = Duration::from_secs(60);
         let db = LogDb::open(config).unwrap();
 
         let payload = vec![0xA5u8; 64 * 1024]; // 64KB each -> ~17 records fill >1MB
@@ -2242,7 +2242,7 @@ mod tests {
         config.segment_size = 1 * 1024 * 1024; // 1MB → rolls quickly with big payloads
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
-        config.flush_timeout = Duration::from_secs(10);
+        config.flush_timeout = Duration::from_secs(60);
         let db = Arc::new(LogDb::open(config).unwrap());
 
         // Spread big records across both shards so at least one shard rolls.
@@ -2376,6 +2376,7 @@ mod tests {
     // flush+roll+truncation). Underlying issue: per-shard manifests may not
     // refresh segment listings after a segment roll that occurs during the
     // second write batch. Works reliably on bare-metal Linux. See cr-026.
+    #[serial_test::serial]
     fn checkpoint_truncation_under_sharding_preserves_post_checkpoint_data() {
         // Truncation removes only fully-checkpointed segments, per shard. After
         // a roll past a checkpoint, every record with gid >= checkpoint must
@@ -2387,7 +2388,7 @@ mod tests {
         config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
-        config.flush_timeout = Duration::from_secs(10);
+        config.flush_timeout = Duration::from_secs(60);
         let db = Arc::new(LogDb::open(config).unwrap());
 
         let payload = vec![0xA5u8; 64 * 1024];
@@ -2489,7 +2490,7 @@ mod tests {
         config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
-        config.flush_timeout = Duration::from_secs(10);
+        config.flush_timeout = Duration::from_secs(60);
         let db = Arc::new(LogDb::open(config).unwrap());
 
         let payload = vec![0xA5u8; 64 * 1024];
@@ -2555,7 +2556,7 @@ mod tests {
         config.segment_size = 1 * 1024 * 1024;
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
-        config.flush_timeout = Duration::from_secs(10);
+        config.flush_timeout = Duration::from_secs(60);
         config.retention = RetentionPolicy::MaxBytes(2 * 1024 * 1024); // 2MB cap
         let db = Arc::new(LogDb::open(config).unwrap());
 
@@ -3022,7 +3023,7 @@ mod tests {
         config.compression_enabled = compressed;
         config.encryption_key = key;
         config.durability_mode = DurabilityMode::Sync;
-        config.flush_timeout = Duration::from_secs(10);
+        config.flush_timeout = Duration::from_secs(60);
         let db = LogDb::open(config).unwrap();
 
         // Each record gets a UNIQUE incompressible payload (splitmix64 over

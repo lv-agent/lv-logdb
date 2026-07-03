@@ -132,15 +132,12 @@ pub enum OpenError {
     /// The provided [`Config`](crate::Config) failed validation.
     #[error("invalid configuration: {0}")]
     InvalidConfig(#[from] ConfigError),
-    /// Crash recovery failed for one shard. `reason` is the underlying detail
-    /// (recovery currently returns a `String`; full structuring is tracked
-    /// separately).
+    /// Crash recovery failed for one shard.
     #[error("recovery failed for shard {shard}: {reason}")]
     Recovery {
-        /// The shard index that failed recovery.
         shard: usize,
-        /// The underlying failure detail.
-        reason: String,
+        #[source]
+        reason: crate::recovery::RecoveryError,
     },
     /// A segment manager could not be created (`SegmentManager::create`
     /// returned an I/O error while creating the directory / first segment).

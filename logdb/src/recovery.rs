@@ -28,6 +28,38 @@ use crate::storage::format::{
 };
 use crate::storage::SegmentManager;
 
+/// Structured error for catastrophic recovery failures.
+#[derive(Debug)]
+pub struct RecoveryError {
+    pub message: String,
+}
+
+impl RecoveryError {
+    fn new(msg: impl Into<String>) -> Self {
+        Self { message: msg.into() }
+    }
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for RecoveryError {}
+
+impl From<String> for RecoveryError {
+    fn from(s: String) -> Self {
+        Self { message: s }
+    }
+}
+
+impl From<&str> for RecoveryError {
+    fn from(s: &str) -> Self {
+        Self { message: s.to_string() }
+    }
+}
+
 /// Warnings produced during recovery (non-fatal).
 #[derive(Debug, Clone)]
 pub enum RecoveryWarning {
@@ -109,7 +141,7 @@ pub fn recover_shard(
     segment_size: u64,
     retention: RetentionPolicy,
     encryption_key: Option<KeyHandle>,
-) -> Result<RecoveryState, String> {
+) -> Result<RecoveryState, RecoveryError> {
     let __t0 = std::time::Instant::now();
     let result = recover_shard_inner(shard_dir, shard_bits, segment_size, retention, encryption_key);
     metric_histogram!("logdb.recovery.duration", __t0.elapsed());
@@ -122,15 +154,15 @@ fn recover_shard_inner(
     segment_size: u64,
     retention: RetentionPolicy,
     encryption_key: Option<KeyHandle>,
-) -> Result<RecoveryState, String> {
+) -> Result<RecoveryState, RecoveryError> {
     if !shard_dir.exists() {
-        return Err(format!("data directory does not exist: {:?}", shard_dir));
+        return Err(RecoveryError::new(format!("data directory does not exist: {:?}", shard_dir)));
     }
 
     // 1. List and sort segment files
     let mut seg_files = list_segment_files(shard_dir)?;
     if seg_files.is_empty() {
-        return Err(format!("no segment files found in {:?}", shard_dir));
+        return Err(RecoveryError::new(format!("no segment files found in {:?}", shard_dir)));
     }
     seg_files.sort_by_key(|(id, _)| *id);
 
@@ -194,7 +226,7 @@ fn recover_shard_inner(
     }
 
     if valid_segments.is_empty() {
-        return Err("no valid segments found after header validation".to_string());
+        return Err(RecoveryError::new("no valid segments found after header validation"));
     }
 
     // 3. Extract metadata from the first valid segment
@@ -288,7 +320,7 @@ pub fn recover(
     segment_size: u64,
     retention: RetentionPolicy,
     encryption_key: Option<KeyHandle>,
-) -> Result<RecoveryState, String> {
+) -> Result<RecoveryState, RecoveryError> {
     recover_shard(data_dir, 0, segment_size, retention, encryption_key)
 }
 
@@ -316,7 +348,7 @@ fn scan_last_segment(
     hash_enabled: bool,
     encryption_key: Option<KeyHandle>,
     shard_bits: u32,
-) -> Result<(u64, [u8; 32], u64, Vec<RecoveryWarning>, u64), String> {
+) -> Result<(u64, [u8; 32], u64, Vec<RecoveryWarning>, u64), RecoveryError> {
     let mut file = OpenOptions::new()
         .write(true)
         .read(true)
@@ -544,7 +576,7 @@ fn scan_last_segment(
 }
 
 /// List segment files in a directory, returning (segment_id, path) pairs.
-fn list_segment_files(dir: &Path) -> Result<Vec<(u32, PathBuf)>, String> {
+fn list_segment_files(dir: &Path) -> Result<Vec<(u32, PathBuf)>, RecoveryError> {
     let mut result = Vec::new();
     let entries = fs::read_dir(dir).map_err(|e| format!("read_dir {:?}: {}", dir, e))?;
     for entry in entries {

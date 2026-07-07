@@ -27,3 +27,11 @@ use logdbd_proto::pb;
 pub type Record = pb::Record;
 /// Append response (seq, gid, etc.)
 pub type AppendResult = pb::AppendResponse;
+/// Structured query request (predicates + result shape). See `Client::query`.
+pub type QueryRequest = pb::QueryRequest;
+/// Structured query response (typed `result` oneof). See `Client::query`.
+pub type QueryResponse = pb::QueryResponse;
+/// Result-shape selector for `QueryRequest` (RECORDS, COUNT, EXISTS, ...).
+pub type QueryResult = pb::QueryResult;
+/// Oneof variants of `QueryResponse::result` (matched by callers).
+pub use pb::query_response;

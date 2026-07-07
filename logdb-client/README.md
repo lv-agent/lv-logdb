@@ -44,22 +44,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Query cache (SQL SELECT)
+## Query (structured filter)
+
+Query reads the log segment directly at the committed cursor — no SQL, no
+SQLite cache. Build a `QueryRequest` with predicates and a `QueryResult` shape,
+then match on the typed `QueryResponse::result` oneof.
 
 ```rust
-// Query stream's SQLite cache with SQL
-let rows = client.query(
-    "my-app", "main",
-    "SELECT seq, event_type FROM records WHERE event_type = 'llm.call' ORDER BY seq DESC LIMIT 10",
-).await?;
-for row in &rows {
-    println!("{}", row); // JSON string per row
+use logdb_client::{QueryRequest, QueryResult, query_response};
+
+// Fetch the 10 most recent llm.call records
+let resp = client.query(QueryRequest {
+    namespace: "my-app".into(),
+    stream: "main".into(),
+    event_types: vec!["llm.call".into()],
+    descending: true,
+    limit: 10,
+    ..Default::default()
+}).await?;
+if let Some(query_response::Result::Records(rr)) = resp.result {
+    for r in &rr.records {
+        println!("[{}] {}", r.seq, r.event_type);
+    }
 }
 
-// COUNT
-let count = client.query("my-app", "main", "SELECT COUNT(*) FROM records").await?;
-println!("total records: {}", count[0]);
+// COUNT matching records
+let resp = client.query(QueryRequest {
+    namespace: "my-app".into(),
+    stream: "main".into(),
+    result: QueryResult::Count.into(),
+    ..Default::default()
+}).await?;
+if let Some(query_response::Result::Count(n)) = resp.result {
+    println!("total records: {}", n);
+}
 ```
+
+Predicates (all AND-combined): `event_types` (IN), `from_seq`/`to_seq` (inclusive
+closed interval, `None` = unbounded), `metadata` (field equality). Result shapes:
+`RECORDS` (default), `COUNT`, `EXISTS`, `COUNT_DISTINCT`, `MIN`, `MAX`,
+`DISTINCT_VALUES`. `aggregate_field` selects the metadata field for the
+aggregations. `absent` expresses an anti-join (NOT EXISTS). Aggregations skip
+records lacking `aggregate_field`; `MIN`/`MAX` return 0 when none qualify.
 
 ## Subscribe (event-type push)
 
@@ -96,7 +122,7 @@ while let Some(rec) = stream.message().await? {
 | `read(ns, stream, seq)` | Point read |
 | `scan_all(ns, stream, from_seq)` | Scan and collect all |
 | `tail(ns, stream)` | Create a TailOptions builder |
-| `query(ns, stream, sql)` | SQL SELECT against query cache |
+| `query(request)` | Structured filter against the log segment (typed oneof response) |
 | `subscribe(ns, stream, event_types, group, id)` | Event-type push subscription |
 | `watermark(ns, stream)` | Get watermarks |
 | `list_namespaces()` | List all namespaces |

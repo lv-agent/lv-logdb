@@ -93,6 +93,42 @@ for r in &all {
 }
 ```
 
+### 查询（结构化过滤）
+
+`Query` 是原生结构化过滤引擎，直接在已提交游标处读取 Segment（无 SQL、无 SQLite 缓存）。用 `QueryRequest` 描述过滤条件与结果形态，再按 `QueryResponse::result` 的 oneof 解析返回值。
+
+```rust
+use logdb_client::{QueryRequest, QueryResult, query_response};
+
+// 取最近 10 条 llm.call 记录
+let resp = client.query(QueryRequest {
+    namespace: "my-app".into(),
+    stream: "main".into(),
+    event_types: vec!["llm.call".into()],
+    descending: true,
+    limit: 10,
+    ..Default::default()
+}).await?;
+if let Some(query_response::Result::Records(rr)) = resp.result {
+    for r in &rr.records {
+        println!("[{}] {}", r.seq, r.event_type);
+    }
+}
+
+// 计数
+let resp = client.query(QueryRequest {
+    namespace: "my-app".into(),
+    stream: "main".into(),
+    result: QueryResult::Count.into(),
+    ..Default::default()
+}).await?;
+if let Some(query_response::Result::Count(n)) = resp.result {
+    println!("total records: {}", n);
+}
+```
+
+过滤字段（之间为 AND 关系）：`event_types`（IN）、`from_seq`/`to_seq`（闭区间，`None` 表示该侧无界）、`metadata`（字段相等）。结果形态：`RECORDS`（默认）、`COUNT`、`EXISTS`、`COUNT_DISTINCT`、`MIN`、`MAX`、`DISTINCT_VALUES`；`aggregate_field` 选择聚合用的 metadata 字段，`absent` 表达反连接（NOT EXISTS）。
+
 ### 实时订阅（Tail + Consumer Group）
 
 ```rust
@@ -143,6 +179,11 @@ if result.ok {
 } else {
     println!("Hash chain BROKEN at seq {}: {}", result.error_at_seq, result.error_message);
 }
+
+// 删除 stream（仅 primary 可调用，需要 admin 角色）
+// 实现上是向该 stream 追加一条 logdb.stream_deleted 墓碑记录，
+// 之后的查询/订阅会跳过该 stream；同名 stream 可重新创建。
+client.delete_stream("my-app", "old-stream").await?;
 ```
 
 ## 使用 CLI 工具
@@ -206,6 +247,5 @@ logdb-exporter exporter.yaml
 ## 下一步
 
 - [配置参考](configuration.md) — 完整配置项说明
-- [SQL 查询缓存](query-cache.md) — 使用 SQL 直接查询流数据
 - [开发指南](../dev/building.md) — 编译、测试、贡献
 - [logdb-client SDK](../../../logdb-client/) — Rust SDK API 文档

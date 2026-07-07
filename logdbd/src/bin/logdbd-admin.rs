@@ -13,11 +13,39 @@ use logdbd::pb::*;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
+    if args.len() < 2 {
         usage(&args[0]);
         return Ok(());
     }
     let cmd = &args[1];
+
+    // Local (filesystem) commands — operate on a stopped node, no server needed.
+    match cmd.as_str() {
+        "backup" => {
+            let data_dir = flag(&args, "--data-dir")?.ok_or("--data-dir required")?;
+            let out = flag(&args, "--out")?.ok_or("--out required")?;
+            cmd_backup_local(std::path::Path::new(data_dir), std::path::Path::new(out))?;
+            return Ok(());
+        }
+        "restore" => {
+            let backup_path = flag(&args, "--backup")?.ok_or("--backup required")?;
+            let data_dir = flag(&args, "--data-dir")?.ok_or("--data-dir required")?;
+            let verify = args.iter().any(|a| a == "--verify");
+            cmd_restore(
+                std::path::Path::new(backup_path),
+                std::path::Path::new(data_dir),
+                verify,
+            )?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Remote commands — connect to <addr>.
+    if args.len() < 3 {
+        usage(&args[0]);
+        return Ok(());
+    }
     let addr = &args[2];
     let url = if addr.starts_with("http") {
         addr.clone()
@@ -42,21 +70,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cmd_append(&mut client, ns, stream, msg).await?;
         }
         "checkpoint" => cmd_checkpoint(&mut client).await?,
-        "backup" => cmd_backup(&mut client).await?,
         _ => usage(&args[0]),
     }
     Ok(())
 }
 
+/// Extract the value of `--flag <value>` from args (returns None if absent).
+fn flag<'a>(
+    args: &'a [String],
+    name: &str,
+) -> Result<Option<&'a str>, Box<dyn std::error::Error>> {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a == name {
+            return match iter.next() {
+                Some(v) => Ok(Some(v.as_str())),
+                None => Err(format!("{name} requires a value").into()),
+            };
+        }
+    }
+    Ok(None)
+}
+
 fn usage(prog: &str) {
-    eprintln!("Usage:");
+    eprintln!("Remote (operate on a running logdbd):");
     eprintln!("  {} status      <addr>", prog);
     eprintln!("  {} list        <addr>", prog);
     eprintln!("  {} streams     <addr> <namespace>", prog);
     eprintln!("  {} ping        <addr>", prog);
     eprintln!("  {} append      <addr> <ns> <stream> <message>", prog);
     eprintln!("  {} checkpoint  <addr>", prog);
-    eprintln!("  {} backup      <addr>  (prints rsync instructions)", prog);
+    eprintln!();
+    eprintln!("Local disaster recovery (run on a STOPPED node):");
+    eprintln!(
+        "  {} backup   --data-dir <dir> --out <file.logdbbak>",
+        prog
+    );
+    eprintln!(
+        "  {} restore  --backup <file.logdbbak> --data-dir <dir> [--verify]",
+        prog
+    );
 }
 
 async fn cmd_status(
@@ -178,30 +231,43 @@ async fn cmd_checkpoint(
     Ok(())
 }
 
-async fn cmd_backup(
-    client: &mut LogDbServiceClient<tonic::transport::Channel>,
+/// Local backup: tar a stopped node's data_dir into a `.logdbbak` archive.
+fn cmd_backup_local(
+    data_dir: &std::path::Path,
+    out: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Advance checkpoint to current durable position
-    let status = client.status(StatusRequest {}).await?.into_inner();
-    let seq = status.durable_sequence;
-    client
-        .checkpoint(CheckpointRequest { sequence: seq })
-        .await?;
+    let manifest = logdbd::backup::backup(data_dir, out)?;
+    println!("Backup written: {}", out.display());
+    println!("  source:   {}", manifest.source_data_dir);
+    println!("  files:    {}", manifest.file_count);
+    println!("  bytes:    {}", manifest.total_bytes);
+    println!(
+        "  version:  logdbd {} (format v{})",
+        manifest.logdbd_version, manifest.format_version
+    );
+    println!("  checksum: {}.sha256", out.display());
+    Ok(())
+}
 
-    println!("# Backup Instructions");
-    println!("# WAL checkpoint advanced to {}", seq);
-    println!("# Run on the logdbd server:");
-    println!();
-    println!("  BACKUP_DIR=/backup/logdbd-$(date +%Y%m%d-%H%M%S)");
-    println!("  mkdir -p $BACKUP_DIR");
-    println!("  rsync -av --delete <DATA_DIR>/ $BACKUP_DIR/");
-    println!();
-    println!("# To restore:");
-    println!("  systemctl stop logdbd");
-    println!("  rsync -av $BACKUP_DIR/ <DATA_DIR>/");
-    println!("  systemctl start logdbd");
-    println!();
-    println!("# Segment files are immutable; rsync is safe because checkpoint");
-    println!("# ensures records before {} are fully durable.", seq);
+/// Local restore: reconstruct a data_dir from a `.logdbbak` archive.
+fn cmd_restore(
+    backup_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    verify: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = logdbd::backup::restore(backup_path, data_dir, verify)?;
+    println!(
+        "Restored {} → {}",
+        backup_path.display(),
+        data_dir.display()
+    );
+    println!(
+        "  source: {} (format v{}, logdbd {})",
+        manifest.source_data_dir, manifest.format_version, manifest.logdbd_version
+    );
+    println!("  files:  {}", manifest.file_count);
+    if verify {
+        println!("  verify: OK (recovery passed)");
+    }
     Ok(())
 }

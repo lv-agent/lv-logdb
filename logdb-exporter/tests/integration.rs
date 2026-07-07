@@ -49,7 +49,6 @@ async fn start_logdbd() -> (String, tempfile::TempDir) {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "test-node".into(),
         "primary".into(),
-        dir.path().join("cache"),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -179,7 +179,7 @@ impl SegmentManifest {
     }
 
     /// Force a rescan ignoring the mtime cache (the cache was found to be stale).
-    fn force_refresh(&mut self) -> Result<(), ReadError> {
+    pub(crate) fn force_refresh(&mut self) -> Result<(), ReadError> {
         self.dir_mtime = None;
         self.refresh_if_needed()?;
         Ok(())

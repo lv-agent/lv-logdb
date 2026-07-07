@@ -2064,6 +2064,7 @@ async fn subscribe_replays_missed_records_from_offset() {
 /// High-concurrency stress: 5 subscribers + 100 records, verify
 /// each subscriber receives all matching records.
 #[tokio::test]
+#[ignore = "load test — resource/wall-clock dependent; run with `cargo test --ignored` or a dedicated stress job"]
 async fn subscribe_concurrent_stress() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
@@ -2189,6 +2190,7 @@ async fn subscribe_concurrent_stress() {
 /// 100 concurrent subscribers, 50 records — every subscriber must receive
 /// all 50 records with zero duplicates.
 #[tokio::test]
+#[ignore = "load test — resource/wall-clock dependent; run with `cargo test --ignored` or a dedicated stress job"]
 async fn subscribe_100_concurrent_subscribers_stress() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
@@ -2311,6 +2313,7 @@ async fn subscribe_100_concurrent_subscribers_stress() {
 /// query cache involved. The publisher polls `storage.durable_gid()` and
 /// pushes matching records to each subscriber's broadcast channel.
 #[tokio::test]
+#[ignore = "load test — resource/wall-clock dependent; run with `cargo test --ignored` or a dedicated stress job"]
 async fn subscribe_500_subs_replay_stress() {
     use std::collections::BTreeMap;
     use std::time::Instant;

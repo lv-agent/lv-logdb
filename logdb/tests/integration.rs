@@ -356,6 +356,9 @@ fn flush_across_multiple_rolls_all_durable() {
         db.append(content.as_bytes()).unwrap();
     }
     db.flush().unwrap();
+    // Newly-rolled segments can be invisible to reads until directory mtime
+    // propagates (coarse-mtime filesystems); force a manifest rescan.
+    db.refresh_manifests().unwrap();
 
     // After flush, every appended record must be durable.
     assert!(

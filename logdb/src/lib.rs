@@ -617,6 +617,22 @@ impl LogDb {
         reader.read(record_id)
     }
 
+    /// Force-refresh every shard's segment manifest — re-scan the data
+    /// directory, ignoring the mtime cache.
+    ///
+    /// Read paths self-heal when a *cached* segment's file goes missing
+    /// (truncation/retention), but a **brand-new** segment whose directory
+    /// mtime hasn't ticked can stay invisible until mtime propagates. This
+    /// removes that lag deterministically. Use on coarse-mtime filesystems
+    /// (WSL2, some network FS) or after out-of-band changes (backup restore,
+    /// manual segment deletion).
+    pub fn refresh_manifests(&self) -> Result<(), ReadError> {
+        for manifest in &self.inner.manifests {
+            manifest.lock().unwrap().force_refresh()?;
+        }
+        Ok(())
+    }
+
     /// Read many records by id in one call — a multi-get. Faster than N
     /// individual [`read`](LogDb::read)s when several ids share a segment:
     /// `read_batch` opens each segment file and loads its sparse index **once
@@ -2409,24 +2425,17 @@ mod tests {
             all_ids.extend(h.join().unwrap());
         }
         db.flush().unwrap();
-        // Wait for all records to become visible via scan (manifests may need
-        // time to discover newly created segment files).
-        let total = all_ids.len();
-        let mut scan_ok = false;
-        let mut delay = Duration::from_millis(50);
-        for _ in 0..30 {
-            let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
-            if count >= total {
-                scan_ok = true;
-                break;
-            }
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(Duration::from_secs(2));
-        }
-        if !scan_ok {
-            let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
-            panic!("scan count {} < expected {} after retries", count, total);
-        }
+        // flush made the records durable; force a manifest rescan so the
+        // newly-rolled segments are visible without waiting for directory
+        // mtime propagation (the old polling loop flaked under load — see
+        // `LogDb::refresh_manifests`).
+        db.refresh_manifests().unwrap();
+        let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+        assert_eq!(
+            count,
+            all_ids.len(),
+            "all appended records must be visible after flush + refresh"
+        );
 
         all_ids.sort();
         // Checkpoint past the first segment of every shard, then append more to
@@ -2438,46 +2447,32 @@ mod tests {
             more_ids.push(db.append(&payload).unwrap());
         }
         db.flush().unwrap();
-        // Truncation may have deleted segments fully before the checkpoint.
-        // Only records at or after the checkpoint should still be visible.
+        // Truncation deleted segments fully before the checkpoint; refresh so
+        // the manifest reflects the deletions, then assert exactly the
+        // surviving (>= checkpoint) records are visible — no polling.
+        db.refresh_manifests().unwrap();
         let surviving = all_ids.iter().filter(|&&id| id >= cp).count() + more_ids.len();
-        for attempt in 0..50 {
-            let count = db
-                .scan(cp, u64::MAX)
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .count();
-            if count >= surviving {
-                break;
-            }
-            if attempt == 49 {
-                panic!(
-                    "scan count {} < surviving {} after retries (segment manifest may be stale)",
-                    count, surviving
-                );
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        let count = db
+            .scan(cp, u64::MAX)
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .count();
+        assert!(
+            count >= surviving,
+            "expected at least {surviving} records at/after checkpoint, got {count}"
+        );
 
-        // Every record at/after the checkpoint (old and new) must survive.
-        // Per-shard manifests may take time to refresh after truncation deletes
-        // old segment files. Use exponential backoff per record.
+        // Every surviving record must be individually readable.
         for id in all_ids
             .iter()
             .chain(more_ids.iter())
             .filter(|&&id| id >= cp)
         {
-            let mut ok = false;
-            let mut delay = Duration::from_millis(50);
-            for _ in 0..20 {
-                if db.read(*id).unwrap().is_some() {
-                    ok = true;
-                    break;
-                }
-                std::thread::sleep(delay);
-                delay = (delay * 2).min(Duration::from_secs(1));
-            }
-            assert!(ok, "post-checkpoint id {} lost after truncation", id);
+            assert!(
+                db.read(*id).unwrap().is_some(),
+                "post-checkpoint id {} lost after truncation",
+                id
+            );
         }
     }
 

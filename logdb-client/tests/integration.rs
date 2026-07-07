@@ -36,7 +36,6 @@ async fn start_server() -> (String, tempfile::TempDir) {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "test-node".into(),
         "primary".into(),
-        dir.path().join("cache"),
     );
     let svc = LogDbServiceServer::new(svc);
 

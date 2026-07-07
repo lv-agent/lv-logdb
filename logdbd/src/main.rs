@@ -174,7 +174,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Shared subscriber hub — Indexer publishes, Subscribe RPC reads
     let subscribe_hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
-    let consumer_tracker = Arc::new(ConsumerTracker::new(Some(config.cache.dir.clone())));
+    let consumer_tracker = Arc::new(ConsumerTracker::new(Some(data_dir.join("offsets"))));
+    consumer_tracker.start_flush_loop(std::time::Duration::from_secs(5));
 
     // Cache — per-stream SQLite query cache (Indexer background thread)
     let cache_indexer = Arc::new(logdbd::cache::Indexer::new(
@@ -289,11 +290,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_for_drain = storage.db_arc();
     let idx_for_drain = Arc::clone(&cache_indexer);
+    let offsets_for_drain = Arc::clone(&consumer_tracker);
     server
         .serve_with_shutdown(listen, async move {
             shutdown_signal().await;
             tracing::info!("shutdown signal received; stopping cache indexer");
             idx_for_drain.stop();
+            if let Err(e) = offsets_for_drain.flush() {
+                tracing::warn!(error = %e, "final consumer offset flush failed");
+            }
             // Give Indexer a brief moment to flush
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             tracing::info!(

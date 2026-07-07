@@ -1913,25 +1913,21 @@ async fn subscribe_reconnect_replays_from_offset() {
     let data_dir = dir.path().join("data");
     let cache_dir = dir.path().join("cache");
 
-    // Create SQLite with consumer_offsets table (simulating previous session)
+    // Simulate a previous session: persist a committed offset of 2 in the
+    // binary offset store so ConsumerTracker::new restores it on startup.
+    // (Replaces the former SQLite `consumer_offsets` table setup.)
     std::fs::create_dir_all(&cache_dir).unwrap();
-    let db_path = cache_dir.join("test.main.db");
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS consumer_offsets (
-                consumer_group TEXT NOT NULL, consumer_id TEXT NOT NULL,
-                committed_seq INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (consumer_group, consumer_id)
-            );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO consumer_offsets VALUES ('sandbox', 'reconn', 2)",
-            [],
-        )
-        .unwrap();
-    }
+    let mut prev_offsets = std::collections::HashMap::new();
+    prev_offsets.insert(
+        (
+            "test".to_string(),
+            "main".to_string(),
+            "sandbox".to_string(),
+            "reconn".to_string(),
+        ),
+        2u64,
+    );
+    logdbd::offsets::save(&cache_dir, &prev_offsets).unwrap();
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();

@@ -2600,3 +2600,161 @@ async fn append_rejected_over_record_quota() {
         err
     );
 }
+
+/// Start a no-auth server with a per-stream quota on `test/main`.
+async fn start_quota_server(
+    max_records: Option<u64>,
+    max_bytes: Option<u64>,
+) -> (SocketAddr, tempfile::TempDir) {
+    use logdbd::config::StreamQuota;
+    use logdbd::quota::QuotaTracker;
+    use logdbd::tombstone::TombstoneTracker;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let quotas = vec![StreamQuota {
+        namespace: "test".into(),
+        stream: "main".into(),
+        max_records,
+        max_bytes,
+    }];
+    let log_svc = LogDbServiceImpl::with_quotas(
+        Arc::clone(&storage),
+        Arc::clone(&catalog),
+        Arc::new(ConsumerTracker::new(None)),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
+        quotas,
+        "quota-test".into(),
+        "primary".into(),
+        Arc::new(QuotaTracker::new()),
+        Arc::new(TombstoneTracker::new()),
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (addr, dir)
+}
+
+/// cr-027: `batch_append` must enforce the per-stream record quota. A batch that
+/// would push usage past `max_records` is rejected atomically (nothing written),
+/// and successful batches are tracked so a later append sees the updated usage.
+#[tokio::test]
+async fn batch_append_enforces_record_quota() {
+    let (addr, _dir) = start_quota_server(Some(3), None).await;
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // A batch of 3 sits exactly at the limit (3 <= max_records=3) and is
+    // tracked: without tracking, the next batch could not be seen as over-quota.
+    c.batch_append(pb::BatchAppendRequest {
+        requests: (0..3)
+            .map(|i| pb::AppendRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                event_type: "evt".into(),
+                content: format!("r-{i}").into_bytes(),
+                ..Default::default()
+            })
+            .collect(),
+    })
+    .await
+    .expect("batch at exactly the limit must succeed");
+
+    // A batch of 2 more would reach 5 > 3 → the entire batch is rejected.
+    let err = c
+        .batch_append(pb::BatchAppendRequest {
+            requests: (0..2)
+                .map(|i| pb::AppendRequest {
+                    namespace: "test".into(),
+                    stream: "main".into(),
+                    event_type: "evt".into(),
+                    content: format!("x-{i}").into_bytes(),
+                    ..Default::default()
+                })
+                .collect(),
+        })
+        .await
+        .expect_err("over-quota batch must be rejected atomically");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "over-quota batch must return ResourceExhausted, got: {err:?}"
+    );
+
+    // Atomicity: the rejected batch wrote nothing — seq 4 is absent.
+    let read = c
+        .read(pb::ReadRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            seq: 4,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!read.found, "rejected batch must not write any records");
+}
+
+/// cr-027: `batch_append` must enforce the per-stream byte quota. Total payload
+/// bytes across the batch are pre-flighted against `max_bytes`.
+#[tokio::test]
+async fn batch_append_enforces_byte_quota() {
+    let (addr, _dir) = start_quota_server(None, Some(9)).await;
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // 3 × 3-byte payloads = 9 == max_bytes → fits exactly and is tracked.
+    c.batch_append(pb::BatchAppendRequest {
+        requests: (0..3)
+            .map(|_| pb::AppendRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                event_type: "evt".into(),
+                content: b"abc".to_vec(),
+                ..Default::default()
+            })
+            .collect(),
+    })
+    .await
+    .expect("batch at exactly the byte limit must succeed");
+
+    // One more byte (9 + 1 = 10 > 9) → rejected.
+    let err = c
+        .batch_append(pb::BatchAppendRequest {
+            requests: vec![pb::AppendRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                event_type: "evt".into(),
+                content: b"z".to_vec(),
+                ..Default::default()
+            }],
+        })
+        .await
+        .expect_err("over-byte-quota batch must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "over-byte-quota batch must return ResourceExhausted, got: {err:?}"
+    );
+}

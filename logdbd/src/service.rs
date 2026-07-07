@@ -187,14 +187,20 @@ impl LogDbServiceImpl {
         }
     }
 
-    /// Check stream quota — reject append if over limit. Reads the in-memory
-    /// `QuotaTracker` (segment-seeded, append-maintained); no SQLite.
+    /// Check stream quota — reject if appending `incoming_records` records
+    /// totalling `incoming_bytes` of payload would exceed the limit. Reads the
+    /// in-memory `QuotaTracker` (segment-seeded, append-maintained); no SQLite.
+    ///
+    /// The records bound `usage + incoming > max` is, for a single append
+    /// (`incoming_records = 1`), exactly v0.6.0's `usage >= max`. The bytes
+    /// bound is unchanged: `usage + incoming > max`.
     fn check_quota(
         &self,
         ns: &str,
         stream: &str,
         ns_id: u32,
         stream_id: u64,
+        incoming_records: u64,
         incoming_bytes: usize,
         quotas: &[crate::config::StreamQuota],
     ) -> Result<(), Status> {
@@ -202,18 +208,18 @@ impl LogDbServiceImpl {
             if q.namespace == ns && q.stream == stream {
                 let usage = self.quota_tracker.usage(ns_id, stream_id);
                 if let Some(max_records) = q.max_records {
-                    if usage.records >= max_records {
+                    if usage.records + incoming_records > max_records {
                         return Err(Status::resource_exhausted(format!(
-                            "stream {}/{} record limit reached: {}/{}",
-                            ns, stream, usage.records, max_records
+                            "stream {}/{} record quota exceeded: {} + {} > {}",
+                            ns, stream, usage.records, incoming_records, max_records
                         )));
                     }
                 }
                 if let Some(max_bytes) = q.max_bytes {
                     if usage.bytes + incoming_bytes as u64 > max_bytes {
                         return Err(Status::resource_exhausted(format!(
-                            "stream {}/{} byte limit reached: {}/{}",
-                            ns, stream, usage.bytes, max_bytes
+                            "stream {}/{} byte quota exceeded: {} + {} > {}",
+                            ns, stream, usage.bytes, incoming_bytes, max_bytes
                         )));
                     }
                 }
@@ -256,6 +262,7 @@ impl LogDbService for LogDbServiceImpl {
             &r.stream,
             ns_id,
             stream_id,
+            1,
             r.content.len(),
             &self.quotas,
         )?;
@@ -312,6 +319,21 @@ impl LogDbService for LogDbServiceImpl {
         }
 
         let (ns_id, stream_id) = self.resolve(first_ns, first_stream)?;
+
+        // Pre-flight the whole batch against the quota — atomic: either the
+        // entire batch still fits within the limits, or none of it is written.
+        let batch_records = r.requests.len() as u64;
+        let batch_bytes: usize = r.requests.iter().map(|q| q.content.len()).sum();
+        self.check_quota(
+            first_ns,
+            first_stream,
+            ns_id,
+            stream_id,
+            batch_records,
+            batch_bytes,
+            &self.quotas,
+        )?;
+
         let mut responses = Vec::with_capacity(r.requests.len());
 
         for req in &r.requests {
@@ -339,6 +361,9 @@ impl LogDbService for LogDbServiceImpl {
                     &req.content,
                 )
                 .map_err(|e| Status::internal(e.to_string()))?;
+
+            // Incremental quota update — only on a successful append.
+            self.quota_tracker.add(ns_id, stream_id, req.content.len());
 
             responses.push(pb::AppendResponse {
                 namespace_id: ns_id,

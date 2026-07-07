@@ -24,7 +24,7 @@ service LogDbService {
   rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);
   rpc DeleteStream(DeleteStreamRequest) returns (DeleteStreamResponse);
 
-  // Query cache — SQL SELECT against the stream's SQLite cache
+  // Query — native structured filter against the log segment
   rpc Query(QueryRequest) returns (QueryResponse);
 
   // Subscribe — real-time event-type push with consumer-group offset tracking
@@ -271,16 +271,60 @@ message ListStreamsResponse {
   repeated StreamInfo streams = 1;
 }
 
-// ─── Query (SQL cache) ────────────────────────────────────────────────────
-
+// ─── Query (native structured filter engine) ──────────────────────────────
+// Reads the log segment directly at the committed cursor (no SQLite cache).
+// See veps/cr-027-native-query-engine.md ("读边界").
 message QueryRequest {
   string namespace = 1;
   string stream    = 2;
-  string sql       = 3;  // SELECT statement only
+  // Predicates (all AND-combined).
+  repeated string event_types    = 3;   // IN filter on event_type (empty = all).
+  optional uint64 from_seq       = 4;   // seq >= (inclusive). Absent = no lower bound.
+  optional uint64 to_seq         = 5;   // seq <= (inclusive). Absent = no upper bound.
+  repeated MetadataFilter metadata = 6; // Equality on metadata fields.
+  // Result shape.
+  QueryResult result          = 7;      // Defaults to RECORDS (=0).
+  string aggregate_field      = 8;      // COUNT_DISTINCT/MIN/MAX/DISTINCT_VALUES target. "" = use seq.
+  // Anti-join (NOT EXISTS): drop filtered records whose join_key value also
+  // appears on a record matching peer_event_types.
+  AbsentMatch absent          = 9;
+  // Paging / order.
+  int32 limit                  = 10;    // 0 = unlimited. Ignored for aggregations.
+  bool   descending            = 11;    // Order records/values by seq descending.
 }
-
+message MetadataFilter {
+  string key   = 1;
+  string value = 2;
+}
+message AbsentMatch {
+  repeated string peer_event_types = 1;  // Event types that "complete" a group (e.g. turn_completed).
+  string join_key                  = 2;  // Metadata field joining candidates to peers (e.g. turn_id).
+}
+enum QueryResult {
+  RECORDS         = 0;
+  COUNT           = 1;
+  COUNT_DISTINCT  = 2;
+  MIN             = 3;
+  MAX             = 4;
+  EXISTS          = 5;
+  DISTINCT_VALUES = 6;
+}
 message QueryResponse {
-  repeated string rows = 1;  // each row as JSON string
+  oneof result {
+    RecordsResult        records         = 1;
+    uint64               count           = 2;
+    bool                 exists          = 3;
+    uint64               count_distinct  = 4;
+    uint64               min             = 5;
+    uint64               max             = 6;
+    DistinctValuesResult distinct_values = 7;
+  }
+}
+message RecordsResult {
+  repeated Record records = 1;
+}
+message DistinctValuesResult {
+  repeated string values = 1;
 }
 
 // ─── Subscribe (event-type push) ──────────────────────────────────────────

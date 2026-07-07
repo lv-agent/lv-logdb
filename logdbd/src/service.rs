@@ -8,6 +8,10 @@ use crate::catalog::Catalog;
 use crate::consumer::ConsumerTracker;
 use crate::pb;
 use crate::pb::log_db_service_server::LogDbService;
+use crate::query::{
+    self, AbsentMatch as QueryAbsentMatch, MetadataFilter as QueryMetadataFilter, Query,
+    QueryResult as EngineQueryResult, ResultSet,
+};
 use crate::storage::Storage;
 use crate::subscribe::SubscribeHub;
 
@@ -19,6 +23,78 @@ fn to_btree(hm: &HashMap<String, String>) -> BTreeMap<String, String> {
 /// Convert BTreeMap to HashMap for protobuf serialization.
 fn to_hashmap(bm: &BTreeMap<String, String>) -> HashMap<String, String> {
     bm.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Map a proto `QueryRequest` into the engine's `Query`.
+fn build_query(req: &pb::QueryRequest) -> Query {
+    Query {
+        event_types: req.event_types.clone(),
+        from_seq: req.from_seq,
+        to_seq: req.to_seq,
+        metadata: req
+            .metadata
+            .iter()
+            .map(|m| QueryMetadataFilter {
+                key: m.key.clone(),
+                value: m.value.clone(),
+            })
+            .collect(),
+        // prost represents the proto3 enum field as `i32` (so unknown enum
+        // values survive a round-trip). `TryFrom` recovers the typed variant;
+        // RECORDS (0) and any future/unspecified value fall back to Records.
+        result: match pb::QueryResult::try_from(req.result) {
+            Ok(pb::QueryResult::Count) => EngineQueryResult::Count,
+            Ok(pb::QueryResult::Exists) => EngineQueryResult::Exists,
+            Ok(pb::QueryResult::CountDistinct) => EngineQueryResult::CountDistinct,
+            Ok(pb::QueryResult::Min) => EngineQueryResult::Min,
+            Ok(pb::QueryResult::Max) => EngineQueryResult::Max,
+            Ok(pb::QueryResult::DistinctValues) => EngineQueryResult::DistinctValues,
+            _ => EngineQueryResult::Records,
+        },
+        aggregate_field: if req.aggregate_field.is_empty() {
+            None
+        } else {
+            Some(req.aggregate_field.clone())
+        },
+        absent: req.absent.as_ref().map(|a| QueryAbsentMatch {
+            peer_event_types: a.peer_event_types.clone(),
+            join_key: a.join_key.clone(),
+        }),
+        limit: req.limit.max(0) as usize,
+        descending: req.descending,
+    }
+}
+
+/// Map an engine `ResultSet` into the proto `QueryResponse` oneof.
+fn result_to_response(rs: ResultSet) -> pb::QueryResponse {
+    let result = match rs {
+        ResultSet::Records(recs) => Some(pb::query_response::Result::Records(pb::RecordsResult {
+            records: recs.iter().map(decoded_to_pb).collect(),
+        })),
+        ResultSet::Count(n) => Some(pb::query_response::Result::Count(n)),
+        ResultSet::Exists(b) => Some(pb::query_response::Result::Exists(b)),
+        ResultSet::CountDistinct(n) => Some(pb::query_response::Result::CountDistinct(n)),
+        ResultSet::Min(n) => Some(pb::query_response::Result::Min(n)),
+        ResultSet::Max(n) => Some(pb::query_response::Result::Max(n)),
+        ResultSet::DistinctValues(vals) => Some(pb::query_response::Result::DistinctValues(
+            pb::DistinctValuesResult { values: vals },
+        )),
+    };
+    pb::QueryResponse { result }
+}
+
+/// Encode a `DecodedRecord` into the wire `Record`.
+fn decoded_to_pb(r: &crate::record::DecodedRecord) -> pb::Record {
+    pb::Record {
+        namespace_id: r.namespace_id,
+        stream_id: r.stream_id,
+        seq: r.seq,
+        event_type: r.event_type.clone(),
+        timestamp_ns: r.timestamp_ns,
+        content_type: r.content_type.clone(),
+        metadata: to_hashmap(&r.metadata),
+        content: r.user_content.clone(),
+    }
 }
 
 pub struct LogDbServiceImpl {
@@ -676,20 +752,28 @@ impl LogDbService for LogDbServiceImpl {
         crate::auth::require_role(&req, crate::auth::Role::Reader)?;
         let r = req.get_ref();
 
-        // Validate namespace + stream exist
-        let (_ns_id, _stream_id) = self.resolve(&r.namespace, &r.stream)?;
+        // Resolve namespace + stream (validates existence, gives stream_id).
+        let (_ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 
-        let db_name = crate::cache::indexer::db_filename(&r.namespace, &r.stream);
-        let db_path = self.cache_dir.join(db_name);
+        // Read boundary: COMMITTED cursor. The segment is the source of truth —
+        // we read it directly instead of the SQLite cache, so a record becomes
+        // queryable within a Committer cycle (~≤10ms) of Append returning,
+        // rather than waiting for the async Indexer. See cr-027 读边界.
+        let committed = self.storage.committed_gid();
+        let all = self
+            .storage
+            .scan(0, committed)
+            .map_err(|e| Status::internal(format!("scan: {}", e)))?;
 
-        if !db_path.exists() {
-            return Ok(Response::new(pb::QueryResponse { rows: vec![] }));
-        }
+        // The engine operates on one stream's records.
+        let stream_records: Vec<crate::record::DecodedRecord> = all
+            .into_iter()
+            .filter(|rec| rec.stream_id == stream_id)
+            .collect();
 
-        match crate::cache::execute_query(&db_path, &r.sql) {
-            Ok(rows) => Ok(Response::new(pb::QueryResponse { rows })),
-            Err(e) => Err(Status::invalid_argument(e.to_string())),
-        }
+        let q = build_query(r);
+        let rs = query::execute(&q, &stream_records);
+        Ok(Response::new(result_to_response(rs)))
     }
 
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<pb::Record, Status>>;
@@ -857,5 +941,115 @@ impl LogDbService for LogDbServiceImpl {
             deleted: true,
             deleted_count: deleted,
         }))
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    use crate::record::DecodedRecord;
+    use std::collections::BTreeMap;
+
+    fn rec(seq: u64, event_type: &str, meta: &[(&str, &str)]) -> DecodedRecord {
+        let mut metadata = BTreeMap::new();
+        for (k, v) in meta {
+            metadata.insert((*k).to_string(), (*v).to_string());
+        }
+        DecodedRecord {
+            namespace_id: 1,
+            stream_id: 7,
+            seq,
+            event_type: event_type.to_string(),
+            content_type: "application/json".to_string(),
+            metadata,
+            timestamp_ns: seq,
+            user_content: format!("c-{}", seq).into_bytes(),
+        }
+    }
+
+    #[test]
+    fn build_query_maps_all_fields_and_defaults_result_to_records() {
+        let req = pb::QueryRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            event_types: vec!["a".into(), "b".into()],
+            from_seq: Some(5),
+            to_seq: Some(9),
+            metadata: vec![pb::MetadataFilter {
+                key: "turn_id".into(),
+                value: "1".into(),
+            }],
+            result: pb::QueryResult::CountDistinct.into(),
+            aggregate_field: "turn_id".into(),
+            absent: Some(pb::AbsentMatch {
+                peer_event_types: vec!["turn_completed".into()],
+                join_key: "turn_id".into(),
+            }),
+            limit: 3,
+            descending: true,
+        };
+        let q = build_query(&req);
+        assert_eq!(q.event_types, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(q.from_seq, Some(5));
+        assert_eq!(q.to_seq, Some(9));
+        assert_eq!(q.metadata.len(), 1);
+        assert_eq!(q.metadata[0].key, "turn_id");
+        assert_eq!(q.result, EngineQueryResult::CountDistinct);
+        assert_eq!(q.aggregate_field.as_deref(), Some("turn_id"));
+        assert_eq!(q.absent.as_ref().unwrap().join_key, "turn_id");
+        assert_eq!(q.limit, 3);
+        assert!(q.descending);
+    }
+
+    #[test]
+    fn build_query_unspecified_result_is_records_and_empty_aggregate_is_none() {
+        let req = pb::QueryRequest::default();
+        let q = build_query(&req);
+        assert_eq!(q.result, EngineQueryResult::Records);
+        assert!(q.aggregate_field.is_none());
+        assert!(q.absent.is_none());
+        assert_eq!(q.limit, 0);
+    }
+
+    #[test]
+    fn build_query_negative_limit_clamped_to_zero() {
+        let req = pb::QueryRequest {
+            limit: -5,
+            ..Default::default()
+        };
+        assert_eq!(build_query(&req).limit, 0);
+    }
+
+    #[test]
+    fn result_to_response_count() {
+        let resp = result_to_response(ResultSet::Count(42));
+        assert!(matches!(
+            resp.result,
+            Some(pb::query_response::Result::Count(42))
+        ));
+    }
+
+    #[test]
+    fn result_to_response_records_carries_fields() {
+        let resp = result_to_response(ResultSet::Records(vec![rec(3, "x", &[])]));
+        match resp.result {
+            Some(pb::query_response::Result::Records(rr)) => {
+                assert_eq!(rr.records.len(), 1);
+                assert_eq!(rr.records[0].seq, 3);
+                assert_eq!(rr.records[0].stream_id, 7);
+            }
+            _ => panic!("expected Records"),
+        }
+    }
+
+    #[test]
+    fn result_to_response_distinct_values() {
+        let resp = result_to_response(ResultSet::DistinctValues(vec!["9".into(), "10".into()]));
+        match resp.result {
+            Some(pb::query_response::Result::DistinctValues(dv)) => {
+                assert_eq!(dv.values, vec!["9".to_string(), "10".to_string()])
+            }
+            _ => panic!("expected DistinctValues"),
+        }
     }
 }

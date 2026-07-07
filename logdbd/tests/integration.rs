@@ -20,6 +20,7 @@ use logdbd::pb::log_db_service_server::LogDbServiceServer;
 use logdbd::replication::{ReplicationServiceImpl, run_primary_sync};
 use logdbd::service::LogDbServiceImpl;
 use logdbd::storage::Storage;
+use logdbd_proto::pb::{QueryRequest, QueryResult, query_response};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1262,30 +1263,41 @@ async fn cache_query_after_append() {
     wait_for_indexer(&indexer, 3, 3000).await;
 
     let resp = client
-        .query(pb::QueryRequest {
+        .query(QueryRequest {
             namespace: "test".into(),
             stream: "main".into(),
-            sql: "SELECT seq, event_type FROM records ORDER BY seq".into(),
+            result: QueryResult::Records.into(),
+            ..Default::default()
         })
         .await
         .unwrap()
         .into_inner();
 
-    assert_eq!(resp.rows.len(), 3, "should return 3 rows");
-    assert!(resp.rows[0].contains("type.0"));
-    assert!(resp.rows[1].contains("type.1"));
-    assert!(resp.rows[2].contains("type.2"));
+    let recs = match resp.result {
+        Some(query_response::Result::Records(rr)) => rr.records,
+        _ => panic!("expected Records"),
+    };
+    assert_eq!(recs.len(), 3, "should return 3 records");
+    assert_eq!(recs[0].event_type, "type.0");
+    assert_eq!(recs[0].seq, 1);
+    assert_eq!(recs[1].event_type, "type.1");
+    assert_eq!(recs[2].event_type, "type.2");
 
     let count_resp = client
-        .query(pb::QueryRequest {
+        .query(QueryRequest {
             namespace: "test".into(),
             stream: "main".into(),
-            sql: "SELECT COUNT(*) FROM records".into(),
+            result: QueryResult::Count.into(),
+            ..Default::default()
         })
         .await
         .unwrap()
         .into_inner();
-    assert!(count_resp.rows[0].contains("3"), "COUNT should return 3");
+    let count = match count_resp.result {
+        Some(query_response::Result::Count(n)) => n,
+        _ => panic!("expected Count"),
+    };
+    assert_eq!(count, 3, "COUNT should return 3");
 
     indexer.stop();
 }
@@ -1328,90 +1340,56 @@ async fn cache_multi_stream_isolation() {
 
     // Query stream-a independently
     let resp_a = client
-        .query(pb::QueryRequest {
+        .query(QueryRequest {
             namespace: "test".into(),
             stream: "stream-a".into(),
-            sql: "SELECT COUNT(*) FROM records".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(
-        resp_a.rows[0].contains("3"),
-        "stream-a should have 3 records"
-    );
-
-    // Query stream-b independently
-    let resp_b = client
-        .query(pb::QueryRequest {
-            namespace: "test".into(),
-            stream: "stream-b".into(),
-            sql: "SELECT COUNT(*) FROM records".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(
-        resp_b.rows[0].contains("2"),
-        "stream-b should have 2 records"
-    );
-
-    // stream-a should NOT contain b's events
-    let resp_a_events = client
-        .query(pb::QueryRequest {
-            namespace: "test".into(),
-            stream: "stream-a".into(),
-            sql: "SELECT event_type FROM records WHERE event_type LIKE 'b.%'".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(
-        resp_a_events.rows.is_empty(),
-        "stream-a must not see stream-b's data"
-    );
-
-    indexer.stop();
-}
-
-#[tokio::test]
-async fn cache_query_rejects_non_select() {
-    let (addr, _dir, indexer) = start_cache_server().await;
-    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
-        .await
-        .unwrap();
-
-    // Append one record first
-    client
-        .append(pb::AppendRequest {
-            namespace: "test".into(),
-            stream: "main".into(),
-            event_type: "test".into(),
-            content: b"data".to_vec(),
+            result: QueryResult::Count.into(),
             ..Default::default()
         })
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
+    let count_a = match resp_a.result {
+        Some(query_response::Result::Count(n)) => n,
+        _ => panic!("expected Count"),
+    };
+    assert_eq!(count_a, 3, "stream-a should have 3 records");
 
-    wait_for_indexer(&indexer, 1, 3000).await;
+    // Query stream-b independently
+    let resp_b = client
+        .query(QueryRequest {
+            namespace: "test".into(),
+            stream: "stream-b".into(),
+            result: QueryResult::Count.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let count_b = match resp_b.result {
+        Some(query_response::Result::Count(n)) => n,
+        _ => panic!("expected Count"),
+    };
+    assert_eq!(count_b, 2, "stream-b should have 2 records");
 
-    let forbidden_sqls = [
-        "INSERT INTO records (seq) VALUES (99)",
-        "DELETE FROM records WHERE seq = 1",
-        "UPDATE records SET deleted = 1",
-        "DROP TABLE records",
-    ];
-
-    for sql in &forbidden_sqls {
-        let err = client
-            .query(pb::QueryRequest {
-                namespace: "test".into(),
-                stream: "main".into(),
-                sql: sql.to_string(),
-            })
-            .await;
-        assert!(err.is_err(), "should reject: {}", sql);
-    }
+    // stream-a should NOT contain b's events (native engine filters by
+    // stream_id in the handler, so stream-a queries never see stream-b data).
+    let resp_a_events = client
+        .query(QueryRequest {
+            namespace: "test".into(),
+            stream: "stream-a".into(),
+            event_types: vec!["b.event".into()],
+            result: QueryResult::Records.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let a_recs = match resp_a_events.result {
+        Some(query_response::Result::Records(rr)) => rr.records,
+        _ => panic!("expected Records"),
+    };
+    assert!(a_recs.is_empty(), "stream-a must not see stream-b's data");
 
     indexer.stop();
 }
@@ -1439,20 +1417,19 @@ async fn cache_query_concurrent_reads() {
 
     wait_for_indexer(&indexer, 50, 5000).await;
 
-    // Multiple concurrent queries
+    // Multiple concurrent queries — each filters on one event_type.
     let mut handles = Vec::new();
     for filter_val in 0..5 {
         let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
             .await
             .unwrap();
         handles.push(tokio::spawn(async move {
-            c.query(pb::QueryRequest {
+            c.query(QueryRequest {
                 namespace: "test".into(),
                 stream: "main".into(),
-                sql: format!(
-                    "SELECT COUNT(*) FROM records WHERE event_type = 'type.{}'",
-                    filter_val
-                ),
+                event_types: vec![format!("type.{}", filter_val)],
+                result: QueryResult::Count.into(),
+                ..Default::default()
             })
             .await
         }));
@@ -1460,82 +1437,12 @@ async fn cache_query_concurrent_reads() {
 
     for h in handles {
         let resp = h.await.unwrap().unwrap().into_inner();
-        assert!(
-            resp.rows[0].contains("10"),
-            "each event_type should have 10 records"
-        );
+        let count = match resp.result {
+            Some(query_response::Result::Count(n)) => n,
+            _ => panic!("expected Count"),
+        };
+        assert_eq!(count, 10, "each event_type should have 10 records");
     }
-
-    indexer.stop();
-}
-
-#[tokio::test]
-async fn cache_tombstone_and_query() {
-    let (addr, _dir, indexer) = start_cache_server().await;
-    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
-        .await
-        .unwrap();
-
-    // Append 5 records
-    for i in 0..5u64 {
-        client
-            .append(pb::AppendRequest {
-                namespace: "test".into(),
-                stream: "main".into(),
-                event_type: "msg".into(),
-                content: format!("msg-{}", i).into_bytes(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-    }
-
-    // Append a tombstone targeting seq=2
-    let mut meta = std::collections::HashMap::new();
-    meta.insert("target_seq".into(), "2".into());
-    client
-        .append(pb::AppendRequest {
-            namespace: "test".into(),
-            stream: "main".into(),
-            event_type: "logdb.tombstone".into(),
-            metadata: meta,
-            content: vec![],
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    wait_for_indexer(&indexer, 6, 3000).await;
-
-    // Non-deleted count should be 4
-    let resp = client
-        .query(pb::QueryRequest {
-            namespace: "test".into(),
-            stream: "main".into(),
-            sql:
-                "SELECT COUNT(*) FROM records WHERE deleted = 0 AND event_type != 'logdb.tombstone'"
-                    .into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(
-        resp.rows[0].contains("4"),
-        "should have 4 non-deleted records after tombstone: got {}",
-        resp.rows[0]
-    );
-
-    // Tombstone record should exist
-    let tomb_resp = client
-        .query(pb::QueryRequest {
-            namespace: "test".into(),
-            stream: "main".into(),
-            sql: "SELECT seq FROM records WHERE event_type = 'logdb.tombstone'".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(tomb_resp.rows.len(), 1, "tombstone record should exist");
 
     indexer.stop();
 }
@@ -1622,35 +1529,106 @@ async fn cache_query_with_metadata_index() {
 
     wait_for_indexer(&indexer, 10, 5000).await;
 
-    // Query using json_extract on the indexed 'turn_id' field
-    let resp = client.query(pb::QueryRequest {
-        namespace: "test".into(),
-        stream: "main".into(),
-        sql: "SELECT seq FROM records WHERE json_extract(metadata_json, '$.turn_id') = 'turn-1' ORDER BY seq".into(),
-    }).await.unwrap().into_inner();
-    assert_eq!(
-        resp.rows.len(),
-        3,
-        "turn-1 should match 3 records (i=3,4,5)"
-    );
-
-    // Verify the index was created
-    let index_resp = client
-        .query(pb::QueryRequest {
+    // Query by metadata equality on turn_id (native engine — no SQL, no
+    // json_extract; the metadata index config above is now inert for queries,
+    // the engine filters directly on the decoded record's metadata map).
+    let resp = client
+        .query(QueryRequest {
             namespace: "test".into(),
             stream: "main".into(),
-            sql: "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE '%meta%'".into(),
+            metadata: vec![pb::MetadataFilter {
+                key: "turn_id".into(),
+                value: "turn-1".into(),
+            }],
+            result: QueryResult::Records.into(),
+            ..Default::default()
         })
         .await
         .unwrap()
         .into_inner();
-    assert!(
-        index_resp
-            .rows
-            .iter()
-            .any(|r| r.contains("idx_records_meta_turn_id")),
-        "metadata index on turn_id should exist: {:?}",
-        index_resp.rows
+    let recs = match resp.result {
+        Some(query_response::Result::Records(rr)) => rr.records,
+        _ => panic!("expected Records"),
+    };
+    assert_eq!(recs.len(), 3, "turn-1 should match 3 records (i=3,4,5)");
+
+    indexer.stop();
+}
+
+/// cr-027: Query reads the log segment directly (committed cursor), so records
+/// become visible within a Committer cycle of Append — and Query works even
+/// when the SQLite cache file is absent/removed.
+#[tokio::test]
+async fn query_reads_segment_not_sqlite_cache() {
+    let (addr, dir, indexer) = start_cache_server().await;
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+    let ns = "qcache";
+    let stream = "main";
+
+    for i in 0..3u64 {
+        client
+            .append(pb::AppendRequest {
+                namespace: ns.into(),
+                stream: stream.into(),
+                event_type: "evt".into(),
+                content: format!("{{\"i\":{}}}", i).into_bytes(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    // Poll COUNT until the committed cursor catches up (≤ Committer cycle).
+    let mut count = 0u64;
+    for _ in 0..200 {
+        let resp = client
+            .query(QueryRequest {
+                namespace: ns.into(),
+                stream: stream.into(),
+                result: QueryResult::Count.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        count = match resp.result {
+            Some(query_response::Result::Count(n)) => n,
+            _ => 0,
+        };
+        if count == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(count, 3, "committed records not visible to Query");
+
+    // Stronger: remove the SQLite cache file, then query again — must still
+    // return the records, proving Query reads the segment, not SQLite.
+    let db_path = dir
+        .path()
+        .join("cache")
+        .join(format!("{}.{}.db", ns, stream));
+    let _ = std::fs::remove_file(&db_path);
+
+    let resp = client
+        .query(QueryRequest {
+            namespace: ns.into(),
+            stream: stream.into(),
+            result: QueryResult::Count.into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let count_after = match resp.result {
+        Some(query_response::Result::Count(n)) => n,
+        _ => 0,
+    };
+    assert_eq!(
+        count_after, 3,
+        "Query must read the segment even with the SQLite cache file removed"
     );
 
     indexer.stop();

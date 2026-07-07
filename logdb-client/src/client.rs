@@ -175,25 +175,19 @@ impl Client {
 
     // ── Query ──────────────────────────────────────────────────────────
 
-    /// Execute a read-only SQL query against a stream's query cache.
+    /// Execute a structured query against a stream.
     ///
-    /// Only SELECT statements are allowed. The connection is opened read-only
-    /// at the SQLite level — any write operation is rejected by the kernel.
-    pub async fn query(
-        &mut self,
-        namespace: &str,
-        stream: &str,
-        sql: &str,
-    ) -> Result<Vec<String>, tonic::Status> {
-        let resp = self
-            .inner
-            .query(QueryRequest {
-                namespace: namespace.into(),
-                stream: stream.into(),
-                sql: sql.into(),
-            })
-            .await?;
-        Ok(resp.into_inner().rows)
+    /// Reads the log segment directly at the committed cursor (no SQL, no
+    /// SQLite cache). Build a `QueryRequest` with predicates + a `QueryResult`
+    /// shape; match on the returned `QueryResponse::result` oneof.
+    ///
+    /// Semantics: `from_seq`/`to_seq` are an inclusive closed interval
+    /// (`None` = unbounded on that side); `result` defaults to `RECORDS`;
+    /// `limit = 0` means unlimited; aggregations skip records lacking
+    /// `aggregate_field`.
+    pub async fn query(&mut self, request: QueryRequest) -> Result<QueryResponse, tonic::Status> {
+        let resp = self.inner.query(request).await?;
+        Ok(resp.into_inner())
     }
 
     // ── Subscribe ───────────────────────────────────────────────────────

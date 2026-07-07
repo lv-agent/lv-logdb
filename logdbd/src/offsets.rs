@@ -8,12 +8,15 @@
 //! Writes are atomic (tmp + rename). Loaded once at startup; flushed periodically.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 /// (namespace, stream, consumer_group, consumer_id) -> committed seq
 pub type OffsetKey = (String, String, String, String);
 
 const MAGIC: &[u8; 4] = b"LDBO";
 const VERSION: u8 = 1;
+const FILENAME: &str = "offsets.bin";
+const TMP_FILENAME: &str = "offsets.bin.tmp";
 
 pub fn encode(map: &HashMap<OffsetKey, u64>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(16 + map.len() * 64);
@@ -80,6 +83,27 @@ fn read_str(bytes: &[u8], pos: usize) -> Result<(String, usize), OffsetError> {
     }
     let s = String::from_utf8(bytes[start..end].to_vec()).map_err(|_| OffsetError::BadUtf8)?;
     Ok((s, end))
+}
+
+/// Load all offsets from `<dir>/offsets.bin`. Empty map if the file is absent.
+pub fn load(dir: &Path) -> Result<HashMap<OffsetKey, u64>, OffsetError> {
+    let path = dir.join(FILENAME);
+    match std::fs::read(&path) {
+        Ok(bytes) => decode(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(OffsetError::Io(e.to_string())),
+    }
+}
+
+/// Atomically write all offsets to `<dir>/offsets.bin` (write tmp, then rename).
+pub fn save(dir: &Path, map: &HashMap<OffsetKey, u64>) -> Result<(), OffsetError> {
+    std::fs::create_dir_all(dir).map_err(|e| OffsetError::Io(e.to_string()))?;
+    let tmp = dir.join(TMP_FILENAME);
+    let final_path = dir.join(FILENAME);
+    let bytes = encode(map);
+    std::fs::write(&tmp, &bytes).map_err(|e| OffsetError::Io(e.to_string()))?;
+    std::fs::rename(&tmp, &final_path).map_err(|e| OffsetError::Io(e.to_string()))?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -191,5 +215,37 @@ mod tests {
         );
         let bytes = encode(&map);
         assert_eq!(decode(&bytes).unwrap(), map);
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = HashMap::new();
+        map.insert(("ns".into(), "s".into(), "g".into(), "c1".into()), 5u64);
+        map.insert(("ns".into(), "s".into(), "g".into(), "c2".into()), 9);
+
+        save(dir.path(), &map).unwrap();
+        assert!(dir.path().join("offsets.bin").exists());
+        // tmp file must not linger after atomic rename
+        assert!(!dir.path().join("offsets.bin.tmp").exists());
+
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded, map);
+    }
+
+    #[test]
+    fn load_missing_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn save_creates_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c");
+        let map = HashMap::new();
+        save(&nested, &map).unwrap();
+        assert!(nested.join("offsets.bin").exists());
     }
 }

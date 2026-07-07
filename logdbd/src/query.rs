@@ -193,17 +193,32 @@ fn numeric_extremum(records: &[&DecodedRecord], field: Option<&str>, is_min: boo
     best.unwrap_or(0)
 }
 
-/// Anti-join. Task 1 returns the candidates unchanged when `absent` is None;
-/// Task 3 implements the real NOT EXISTS semantics.
+/// Anti-join (NOT EXISTS): keep `candidates` whose `join_key` value does NOT
+/// appear on any record in `all_records` matching `peer_event_types`.
+///
+/// A candidate lacking the `join_key` is kept (no peer can match a missing key).
 fn apply_absent<'a>(
     candidates: &[&'a DecodedRecord],
-    _all_records: &[DecodedRecord],
+    all_records: &[DecodedRecord],
     absent: Option<&AbsentMatch>,
 ) -> Vec<&'a DecodedRecord> {
-    match absent {
-        Some(_) => unimplemented!("anti-join added in Task 3"),
-        None => candidates.to_vec(),
-    }
+    let Some(absent) = absent else {
+        return candidates.to_vec();
+    };
+    // Set of join_key values that have at least one matching peer.
+    let peer_keys: HashSet<String> = all_records
+        .iter()
+        .filter(|r| absent.peer_event_types.iter().any(|e| e == &r.event_type))
+        .filter_map(|r| r.metadata.get(&absent.join_key).cloned())
+        .collect();
+    candidates
+        .iter()
+        .copied()
+        .filter(|r| match r.metadata.get(&absent.join_key) {
+            Some(val) => !peer_keys.contains(val),
+            None => true,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -424,5 +439,84 @@ mod tests {
             }
             _ => panic!("expected DistinctValues"),
         }
+    }
+
+    #[test]
+    fn absent_match_returns_records_without_a_peer() {
+        // turn_started records whose turn_id has NO turn_completed/failed/...
+        // Here NO records are "completed", so BOTH turn_started (turn_id 10, 20) qualify.
+        let q = Query {
+            event_types: vec!["turn_started".into()],
+            result: QueryResult::Records,
+            absent: Some(AbsentMatch {
+                peer_event_types: vec!["turn_completed".into(), "turn_failed".into()],
+                join_key: "turn_id".into(),
+            }),
+            ..Default::default()
+        };
+        match execute(&q, &records()) {
+            ResultSet::Records(rows) => {
+                let mut seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
+                seqs.sort();
+                assert_eq!(seqs, vec![1, 3]);
+            }
+            _ => panic!("expected Records"),
+        }
+    }
+
+    #[test]
+    fn absent_match_excludes_records_with_a_peer() {
+        // Add a turn_completed for turn_id=10 → seq-1 turn_started is now complete.
+        let mut recs = records();
+        recs.push(rec(5, "turn_completed", &[("turn_id", "10")]));
+        let q = Query {
+            event_types: vec!["turn_started".into()],
+            result: QueryResult::Records,
+            absent: Some(AbsentMatch {
+                peer_event_types: vec!["turn_completed".into()],
+                join_key: "turn_id".into(),
+            }),
+            ..Default::default()
+        };
+        match execute(&q, &recs) {
+            ResultSet::Records(rows) => {
+                // Only turn_id=20 (seq 3) remains; turn_id=10 (seq 1) has a peer.
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].seq, 3);
+            }
+            _ => panic!("expected Records"),
+        }
+    }
+
+    #[test]
+    fn absent_match_count_incomplete() {
+        let q = Query {
+            event_types: vec!["turn_started".into()],
+            result: QueryResult::Count,
+            absent: Some(AbsentMatch {
+                peer_event_types: vec!["turn_completed".into()],
+                join_key: "turn_id".into(),
+            }),
+            ..Default::default()
+        };
+        // No completions → both turn_started are incomplete.
+        assert!(matches!(execute(&q, &records()), ResultSet::Count(2)));
+    }
+
+    #[test]
+    fn absent_match_records_lacking_join_key_are_kept() {
+        // A turn_started with no turn_id at all is kept (no peer can match its key).
+        let mut recs = records();
+        recs.push(rec(6, "turn_started", &[])); // no turn_id
+        let q = Query {
+            event_types: vec!["turn_started".into()],
+            result: QueryResult::Count,
+            absent: Some(AbsentMatch {
+                peer_event_types: vec!["turn_completed".into()],
+                join_key: "turn_id".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(execute(&q, &recs), ResultSet::Count(3)));
     }
 }

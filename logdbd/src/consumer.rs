@@ -57,8 +57,8 @@ impl ConsumerTracker {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.insert(key, seq);
+            self.dirty.store(true, Ordering::Release);
         }
-        self.dirty.store(true, Ordering::Release);
     }
 
     /// Get the last committed offset for a consumer (0 if none).
@@ -104,20 +104,30 @@ impl ConsumerTracker {
         if !self.dirty.load(Ordering::Acquire) {
             return Ok(());
         }
-        if let Some(dir) = &self.offsets_dir {
-            let snapshot = self
+        // Snapshot the map and clear `dirty` atomically under the WRITE lock.
+        // This closes the commit/flush race: a commit that lands AFTER this
+        // section re-sets dirty=true and is persisted by the next flush; a
+        // commit that landed BEFORE is already in the snapshot. Saving outside
+        // the lock keeps the critical section short.
+        let snapshot = {
+            let map = self
                 .offsets
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            offsets::save(dir, &snapshot)?;
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.dirty.store(false, Ordering::Release);
+            self.offsets_dir.as_ref().map(|_| map.clone())
+        };
+        if let (Some(dir), Some(snap)) = (self.offsets_dir.as_ref(), snapshot) {
+            offsets::save(dir, &snap)?;
         }
-        self.dirty.store(false, Ordering::Release);
         Ok(())
     }
 
     /// Spawn a background thread that flushes every `interval`.
-    /// Best-effort; the caller should also `flush()` on shutdown.
+    /// Fire-and-forget: the thread runs for the process lifetime and is killed
+    /// on exit — the caller MUST also call `flush()` on graceful shutdown (a
+    /// final flush, not a `.join()`). Do not join the returned handle; the loop
+    /// never returns.
     pub fn start_flush_loop(self: &Arc<Self>, interval: Duration) -> std::thread::JoinHandle<()> {
         let this = Arc::clone(self);
         std::thread::Builder::new()
@@ -199,5 +209,35 @@ mod tests {
         assert_eq!(g1.len(), 2);
         assert!(g1.contains(&("w1".into(), 10)));
         assert!(g1.contains(&("w2".into(), 20)));
+    }
+
+    #[test]
+    fn flush_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let offsets_dir = dir.path().to_path_buf();
+        let tracker = ConsumerTracker::new(Some(offsets_dir.clone()));
+        tracker.commit("ns", "s", "g", "c1", 7);
+        tracker.flush().unwrap();
+        tracker.flush().unwrap(); // second flush must not corrupt/truncate
+
+        let tracker2 = ConsumerTracker::new(Some(offsets_dir));
+        assert_eq!(tracker2.get("ns", "s", "g", "c1"), 7);
+    }
+
+    #[test]
+    fn flush_when_clean_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let offsets_dir = dir.path().to_path_buf();
+        let tracker = ConsumerTracker::new(Some(offsets_dir.clone()));
+        tracker.commit("ns", "s", "g", "c1", 5);
+        tracker.flush().unwrap();
+
+        // A second tracker loads the persisted offset, then flushes with no new
+        // commit (dirty == false → early return). A third tracker must still see
+        // the offset — the no-op flush must not wipe the file.
+        let tracker2 = ConsumerTracker::new(Some(offsets_dir.clone()));
+        tracker2.flush().unwrap();
+        let tracker3 = ConsumerTracker::new(Some(offsets_dir));
+        assert_eq!(tracker3.get("ns", "s", "g", "c1"), 5);
     }
 }

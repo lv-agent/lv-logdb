@@ -95,10 +95,12 @@ pub fn execute(query: &Query, records: &[DecodedRecord]) -> ResultSet {
         }
         QueryResult::DistinctValues => {
             let mut vals = distinct_field_values(&filtered, query.aggregate_field.as_deref());
+            // `distinct_field_values` returns values in first-occurrence order,
+            // which for seq-ordered input (storage.scan) is seq order. Order by
+            // that — NOT lexicographically — so numeric-looking values like
+            // turn_id don't misorder past one digit ("100" < "20" < "9" lexically).
             if query.descending {
-                vals.sort_by(|a, b| b.cmp(a));
-            } else {
-                vals.sort();
+                vals.reverse();
             }
             if query.limit > 0 && vals.len() > query.limit {
                 vals.truncate(query.limit);
@@ -143,8 +145,10 @@ fn sort_and_limit(rows: &mut Vec<DecodedRecord>, descending: bool, limit: usize)
     }
 }
 
-/// Distinct string values of `field` across `records`. If `field` is None, uses
-/// `seq` (stringified). Records lacking the field are skipped.
+/// Distinct string values of `field` across `records`, in **first-occurrence
+/// order** (which is seq order when the input is seq-ordered, as `storage.scan`
+/// provides). If `field` is None, uses `seq` (stringified). Records lacking the
+/// field are skipped.
 fn distinct_field_values(records: &[&DecodedRecord], field: Option<&str>) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
@@ -166,6 +170,8 @@ fn distinct_field_values(records: &[&DecodedRecord], field: Option<&str>) -> Vec
 /// Min (is_min=true) or Max of a numeric field. If `field` is None, uses `seq`.
 /// Records lacking the field or with a non-numeric value are skipped.
 /// Returns 0 if none qualify (mirrors SQL `COALESCE(MIN/MAX(..), 0)`).
+/// Parses values as `u64` (non-negative); records with negative or non-numeric
+/// values are skipped. lv-fixus's turn_id/step_id are non-negative.
 fn numeric_extremum(records: &[&DecodedRecord], field: Option<&str>, is_min: bool) -> u64 {
     let mut best: Option<u64> = None;
     for r in records {
@@ -518,5 +524,107 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(execute(&q, &recs), ResultSet::Count(3)));
+    }
+
+    #[test]
+    fn distinct_values_order_follows_seq_not_lexicographic() {
+        // turn_ids 9, 10, 20 appearing in seq order. Lexical sort would give
+        // ["10","20","9"]; seq order gives ["9","10","20"].
+        let recs = vec![
+            rec(1, "turn_started", &[("turn_id", "9")]),
+            rec(2, "turn_started", &[("turn_id", "10")]),
+            rec(3, "turn_started", &[("turn_id", "20")]),
+        ];
+        let asc = Query {
+            result: QueryResult::DistinctValues,
+            aggregate_field: Some("turn_id".into()),
+            ..Default::default()
+        };
+        match execute(&asc, &recs) {
+            ResultSet::DistinctValues(v) => {
+                assert_eq!(v, vec!["9".to_string(), "10".to_string(), "20".to_string()])
+            }
+            _ => panic!("expected DistinctValues"),
+        }
+        let desc = Query {
+            result: QueryResult::DistinctValues,
+            aggregate_field: Some("turn_id".into()),
+            descending: true,
+            ..Default::default()
+        };
+        match execute(&desc, &recs) {
+            ResultSet::DistinctValues(v) => {
+                assert_eq!(v, vec!["20".to_string(), "10".to_string(), "9".to_string()])
+            }
+            _ => panic!("expected DistinctValues"),
+        }
+    }
+
+    #[test]
+    fn from_seq_is_inclusive() {
+        // from_seq = Some(2) must INCLUDE seq 2 (closed interval). records() has
+        // seqs 1,2,3,4 → from_seq=2 keeps 2,3,4 → Count(3).
+        let q = Query {
+            from_seq: Some(2),
+            result: QueryResult::Count,
+            ..Default::default()
+        };
+        assert!(matches!(execute(&q, &records()), ResultSet::Count(3)));
+    }
+
+    #[test]
+    fn execute_on_empty_records() {
+        let empty: Vec<DecodedRecord> = vec![];
+        assert!(matches!(
+            execute(
+                &Query {
+                    result: QueryResult::Count,
+                    ..Default::default()
+                },
+                &empty
+            ),
+            ResultSet::Count(0)
+        ));
+        assert!(matches!(
+            execute(
+                &Query {
+                    result: QueryResult::Exists,
+                    ..Default::default()
+                },
+                &empty
+            ),
+            ResultSet::Exists(false)
+        ));
+        assert!(matches!(
+            execute(
+                &Query {
+                    result: QueryResult::Max,
+                    ..Default::default()
+                },
+                &empty
+            ),
+            ResultSet::Max(0)
+        ));
+        assert!(matches!(
+            execute(
+                &Query {
+                    result: QueryResult::CountDistinct,
+                    aggregate_field: Some("x".into()),
+                    ..Default::default()
+                },
+                &empty
+            ),
+            ResultSet::CountDistinct(0)
+        ));
+        match execute(
+            &Query {
+                result: QueryResult::Records,
+                ..Default::default()
+            },
+            &empty,
+        ) {
+            ResultSet::Records(rows) => assert!(rows.is_empty()),
+            _ => panic!("expected Records"),
+        }
     }
 }

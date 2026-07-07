@@ -41,7 +41,10 @@ pub fn decode(bytes: &[u8]) -> Result<HashMap<OffsetKey, u64>, OffsetError> {
     if bytes.is_empty() {
         return Ok(HashMap::new());
     }
-    if bytes.len() < 9 || &bytes[..4] != MAGIC {
+    if bytes.len() < 9 {
+        return Err(OffsetError::UnexpectedEof);
+    }
+    if &bytes[..4] != MAGIC {
         return Err(OffsetError::BadMagic);
     }
     if bytes[4] != VERSION {
@@ -118,5 +121,75 @@ mod tests {
         let bytes = encode(&map);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, map);
+    }
+
+    #[test]
+    fn decode_empty_input_returns_empty_map() {
+        assert!(decode(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_map_roundtrips() {
+        let map = HashMap::new();
+        let bytes = encode(&map);
+        assert_eq!(decode(&bytes).unwrap(), map);
+    }
+
+    #[test]
+    fn decode_bad_magic() {
+        // 9 bytes, valid header shape, wrong magic
+        assert!(matches!(
+            decode(b"XXXX\x01\x00\x00\x00\x00"),
+            Err(OffsetError::BadMagic)
+        ));
+    }
+
+    #[test]
+    fn decode_wrong_version() {
+        assert!(matches!(
+            decode(b"LDBO\x02\x00\x00\x00\x00"),
+            Err(OffsetError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[test]
+    fn decode_truncated_header_returns_unexpected_eof() {
+        // correct magic, but header shorter than 9 bytes
+        assert!(matches!(
+            decode(b"LDBO\x01"),
+            Err(OffsetError::UnexpectedEof)
+        ));
+    }
+
+    #[test]
+    fn decode_truncated_entry_returns_unexpected_eof() {
+        // header claims 1 entry, but no entry data follows
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"LDBO");
+        bytes.push(1); // version
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        assert!(matches!(decode(&bytes), Err(OffsetError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn decode_bad_utf8() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"LDBO");
+        bytes.push(1); // version
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // ns_len = 1
+        bytes.push(0xFF); // invalid UTF-8 start byte
+        assert!(matches!(decode(&bytes), Err(OffsetError::BadUtf8)));
+    }
+
+    #[test]
+    fn roundtrip_multibyte_utf8_and_empty_fields() {
+        let mut map = HashMap::new();
+        map.insert(
+            ("消费者".into(), "".into(), "grp".into(), "id-1".into()),
+            7u64,
+        );
+        let bytes = encode(&map);
+        assert_eq!(decode(&bytes).unwrap(), map);
     }
 }

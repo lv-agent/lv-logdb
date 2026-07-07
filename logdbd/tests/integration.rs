@@ -1100,13 +1100,18 @@ async fn out_of_retention_graceful() {
     assert!(read10.found, "record at checkpoint boundary should survive");
 }
 
-// ── Cache (SQLite Query) Tests ───────────────────────────────────────────────
+// ── Native query engine Tests (formerly SQLite Query Cache) ──────────────────
+//
+// cr-027 phase 5: the SQLite query cache is gone. `query` reads the segment at
+// the committed cursor; `wait_for_durable` polls `storage.durable_gid()` until
+// the appended records are fsync'd and visible to segment replay.
 
-// Helper: start a test server with cache Indexer, returning (addr, tempdir, indexer).
-async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cache::Indexer>) {
+// Helper: start a test server backed by the native engine, returning
+// (addr, tempdir, storage). The returned `storage` lets callers wait for the
+// durable cursor to advance.
+async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<Storage>) {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
@@ -1117,18 +1122,6 @@ async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cac
     let db = LogDb::open(db_config).unwrap();
     let storage = Arc::new(Storage::new(db, 1));
     let catalog = test_catalog(&data_dir);
-
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
@@ -1152,83 +1145,30 @@ async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cac
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    (addr, dir, indexer)
+    (addr, dir, storage)
 }
 
-/// Wait for the Indexer to reach or exceed `target_gid`.
-async fn wait_for_indexer(indexer: &logdbd::cache::Indexer, target_gid: u64, timeout_ms: u64) {
+/// Wait until the storage durable cursor reaches `target_gid` (records fsync'd
+/// and visible to segment replay). Replay reads the segment at the durable
+/// cursor — there is no SQLite cache to consult anymore.
+async fn wait_for_durable(storage: &Storage, target_gid: u64, timeout_ms: u64) {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        if indexer.last_gid() >= target_gid {
-            break;
-        }
+    while storage.durable_gid() < target_gid {
         if std::time::Instant::now() > deadline {
             panic!(
-                "Indexer did not reach target_gid={} within {}ms (current={})",
+                "durable cursor did not reach target_gid={} within {}ms (current={})",
                 target_gid,
                 timeout_ms,
-                indexer.last_gid()
+                storage.durable_gid()
             );
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
-// Redisign the first test to use the helper
-
 #[tokio::test]
 async fn cache_query_after_append() {
-    use logdbd::cache::Indexer;
-    use logdbd::config::CacheConfig;
-
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
-
-    let mut db_config = DbConfig::default();
-    db_config.data_dir = data_dir.clone();
-    db_config.durability_mode = logdb::DurabilityMode::Sync;
-    db_config.ring_size = 256;
-    db_config.shards = 1;
-    db_config.flush_timeout = Duration::from_secs(5);
-    let db = LogDb::open(db_config).unwrap();
-    let storage = Arc::new(Storage::new(db, 1));
-    let catalog = test_catalog(&data_dir);
-
-    let cache_config = CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
-
-    let log_svc = LogDbServiceImpl::new(
-        Arc::clone(&storage),
-        catalog,
-        Arc::new(ConsumerTracker::new(None)),
-        Arc::new(logdbd::subscribe::SubscribeHub::new()),
-        "cache-test".into(),
-        "primary".into(),
-    );
-    let svc = LogDbServiceServer::new(log_svc);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
+    let (addr, _dir, storage) = start_cache_server().await;
     let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
         .await
         .unwrap();
@@ -1246,7 +1186,8 @@ async fn cache_query_after_append() {
             .unwrap();
     }
 
-    wait_for_indexer(&indexer, 3, 3000).await;
+    // Wait for the 3 appends to become durable (single-shard gid starts at 1).
+    wait_for_durable(&storage, 3, 3000).await;
 
     let resp = client
         .query(QueryRequest {
@@ -1284,13 +1225,11 @@ async fn cache_query_after_append() {
         _ => panic!("expected Count"),
     };
     assert_eq!(count, 3, "COUNT should return 3");
-
-    indexer.stop();
 }
 
 #[tokio::test]
 async fn cache_multi_stream_isolation() {
-    let (addr, _dir, indexer) = start_cache_server().await;
+    let (addr, _dir, storage) = start_cache_server().await;
     let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
         .await
         .unwrap();
@@ -1322,7 +1261,8 @@ async fn cache_multi_stream_isolation() {
             .unwrap();
     }
 
-    wait_for_indexer(&indexer, 5, 3000).await;
+    // 3 + 2 = 5 records appended; durable_gid reaches 5 in a single shard.
+    wait_for_durable(&storage, 5, 3000).await;
 
     // Query stream-a independently
     let resp_a = client
@@ -1376,13 +1316,11 @@ async fn cache_multi_stream_isolation() {
         _ => panic!("expected Records"),
     };
     assert!(a_recs.is_empty(), "stream-a must not see stream-b's data");
-
-    indexer.stop();
 }
 
 #[tokio::test]
 async fn cache_query_concurrent_reads() {
-    let (addr, _dir, indexer) = start_cache_server().await;
+    let (addr, _dir, storage) = start_cache_server().await;
     let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
         .await
         .unwrap();
@@ -1401,7 +1339,7 @@ async fn cache_query_concurrent_reads() {
             .unwrap();
     }
 
-    wait_for_indexer(&indexer, 50, 5000).await;
+    wait_for_durable(&storage, 50, 5000).await;
 
     // Multiple concurrent queries — each filters on one event_type.
     let mut handles = Vec::new();
@@ -1429,114 +1367,6 @@ async fn cache_query_concurrent_reads() {
         };
         assert_eq!(count, 10, "each event_type should have 10 records");
     }
-
-    indexer.stop();
-}
-
-#[tokio::test]
-async fn cache_query_with_metadata_index() {
-    use logdbd::config::StreamIndexConfig;
-
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
-
-    let mut db_config = DbConfig::default();
-    db_config.data_dir = data_dir.clone();
-    db_config.durability_mode = logdb::DurabilityMode::Sync;
-    db_config.ring_size = 256;
-    db_config.shards = 1;
-    db_config.flush_timeout = Duration::from_secs(5);
-    let db = LogDb::open(db_config).unwrap();
-    let storage = Arc::new(Storage::new(db, 1));
-    let catalog = test_catalog(&data_dir);
-
-    // Config with metadata index on 'turn_id'
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        indexes: vec![StreamIndexConfig {
-            stream: "main".into(),
-            fields: vec!["turn_id".into()],
-        }],
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
-
-    let log_svc = LogDbServiceImpl::new(
-        Arc::clone(&storage),
-        catalog,
-        Arc::new(ConsumerTracker::new(None)),
-        Arc::new(logdbd::subscribe::SubscribeHub::new()),
-        "meta-idx-test".into(),
-        "primary".into(),
-    );
-    let svc = LogDbServiceServer::new(log_svc);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(svc)
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
-        .await
-        .unwrap();
-
-    // Append records with different turn_ids in metadata
-    for i in 0..10u64 {
-        let mut meta = std::collections::HashMap::new();
-        meta.insert("turn_id".into(), format!("turn-{}", i / 3));
-        client
-            .append(pb::AppendRequest {
-                namespace: "test".into(),
-                stream: "main".into(),
-                event_type: "llm.call".into(),
-                metadata: meta,
-                content: format!("response-{}", i).into_bytes(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-    }
-
-    wait_for_indexer(&indexer, 10, 5000).await;
-
-    // Query by metadata equality on turn_id (native engine — no SQL, no
-    // json_extract; the metadata index config above is now inert for queries,
-    // the engine filters directly on the decoded record's metadata map).
-    let resp = client
-        .query(QueryRequest {
-            namespace: "test".into(),
-            stream: "main".into(),
-            metadata: vec![pb::MetadataFilter {
-                key: "turn_id".into(),
-                value: "turn-1".into(),
-            }],
-            result: QueryResult::Records.into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    let recs = match resp.result {
-        Some(query_response::Result::Records(rr)) => rr.records,
-        _ => panic!("expected Records"),
-    };
-    assert_eq!(recs.len(), 3, "turn-1 should match 3 records (i=3,4,5)");
-
-    indexer.stop();
 }
 
 /// cr-027: Query reads the log segment directly (committed cursor), so records
@@ -1544,7 +1374,7 @@ async fn cache_query_with_metadata_index() {
 /// when the SQLite cache file is absent/removed.
 #[tokio::test]
 async fn query_reads_segment_not_sqlite_cache() {
-    let (addr, dir, indexer) = start_cache_server().await;
+    let (addr, _dir, _storage) = start_cache_server().await;
     let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
         .await
         .unwrap();
@@ -1565,6 +1395,9 @@ async fn query_reads_segment_not_sqlite_cache() {
     }
 
     // Poll COUNT until the committed cursor catches up (≤ Committer cycle).
+    // cr-027: Query reads the segment directly at the committed cursor — no
+    // SQLite cache to consult, so the assertion is now "records appear once
+    // committed".
     let mut count = 0u64;
     for _ in 0..200 {
         let resp = client
@@ -1587,44 +1420,15 @@ async fn query_reads_segment_not_sqlite_cache() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(count, 3, "committed records not visible to Query");
-
-    // Stronger: remove the SQLite cache file, then query again — must still
-    // return the records, proving Query reads the segment, not SQLite.
-    let db_path = dir
-        .path()
-        .join("cache")
-        .join(format!("{}.{}.db", ns, stream));
-    let _ = std::fs::remove_file(&db_path);
-
-    let resp = client
-        .query(QueryRequest {
-            namespace: ns.into(),
-            stream: stream.into(),
-            result: QueryResult::Count.into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    let count_after = match resp.result {
-        Some(query_response::Result::Count(n)) => n,
-        _ => 0,
-    };
-    assert_eq!(
-        count_after, 3,
-        "Query must read the segment even with the SQLite cache file removed"
-    );
-
-    indexer.stop();
 }
 
 /// cr-027 phase 4: Subscribe reads the log segment directly (durable cursor),
-/// so replay works even when the SQLite cache file is absent/removed. Mirrors
+/// so replay works even when no SQLite cache exists. Mirrors
 /// `query_reads_segment_not_sqlite_cache` in spirit but exercises the Subscribe
 /// RPC replay path instead of Query.
 #[tokio::test]
 async fn subscribe_reads_segment_not_sqlite_cache() {
-    let (addr, dir, indexer) = start_cache_server().await;
+    let (addr, _dir, _storage) = start_cache_server().await;
     let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
         .await
         .unwrap();
@@ -1671,18 +1475,8 @@ async fn subscribe_reads_segment_not_sqlite_cache() {
     }
     drop(sub_stream);
 
-    // Remove the SQLite cache file(s) for this stream — Subscribe must NOT
-    // depend on them (segment is the source of truth).
-    let db_path = dir
-        .path()
-        .join("cache")
-        .join(format!("{}.{}.db", ns, stream));
-    let _ = std::fs::remove_file(&db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
-
-    // Second consumer (g2/c2): subscribe again — must still read all 3 records
-    // from the segment.
+    // Second consumer (g2/c2): subscribe again — must read all 3 records from
+    // the segment (the durable cursor is the only source of truth for replay).
     let resp2 = client
         .subscribe(pb::SubscribeRequest {
             namespace: ns.into(),
@@ -1708,10 +1502,8 @@ async fn subscribe_reads_segment_not_sqlite_cache() {
     }
     assert_eq!(
         count, 3,
-        "Subscribe must read 3 records from the segment after SQLite cache removal"
+        "Subscribe must read 3 records from the segment on replay"
     );
-
-    indexer.stop();
 }
 
 // ── Subscribe (event-type push) Tests ────────────────────────────────────────
@@ -1720,7 +1512,6 @@ async fn subscribe_reads_segment_not_sqlite_cache() {
 async fn subscribe_receives_matching_event_types() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
@@ -1733,17 +1524,6 @@ async fn subscribe_receives_matching_event_types() {
     let catalog = test_catalog(&data_dir);
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
 
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
@@ -1833,7 +1613,6 @@ async fn subscribe_receives_matching_event_types() {
     assert_eq!(rec.event_type, "tool.call");
     assert_eq!(rec.content, b"tool-exec");
 
-    indexer.stop();
     subscribe_publisher.stop();
 }
 
@@ -1841,7 +1620,6 @@ async fn subscribe_receives_matching_event_types() {
 async fn subscribe_multi_consumer_same_group() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
@@ -1855,17 +1633,6 @@ async fn subscribe_multi_consumer_same_group() {
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
     let tracker = Arc::new(ConsumerTracker::new(None));
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
 
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
@@ -1973,7 +1740,6 @@ async fn subscribe_multi_consumer_same_group() {
     assert_eq!(r2.event_type, "llm.call");
     assert_eq!(r2.content, b"lc");
 
-    indexer.stop();
     subscribe_publisher.stop();
 }
 
@@ -1981,12 +1747,11 @@ async fn subscribe_multi_consumer_same_group() {
 async fn subscribe_reconnect_replays_from_offset() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
+    let offsets_dir = dir.path().join("offsets");
 
     // Simulate a previous session: persist a committed offset of 2 in the
     // binary offset store so ConsumerTracker::new restores it on startup.
-    // (Replaces the former SQLite `consumer_offsets` table setup.)
-    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::create_dir_all(&offsets_dir).unwrap();
     let mut prev_offsets = std::collections::HashMap::new();
     prev_offsets.insert(
         (
@@ -1997,7 +1762,7 @@ async fn subscribe_reconnect_replays_from_offset() {
         ),
         2u64,
     );
-    logdbd::offsets::save(&cache_dir, &prev_offsets).unwrap();
+    logdbd::offsets::save(&offsets_dir, &prev_offsets).unwrap();
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
@@ -2010,18 +1775,7 @@ async fn subscribe_reconnect_replays_from_offset() {
     let catalog = test_catalog(&data_dir);
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
-    let tracker = Arc::new(ConsumerTracker::new(Some(cache_dir.clone())));
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
+    let tracker = Arc::new(ConsumerTracker::new(Some(offsets_dir.clone())));
 
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
@@ -2087,11 +1841,10 @@ async fn subscribe_reconnect_replays_from_offset() {
     assert_eq!(rec.event_type, "tool.call");
     assert_eq!(rec.content, b"after-reconnect");
 
-    // Verify the committed offset was restored from SQLite
+    // Verify the committed offset was restored from the binary offset store.
     let committed = tracker.get("test", "main", "sandbox", "reconn");
-    assert_eq!(committed, 2, "offset should be restored from SQLite");
+    assert_eq!(committed, 2, "offset should be restored from the offset store");
 
-    indexer.stop();
     subscribe_publisher.stop();
 }
 
@@ -2101,7 +1854,6 @@ async fn subscribe_reconnect_replays_from_offset() {
 async fn subscribe_replays_missed_records_from_offset() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
@@ -2115,17 +1867,6 @@ async fn subscribe_replays_missed_records_from_offset() {
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
     let tracker = Arc::new(ConsumerTracker::new(None));
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
 
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
@@ -2170,7 +1911,8 @@ async fn subscribe_replays_missed_records_from_offset() {
             .await
             .unwrap();
         }
-        wait_for_indexer(&indexer, 5, 5000).await;
+        // 5 records appended ⇒ durable_gid reaches 5 (single shard, gid starts at 1).
+        wait_for_durable(&storage, 5, 5000).await;
 
         // Simulate consumer processed seq 1 and 2, then died
         tracker.commit("test", "main", "sandbox", "lagging-consumer", 2);
@@ -2232,7 +1974,6 @@ async fn subscribe_replays_missed_records_from_offset() {
         assert_eq!(r.event_type, "tool.call");
     }
 
-    indexer.stop();
     subscribe_publisher.stop();
 }
 
@@ -2242,7 +1983,6 @@ async fn subscribe_replays_missed_records_from_offset() {
 async fn subscribe_concurrent_stress() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
@@ -2256,17 +1996,6 @@ async fn subscribe_concurrent_stress() {
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
     let tracker = Arc::new(ConsumerTracker::new(None));
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
 
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
@@ -2351,8 +2080,9 @@ async fn subscribe_concurrent_stress() {
             .await
             .unwrap();
     }
-    // Ensure Indexer has caught up
-    wait_for_indexer(&indexer, 20, 8000).await;
+    // Wait until all 20 records are durable (visible to subscribers via the
+    // publisher, which polls the durable cursor).
+    wait_for_durable(&storage, 20, 8000).await;
 
     // Collect results from all subscribers
     for h in handles {
@@ -2369,7 +2099,6 @@ async fn subscribe_concurrent_stress() {
         assert_eq!(sorted.len(), 20, "no duplicate deliveries");
     }
 
-    indexer.stop();
     subscribe_publisher.stop();
 }
 
@@ -2379,7 +2108,6 @@ async fn subscribe_concurrent_stress() {
 async fn subscribe_100_concurrent_subscribers_stress() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
@@ -2392,17 +2120,6 @@ async fn subscribe_100_concurrent_subscribers_stress() {
     let catalog = test_catalog(&data_dir);
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
 
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
@@ -2483,7 +2200,7 @@ async fn subscribe_100_concurrent_subscribers_stress() {
             .await
             .unwrap();
     }
-    wait_for_indexer(&indexer, 50, 10000).await;
+    wait_for_durable(&storage, 50, 10000).await;
 
     // Verify all 100 subscribers got all 50 records
     let mut total_recv = 0u64;
@@ -2500,15 +2217,15 @@ async fn subscribe_100_concurrent_subscribers_stress() {
     }
     assert_eq!(total_recv, 100, "all 100 subscribers completed");
 
-    indexer.stop();
     subscribe_publisher.stop();
 }
 
-/// 200 subscribers × 200 pre-written records (replay via SQLite) + 100 real-time.
+/// 200 subscribers × 200 pre-written records (replay via segment scan) +
+/// 100 real-time. Every subscriber must receive all 300 records.
 ///
-/// Pre-write 200 records directly via Storage, then 200 subscribers connect
-/// — each triggers the replay phase via SQLite query cache. After replay, 100
-/// more records via broadcast. Every subscriber must receive all 300 records.
+/// cr-027: replay now reads the segment at the durable cursor — no SQLite
+/// query cache involved. The publisher polls `storage.durable_gid()` and
+/// pushes matching records to each subscriber's broadcast channel.
 #[tokio::test]
 async fn subscribe_500_subs_replay_stress() {
     use std::collections::BTreeMap;
@@ -2516,7 +2233,6 @@ async fn subscribe_500_subs_replay_stress() {
 
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let cache_dir = dir.path().join("cache");
 
     let mut db_config = DbConfig::default();
     db_config.data_dir = data_dir.clone();
@@ -2529,17 +2245,6 @@ async fn subscribe_500_subs_replay_stress() {
     let catalog = test_catalog(&data_dir);
 
     let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
-    let cache_config = logdbd::config::CacheConfig {
-        dir: cache_dir.clone(),
-        ..Default::default()
-    };
-    let indexer = Arc::new(logdbd::cache::Indexer::new(
-        storage.db_arc(),
-        Arc::clone(&catalog),
-        cache_dir.clone(),
-        &cache_config,
-    ));
-    indexer.clone().start();
 
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
@@ -2571,8 +2276,8 @@ async fn subscribe_500_subs_replay_stress() {
         Instant::now().duration_since(t0)
     );
 
-    // Wait for Indexer
-    wait_for_indexer(&indexer, 200, 30000).await;
+    // Wait until all 200 pre-written records are durable.
+    wait_for_durable(&storage, 200, 30000).await;
 
     // Start server for subscriber connections
     let tracker = Arc::new(ConsumerTracker::new(None));
@@ -2596,7 +2301,7 @@ async fn subscribe_500_subs_replay_stress() {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // 200 subscribers — each replaying 200 records via SQLite cache
+    // 200 subscribers — each replaying 200 records via segment scan
     let t1 = Instant::now();
     let mut handles = Vec::new();
     for i in 0..200 {
@@ -2658,9 +2363,9 @@ async fn subscribe_500_subs_replay_stress() {
             .await
             .unwrap();
     }
-    wait_for_indexer(&indexer, 300, 15000).await;
+    wait_for_durable(&storage, 300, 15000).await;
     eprintln!(
-        "[stress-500] published + indexed in {:?}",
+        "[stress-500] published + durable in {:?}",
         Instant::now().duration_since(t1)
     );
 
@@ -2677,14 +2382,14 @@ async fn subscribe_500_subs_replay_stress() {
     );
 
     // NOTE: replay currently uses storage.scan() O(n) per subscriber.
-    // Switching replay to SQLite query cache would scale this to 500/500.
+    // cr-027: replay now reads the segment directly (no SQLite query cache);
+    // the durable-cursor-based publisher fans out matching records.
     assert!(
         completed >= 180,
         "at least 180/200 subscribers must complete (got {})",
         completed
     );
 
-    indexer.stop();
     subscribe_publisher.stop();
 }
 
@@ -2805,4 +2510,93 @@ async fn delete_stream_tombstones_then_recreate() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(n, 1, "stream is re-creatable after delete");
+}
+
+/// cr-027 phase 5: per-stream record quota enforced on the append path via the
+/// in-memory `QuotaTracker` (segment-seeded, append-maintained — no SQLite).
+/// The 4th append past a `max_records: 3` quota must be rejected with
+/// `ResourceExhausted`.
+#[tokio::test]
+async fn append_rejected_over_record_quota() {
+    use logdbd::config::StreamQuota;
+    use logdbd::quota::QuotaTracker;
+    use logdbd::tombstone::TombstoneTracker;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = 1;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, 1));
+    let catalog = test_catalog(&data_dir);
+
+    let quotas = vec![StreamQuota {
+        namespace: "test".into(),
+        stream: "main".into(),
+        max_records: Some(3),
+        max_bytes: None,
+    }];
+    let log_svc = LogDbServiceImpl::with_quotas(
+        Arc::clone(&storage),
+        Arc::clone(&catalog),
+        Arc::new(ConsumerTracker::new(None)),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
+        quotas,
+        "quota-test".into(),
+        "primary".into(),
+        Arc::new(QuotaTracker::new()),
+        Arc::new(TombstoneTracker::new()),
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // First 3 appends succeed — under quota.
+    for i in 0..3u64 {
+        c.append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "evt".into(),
+            content: format!("r-{}", i).into_bytes(),
+            ..Default::default()
+        })
+        .await
+        .expect("append under quota must succeed");
+    }
+
+    // 4th append exceeds the max_records=3 quota.
+    let err = c
+        .append(pb::AppendRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            event_type: "evt".into(),
+            content: b"over-quota".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("append over quota must fail");
+    assert_eq!(
+        err.code(),
+        tonic::Code::ResourceExhausted,
+        "over-quota append must return ResourceExhausted, got: {:?}",
+        err
+    );
 }

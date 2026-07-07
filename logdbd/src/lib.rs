@@ -8,6 +8,7 @@ pub mod node;
 pub mod offsets;
 pub mod publisher;
 pub mod query;
+pub mod quota;
 pub mod record;
 pub mod replication;
 pub mod service;

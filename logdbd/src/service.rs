@@ -295,6 +295,7 @@ impl LogDbService for LogDbServiceImpl {
         &self,
         req: Request<pb::BatchAppendRequest>,
     ) -> Result<Response<pb::AppendBatchResponse>, Status> {
+        crate::auth::require_role(&req, crate::auth::Role::Writer)?;
         self.check_write()?;
         let r = req.get_ref();
 

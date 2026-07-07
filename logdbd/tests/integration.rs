@@ -562,6 +562,90 @@ async fn token_auth_is_enforced() {
     // (tonic client doesn't easily add metadata; tested via code path above)
 }
 
+/// cr-027: `batch_append` must require the Writer role, like `append`. In RBAC
+/// mode a reader-only token is denied (`PermissionDenied`); a writer token
+/// succeeds. Previously `batch_append` had no role check at all — a reader or
+/// subscriber token could write via the batch path (privilege escalation).
+#[tokio::test]
+async fn batch_append_requires_writer_role() {
+    fn one_record_batch() -> pb::BatchAppendRequest {
+        pb::BatchAppendRequest {
+            requests: vec![pb::AppendRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                event_type: "evt".into(),
+                content: b"rbac".to_vec(),
+                ..Default::default()
+            }],
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(test_storage(dir.path()));
+    let catalog = test_catalog(dir.path());
+    let svc = LogDbServiceImpl::new(
+        storage,
+        catalog,
+        Arc::new(ConsumerTracker::new(None)),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
+        "rbac-node".into(),
+        "primary".into(),
+    );
+    let interceptor = AuthInterceptor::new(&[
+        logdbd::auth::TokenEntry {
+            token: "writer-tok".into(),
+            roles: vec![logdbd::auth::Role::Writer],
+        },
+        logdbd::auth::TokenEntry {
+            token: "reader-tok".into(),
+            roles: vec![logdbd::auth::Role::Reader],
+        },
+    ]);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(LogDbServiceServer::with_interceptor(svc, interceptor))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Reader-only token → PermissionDenied (the bug let this through).
+    let mut reader_req = tonic::Request::new(one_record_batch());
+    reader_req.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::from_static("Bearer reader-tok"),
+    );
+    let err = c
+        .batch_append(reader_req)
+        .await
+        .expect_err("reader-role token must be denied batch_append");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "reader-role batch_append must be PermissionDenied, got: {err:?}"
+    );
+
+    // Writer token → succeeds.
+    let mut writer_req = tonic::Request::new(one_record_batch());
+    writer_req.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::from_static("Bearer writer-tok"),
+    );
+    let resp = c
+        .batch_append(writer_req)
+        .await
+        .expect("writer-role token must be allowed batch_append");
+    assert_eq!(resp.into_inner().records.len(), 1);
+}
+
 // ── TLS test ──────────────────────────────────────────────────────────────────
 
 #[tokio::test]

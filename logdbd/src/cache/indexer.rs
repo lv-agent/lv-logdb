@@ -12,7 +12,6 @@ use rusqlite::Connection;
 use crate::catalog::Catalog;
 use crate::config::CacheConfig;
 use crate::record;
-use crate::subscribe::SubscribeHub;
 
 /// Build a safe filename from namespace and stream name.
 /// Replaces '/' with '_' to avoid directory traversal.
@@ -106,8 +105,6 @@ pub struct Indexer {
     flush_interval: Duration,
     /// Per-stream metadata field indexes (stream_name → [field_names]).
     metadata_indexes: HashMap<String, Vec<String>>,
-    /// Subscriber hub — publish each indexed record for real-time push.
-    subscribe_hub: Arc<SubscribeHub>,
 }
 
 impl Indexer {
@@ -117,7 +114,6 @@ impl Indexer {
         catalog: Arc<Catalog>,
         cache_dir: PathBuf,
         config: &CacheConfig,
-        subscribe_hub: Arc<SubscribeHub>,
     ) -> Self {
         std::fs::create_dir_all(&cache_dir).ok();
         let metadata_indexes: HashMap<String, Vec<String>> = config
@@ -134,7 +130,6 @@ impl Indexer {
             running: AtomicBool::new(false),
             flush_interval: Duration::from_secs(config.flush_interval_secs),
             metadata_indexes,
-            subscribe_hub,
         }
     }
 
@@ -265,9 +260,6 @@ impl Indexer {
         if let Err(e) = insert_record(&entry.conn, gid, &decoded) {
             tracing::warn!(gid = gid, stream_id = stream_id, error = %e, "cache indexer insert failed");
         }
-
-        // Publish to subscribers (non-blocking)
-        self.subscribe_hub.publish(stream_id, &decoded);
     }
 
     /// WAL checkpoint + fsync all open connections.

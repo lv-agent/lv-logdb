@@ -97,6 +97,31 @@ fn decoded_to_pb(r: &crate::record::DecodedRecord) -> pb::Record {
     }
 }
 
+/// Stream-replay helper for `subscribe`: read durable records from the segment,
+/// keep only those matching `stream_id` + `seq > last_committed` + `event_types`,
+/// and forward them on `tx`. Tombstones are NOT filtered — the native engine has
+/// no tombstone and lv-fixus does not use them (cr-027 phase 4).
+async fn scan_stream_replay(
+    storage: &Storage,
+    durable: u64,
+    stream_id: u64,
+    last_committed: u64,
+    event_types: &std::collections::HashSet<String>,
+    tx: &tokio::sync::mpsc::Sender<Result<pb::Record, Status>>,
+) -> Result<(), crate::storage::StorageError> {
+    for rec in storage.scan(0, durable)? {
+        if rec.stream_id == stream_id
+            && rec.seq > last_committed
+            && event_types.contains(&rec.event_type)
+        {
+            if tx.send(Ok(decoded_to_pb(&rec))).await.is_err() {
+                return Ok(()); // client disconnected
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct LogDbServiceImpl {
     storage: Arc<Storage>,
     catalog: Arc<Catalog>,
@@ -784,7 +809,7 @@ impl LogDbService for LogDbServiceImpl {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         crate::auth::require_role(&req, crate::auth::Role::Subscriber)?;
         let r = req.get_ref();
-        let (ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
+        let (_ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 
         let event_types: std::collections::HashSet<String> =
             r.event_types.iter().cloned().collect();
@@ -808,78 +833,33 @@ impl LogDbService for LogDbServiceImpl {
         let hub = Arc::clone(&self.subscribe_hub);
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
-        let db_name = crate::cache::indexer::db_filename(&ns, &stream);
-        let db_path = self.cache_dir.join(db_name);
-
         tokio::spawn(async move {
-            // Phase 1: replay missed records from SQLite cache (fast) or segment (fallback)
-            match crate::cache::replay_records(&db_path, last_committed, &event_types) {
-                Ok(records) => {
-                    for rec in records {
-                        let pb_rec = pb::Record {
-                            namespace_id: ns_id,
-                            stream_id,
-                            seq: rec.seq,
-                            event_type: rec.event_type.clone(),
-                            timestamp_ns: rec.ts_ns,
-                            content_type: rec.content_type.clone(),
-                            metadata: crate::service::to_hashmap(&rec.metadata),
-                            content: rec.content.clone(),
-                        };
-                        if tx.send(Ok(pb_rec)).await.is_err() {
-                            return; // client disconnected
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Fallback: segment scan
-                    match storage.scan(0, u64::MAX) {
-                        Ok(all) => {
-                            for rec in all {
-                                if rec.seq > last_committed && event_types.contains(&rec.event_type)
-                                {
-                                    let pb_rec = pb::Record {
-                                        namespace_id: rec.namespace_id,
-                                        stream_id: rec.stream_id,
-                                        seq: rec.seq,
-                                        event_type: rec.event_type.clone(),
-                                        timestamp_ns: rec.timestamp_ns,
-                                        content_type: rec.content_type.clone(),
-                                        metadata: crate::service::to_hashmap(&rec.metadata),
-                                        content: rec.user_content.clone(),
-                                    };
-                                    if tx.send(Ok(pb_rec)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(Status::internal(format!("replay: {}", e))))
-                                .await;
-                            return;
-                        }
-                    }
-                }
+            // Phase 1: replay missed records directly from the log segment at the
+            // durable cursor. No SQLite — the segment is the source of truth. The
+            // Indexer is no longer on the read path (cr-027 phase 4).
+            let durable = storage.durable_gid();
+            if let Err(e) = scan_stream_replay(
+                &storage,
+                durable,
+                stream_id,
+                last_committed,
+                &event_types,
+                &tx,
+            )
+            .await
+            {
+                let _ = tx
+                    .send(Err(Status::internal(format!("replay: {}", e))))
+                    .await;
+                return;
             }
 
-            // Phase 2: subscribe to real-time hub
+            // Phase 2: subscribe to real-time hub (unchanged model; uses decoded_to_pb).
             let mut handle = hub.subscribe(stream_id, event_types);
             loop {
                 match handle.next_matching().await {
                     Ok(rec) => {
-                        let pb_rec = pb::Record {
-                            namespace_id: rec.namespace_id,
-                            stream_id: rec.stream_id,
-                            seq: rec.seq,
-                            event_type: rec.event_type.clone(),
-                            timestamp_ns: rec.timestamp_ns,
-                            content_type: rec.content_type.clone(),
-                            metadata: crate::service::to_hashmap(&rec.metadata),
-                            content: rec.user_content.clone(),
-                        };
-                        if tx.send(Ok(pb_rec)).await.is_err() {
+                        if tx.send(Ok(decoded_to_pb(&rec))).await.is_err() {
                             return; // client disconnected
                         }
                     }
@@ -890,11 +870,8 @@ impl LogDbService for LogDbServiceImpl {
                             skipped = n,
                             "subscribe client lagging, records skipped"
                         );
-                        // Keep going — skipped records are still in the segment
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return; // hub shut down
-                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         });

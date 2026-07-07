@@ -1137,7 +1137,6 @@ async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cac
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::new(logdbd::subscribe::SubscribeHub::new()),
     ));
     indexer.clone().start();
 
@@ -1216,7 +1215,6 @@ async fn cache_query_after_append() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::new(logdbd::subscribe::SubscribeHub::new()),
     ));
     indexer.clone().start();
 
@@ -1479,7 +1477,6 @@ async fn cache_query_with_metadata_index() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::new(logdbd::subscribe::SubscribeHub::new()),
     ));
     indexer.clone().start();
 
@@ -1634,6 +1631,102 @@ async fn query_reads_segment_not_sqlite_cache() {
     indexer.stop();
 }
 
+/// cr-027 phase 4: Subscribe reads the log segment directly (durable cursor),
+/// so replay works even when the SQLite cache file is absent/removed. Mirrors
+/// `query_reads_segment_not_sqlite_cache` in spirit but exercises the Subscribe
+/// RPC replay path instead of Query.
+#[tokio::test]
+async fn subscribe_reads_segment_not_sqlite_cache() {
+    let (addr, dir, indexer) = start_cache_server().await;
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+    let ns = "subseg";
+    let stream = "main";
+
+    // Append 3 tool.call records.
+    for i in 0..3u64 {
+        client
+            .append(pb::AppendRequest {
+                namespace: ns.into(),
+                stream: stream.into(),
+                event_type: "tool.call".into(),
+                content: format!("rec-{}", i).into_bytes(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    // Wait for the records to become durable (Committer cycle).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // First consumer (g1/c1): subscribe and read all 3 back via replay.
+    let resp = client
+        .subscribe(pb::SubscribeRequest {
+            namespace: ns.into(),
+            stream: stream.into(),
+            event_types: vec!["tool.call".into()],
+            consumer_group: "g1".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap();
+    let mut sub_stream = resp.into_inner();
+    for i in 0..3u64 {
+        let rec = tokio::time::timeout(Duration::from_secs(5), sub_stream.message())
+            .await
+            .expect("timeout waiting for replay record")
+            .expect("stream error")
+            .expect("stream closed");
+        assert_eq!(rec.event_type, "tool.call");
+        assert_eq!(rec.content, format!("rec-{}", i).into_bytes());
+    }
+    drop(sub_stream);
+
+    // Remove the SQLite cache file(s) for this stream — Subscribe must NOT
+    // depend on them (segment is the source of truth).
+    let db_path = dir
+        .path()
+        .join("cache")
+        .join(format!("{}.{}.db", ns, stream));
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+
+    // Second consumer (g2/c2): subscribe again — must still read all 3 records
+    // from the segment.
+    let resp2 = client
+        .subscribe(pb::SubscribeRequest {
+            namespace: ns.into(),
+            stream: stream.into(),
+            event_types: vec!["tool.call".into()],
+            consumer_group: "g2".into(),
+            consumer_id: "c2".into(),
+        })
+        .await
+        .unwrap();
+    let mut sub_stream2 = resp2.into_inner();
+    let mut count = 0u32;
+    while let Some(rec) = tokio::time::timeout(Duration::from_secs(5), sub_stream2.message())
+        .await
+        .expect("timeout on second subscribe")
+        .expect("stream error")
+    {
+        assert_eq!(rec.event_type, "tool.call");
+        count += 1;
+        if count >= 3 {
+            break;
+        }
+    }
+    assert_eq!(
+        count, 3,
+        "Subscribe must read 3 records from the segment after SQLite cache removal"
+    );
+
+    indexer.stop();
+}
+
 // ── Subscribe (event-type push) Tests ────────────────────────────────────────
 
 #[tokio::test]
@@ -1662,9 +1755,14 @@ async fn subscribe_receives_matching_event_types() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::clone(&hub),
     ));
     indexer.clone().start();
+
+    let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&hub),
+    ));
+    subscribe_publisher.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
@@ -1749,6 +1847,7 @@ async fn subscribe_receives_matching_event_types() {
     assert_eq!(rec.content, b"tool-exec");
 
     indexer.stop();
+    subscribe_publisher.stop();
 }
 
 #[tokio::test]
@@ -1778,9 +1877,14 @@ async fn subscribe_multi_consumer_same_group() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::clone(&hub),
     ));
     indexer.clone().start();
+
+    let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&hub),
+    ));
+    subscribe_publisher.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
@@ -1883,6 +1987,7 @@ async fn subscribe_multi_consumer_same_group() {
     assert_eq!(r2.content, b"lc");
 
     indexer.stop();
+    subscribe_publisher.stop();
 }
 
 #[tokio::test]
@@ -1928,9 +2033,14 @@ async fn subscribe_reconnect_replays_from_offset() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::clone(&hub),
     ));
     indexer.clone().start();
+
+    let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&hub),
+    ));
+    subscribe_publisher.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
@@ -1995,6 +2105,7 @@ async fn subscribe_reconnect_replays_from_offset() {
     assert_eq!(committed, 2, "offset should be restored from SQLite");
 
     indexer.stop();
+    subscribe_publisher.stop();
 }
 
 /// Real replay verification: write records first, then subscribe, verify
@@ -2026,9 +2137,14 @@ async fn subscribe_replays_missed_records_from_offset() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::clone(&hub),
     ));
     indexer.clone().start();
+
+    let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&hub),
+    ));
+    subscribe_publisher.clone().start();
 
     // Write 5 tool.call records before subscribing
     {
@@ -2131,6 +2247,7 @@ async fn subscribe_replays_missed_records_from_offset() {
     }
 
     indexer.stop();
+    subscribe_publisher.stop();
 }
 
 /// High-concurrency stress: 5 subscribers + 100 records, verify
@@ -2162,9 +2279,14 @@ async fn subscribe_concurrent_stress() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::clone(&hub),
     ));
     indexer.clone().start();
+
+    let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&hub),
+    ));
+    subscribe_publisher.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
@@ -2262,6 +2384,7 @@ async fn subscribe_concurrent_stress() {
     }
 
     indexer.stop();
+    subscribe_publisher.stop();
 }
 
 /// 100 concurrent subscribers, 50 records — every subscriber must receive
@@ -2292,9 +2415,14 @@ async fn subscribe_100_concurrent_subscribers_stress() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::clone(&hub),
     ));
     indexer.clone().start();
+
+    let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&hub),
+    ));
+    subscribe_publisher.clone().start();
 
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
@@ -2387,6 +2515,7 @@ async fn subscribe_100_concurrent_subscribers_stress() {
     assert_eq!(total_recv, 100, "all 100 subscribers completed");
 
     indexer.stop();
+    subscribe_publisher.stop();
 }
 
 /// 200 subscribers × 200 pre-written records (replay via SQLite) + 100 real-time.
@@ -2423,9 +2552,14 @@ async fn subscribe_500_subs_replay_stress() {
         Arc::clone(&catalog),
         cache_dir.clone(),
         &cache_config,
-        Arc::clone(&hub),
     ));
     indexer.clone().start();
+
+    let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&hub),
+    ));
+    subscribe_publisher.clone().start();
 
     // Pre-write 200 records via Storage (direct, no gRPC overhead)
     let t0 = Instant::now();
@@ -2565,4 +2699,5 @@ async fn subscribe_500_subs_replay_stress() {
     );
 
     indexer.stop();
+    subscribe_publisher.stop();
 }

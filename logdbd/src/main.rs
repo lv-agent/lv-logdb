@@ -177,15 +177,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let consumer_tracker = Arc::new(ConsumerTracker::new(Some(data_dir.join("offsets"))));
     consumer_tracker.start_flush_loop(std::time::Duration::from_secs(5));
 
-    // Cache — per-stream SQLite query cache (Indexer background thread)
+    // Cache — per-stream SQLite query cache (Indexer background thread).
+    // The Indexer still writes SQLite (removed in phase 5) but no longer
+    // publishes to the hub (cr-027 phase 4).
     let cache_indexer = Arc::new(logdbd::cache::Indexer::new(
         storage.db_arc(),
         Arc::clone(&catalog),
         config.cache.dir.clone(),
         &config.cache,
-        Arc::clone(&subscribe_hub),
     ));
     cache_indexer.clone().start();
+
+    // Subscribe publisher — chases the durable cursor and fans records out to
+    // the hub. Replaces the Indexer as the hub's publisher (cr-027 phase 4).
+    let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&subscribe_hub),
+    ));
+    subscribe_publisher.clone().start();
 
     let hostname = node.id.clone();
     let role_str = node.role.to_string();
@@ -290,12 +299,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_for_drain = storage.db_arc();
     let idx_for_drain = Arc::clone(&cache_indexer);
+    let pub_for_drain = Arc::clone(&subscribe_publisher);
     let offsets_for_drain = Arc::clone(&consumer_tracker);
     server
         .serve_with_shutdown(listen, async move {
             shutdown_signal().await;
-            tracing::info!("shutdown signal received; stopping cache indexer");
+            tracing::info!(
+                "shutdown signal received; stopping cache indexer and subscribe publisher"
+            );
             idx_for_drain.stop();
+            pub_for_drain.stop();
             if let Err(e) = offsets_for_drain.flush() {
                 tracing::warn!(error = %e, "final consumer offset flush failed");
             }

@@ -1,6 +1,5 @@
-//! Durable-cursor poller that feeds the SubscribeHub. Replaces the Indexer as
-//! the hub's publisher (cr-027 phase 4). The Indexer still writes SQLite; it is
-//! deleted in phase 5.
+//! Durable-cursor poller that feeds the SubscribeHub — the hub's publisher
+//! (cr-027 phase 4).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,8 +15,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Background publisher: chases `Storage::durable_gid()`, scans the new range,
 /// and fans each decoded record out to the `SubscribeHub` by `stream_id`.
 ///
-/// Latency is bounded by `POLL_INTERVAL` (≤10 ms), identical to the legacy
-/// Indexer-driven push. Non-blocking sends — records stay in the segment.
+/// Latency is bounded by `POLL_INTERVAL` (≤10 ms). Non-blocking sends —
+/// records stay in the segment.
 pub struct SubscribePublisher {
     storage: Arc<Storage>,
     subscribe_hub: Arc<SubscribeHub>,
@@ -146,8 +145,8 @@ mod tests {
         assert_eq!(rec.stream_id, 1);
         assert_eq!(rec.user_content, b"hello");
 
-        // Non-blocking stop: the poller exits within one POLL_INTERVAL (10 ms).
-        // Mirrors the Indexer tests — we don't join the thread.
+        // Non-blocking stop: the poller exits within one POLL_INTERVAL (10 ms);
+        // we don't join the thread.
         publisher.stop();
     }
 

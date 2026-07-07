@@ -792,10 +792,9 @@ impl LogDbService for LogDbServiceImpl {
         // Resolve namespace + stream (validates existence, gives stream_id).
         let (_ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 
-        // Read boundary: COMMITTED cursor. The segment is the source of truth —
-        // we read it directly instead of the SQLite cache, so a record becomes
-        // queryable within a Committer cycle (~≤10ms) of Append returning,
-        // rather than waiting for the async Indexer. See cr-027 读边界.
+        // Read boundary: COMMITTED cursor. The segment is the source of truth,
+        // so a record becomes queryable within a Committer cycle (~≤10ms) of
+        // Append returning. See cr-027 读边界.
         let committed = self.storage.committed_gid();
         let all = self
             .storage
@@ -850,8 +849,7 @@ impl LogDbService for LogDbServiceImpl {
 
         tokio::spawn(async move {
             // Phase 1: replay missed records directly from the log segment at the
-            // durable cursor. No SQLite — the segment is the source of truth. The
-            // Indexer is no longer on the read path (cr-027 phase 4).
+            // durable cursor — the segment is the source of truth (cr-027 phase 4).
             let durable = storage.durable_gid();
             if let Err(e) = scan_stream_replay(
                 &storage,

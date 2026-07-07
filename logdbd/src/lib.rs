@@ -1,6 +1,5 @@
 pub use logdbd_proto::pb;
 pub mod auth;
-pub mod cache;
 pub mod catalog;
 pub mod config;
 pub mod consumer;

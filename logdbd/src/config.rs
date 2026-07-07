@@ -26,8 +26,6 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
-    #[serde(default)]
-    pub cache: CacheConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -833,58 +831,6 @@ pub fn validate_metadata_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ── Cache Config ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CacheConfig {
-    #[serde(default = "default_cache_dir")]
-    pub dir: PathBuf,
-    #[serde(default = "default_cache_flush_interval_secs")]
-    pub flush_interval_secs: u64,
-    #[serde(default = "default_cache_snapshot_min_interval_secs")]
-    pub snapshot_min_interval_secs: u64,
-    #[serde(default = "default_cache_snapshot_retain")]
-    pub snapshot_retain: usize,
-    #[serde(default)]
-    pub indexes: Vec<StreamIndexConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StreamIndexConfig {
-    pub stream: String,
-    pub fields: Vec<String>,
-}
-
-fn default_cache_dir() -> PathBuf {
-    PathBuf::from("/var/lib/logdbd/cache")
-}
-
-fn default_cache_flush_interval_secs() -> u64 {
-    30
-}
-
-fn default_cache_snapshot_min_interval_secs() -> u64 {
-    300
-}
-
-fn default_cache_snapshot_retain() -> usize {
-    5
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            dir: default_cache_dir(),
-            flush_interval_secs: 30,
-            snapshot_min_interval_secs: 300,
-            snapshot_retain: 5,
-            indexes: vec![],
-        }
-    }
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1186,7 +1132,6 @@ impl Default for Config {
             replication: ReplicationConfig::default(),
             retention: RetentionConfig::default(),
             observability: ObservabilityConfig::default(),
-            cache: CacheConfig::default(),
         }
     }
 }

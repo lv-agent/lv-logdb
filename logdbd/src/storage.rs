@@ -205,7 +205,7 @@ impl Storage {
     /// Get committed cursor (gid space) — records that have been pwrite'd
     /// (serialized to the segment) but not necessarily fsync'd yet. This is the
     /// Query read boundary: ~≤10ms behind the producer, far fresher than the
-    /// old SQLite Indexer path. See veps/cr-027-native-query-engine.md.
+    /// old SQLite cache path. See veps/cr-027-native-query-engine.md.
     pub fn committed_gid(&self) -> u64 {
         self.db.committed_cursor()
     }

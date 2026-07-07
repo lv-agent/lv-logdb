@@ -172,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Storage — wraps logdb with record encode/decode
     let storage = Arc::new(Storage::new(db, num_shards));
 
-    // Shared subscriber hub — Indexer publishes, Subscribe RPC reads
+    // Shared subscriber hub — SubscribePublisher pushes, Subscribe RPC reads
     let subscribe_hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
     let consumer_tracker = Arc::new(ConsumerTracker::new(Some(data_dir.join("offsets"))));
     consumer_tracker.start_flush_loop(std::time::Duration::from_secs(5));

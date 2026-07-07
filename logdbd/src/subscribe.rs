@@ -1,8 +1,8 @@
 //! Event-type subscription hub — per-stream broadcast channels.
 //!
-//! The Indexer publishes each committed record to the hub after writing
-//! to the SQLite cache.  gRPC `Subscribe` handlers read from the hub.
-//! Non-blocking sends — records are durable in segment regardless.
+//! The durable-cursor poller (`crate::publisher::SubscribePublisher`) fans each
+//! durable record out to the hub by `stream_id`; gRPC `Subscribe` handlers read
+//! from it. Non-blocking sends — records are durable in the segment regardless.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -14,11 +14,11 @@ use crate::record::DecodedRecord;
 /// Capacity of each per-stream broadcast channel.
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Hub that fans out committed records to subscribers by stream.
+/// Hub that fans out durable records to subscribers by stream.
 ///
-/// Each stream gets a lazily-created broadcast channel.  The Indexer
-/// publishes every committed record via `publish`; the Subscribe gRPC
-/// handler calls `subscribe` to receive matching records.
+/// Each stream gets a lazily-created broadcast channel. `SubscribePublisher`
+/// publishes every durable record via `publish`; the Subscribe gRPC handler
+/// calls `subscribe` to receive matching records.
 pub struct SubscribeHub {
     senders: RwLock<HashMap<u64, broadcast::Sender<Arc<DecodedRecord>>>>,
 }

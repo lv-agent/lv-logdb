@@ -26,6 +26,9 @@ impl std::fmt::Display for QueryError {
 impl std::error::Error for QueryError {}
 
 /// A record queried from the cache for replay.
+///
+/// TODO(cr-027 phase 5): delete alongside the Indexer — zero callers after
+/// phase 4 rewired Subscribe onto the segment.
 #[derive(Debug)]
 pub struct ReplayRecord {
     pub seq: u64,
@@ -41,6 +44,9 @@ pub struct ReplayRecord {
 ///
 /// Much faster than segment scan — uses the primary key index.
 /// Falls back gracefully: returns an empty vec if the db doesn't exist yet.
+///
+/// TODO(cr-027 phase 5): delete alongside the Indexer — zero callers after
+/// phase 4 rewired Subscribe onto the segment.
 pub fn replay_records(
     db_path: &Path,
     last_seq: u64,

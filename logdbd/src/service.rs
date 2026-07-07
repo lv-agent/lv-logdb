@@ -101,6 +101,10 @@ fn decoded_to_pb(r: &crate::record::DecodedRecord) -> pb::Record {
 /// keep only those matching `stream_id` + `seq > last_committed` + `event_types`,
 /// and forward them on `tx`. Tombstones are NOT filtered — the native engine has
 /// no tombstone and lv-fixus does not use them (cr-027 phase 4).
+///
+/// TODO(cr-027 phase 5): this materializes the whole durable prefix into a Vec on
+/// every Subscribe call. Stream + filter without collecting once phase 5 removes
+/// the dual-scan transition cost.
 async fn scan_stream_replay(
     storage: &Storage,
     durable: u64,

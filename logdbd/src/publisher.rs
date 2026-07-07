@@ -20,7 +20,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Indexer-driven push. Non-blocking sends — records stay in the segment.
 pub struct SubscribePublisher {
     storage: Arc<Storage>,
-    hub: Arc<SubscribeHub>,
+    subscribe_hub: Arc<SubscribeHub>,
     last_gid: AtomicU64,
     running: AtomicBool,
 }
@@ -29,7 +29,7 @@ impl SubscribePublisher {
     pub fn new(storage: Arc<Storage>, hub: Arc<SubscribeHub>) -> Self {
         Self {
             storage,
-            hub,
+            subscribe_hub: hub,
             last_gid: AtomicU64::new(0),
             running: AtomicBool::new(false),
         }
@@ -58,7 +58,7 @@ impl SubscribePublisher {
                 match self.storage.scan(last, durable) {
                     Ok(records) => {
                         for rec in &records {
-                            self.hub.publish(rec.stream_id, rec);
+                            self.subscribe_hub.publish(rec.stream_id, rec);
                         }
                         // Half-open [last, durable): everything below durable is done.
                         self.last_gid.store(durable, Ordering::Release);
@@ -133,6 +133,8 @@ mod tests {
         assert_eq!(rec.stream_id, 1);
         assert_eq!(rec.user_content, b"hello");
 
+        // Non-blocking stop: the poller exits within one POLL_INTERVAL (10 ms).
+        // Mirrors the Indexer tests — we don't join the thread.
         publisher.stop();
     }
 }

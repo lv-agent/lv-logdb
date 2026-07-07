@@ -10,5 +10,7 @@ pub mod query;
 pub mod snapshot;
 
 pub use indexer::Indexer;
+// TODO(cr-027 phase 5): `replay_records`/`ReplayRecord` have zero callers after
+// phase 4 rewired Subscribe onto the segment; delete alongside the Indexer.
 pub use query::{execute_query, replay_records};
 pub use snapshot::{cleanup_snapshots, create_snapshot, recover_or_create};

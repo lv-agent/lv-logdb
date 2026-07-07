@@ -1,35 +1,42 @@
-//! Consumer group — server-side offset tracking with optional SQLite persistence.
+//! Consumer group — server-side offset tracking with binary-file persistence.
 //!
-//! When a `cache_dir` is provided, offsets are durably stored in each stream's
-//! SQLite cache db (`consumer_offsets` table).  Without a cache dir, offsets are
-//! in-memory only (useful for tests).
+//! Offsets live in an in-memory HashMap (authoritative for reads). When an
+//! `offsets_dir` is provided, they are durably snapshotted to
+//! `<offsets_dir>/offsets.bin` (atomic tmp+rename) on a periodic background
+//! flush and on graceful shutdown. Without a dir, offsets are in-memory only.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use rusqlite::Connection;
+use crate::offsets::{self, OffsetKey};
 
-use crate::cache::indexer::db_filename;
-
-/// Key for consumer offset lookup.
-type ConsumerKey = (String, String, String, String); // (ns, stream, group, id)
+type ConsumerKey = OffsetKey;
 
 pub struct ConsumerTracker {
     offsets: RwLock<HashMap<ConsumerKey, u64>>,
-    cache_dir: Option<PathBuf>,
+    offsets_dir: Option<PathBuf>,
+    dirty: AtomicBool,
 }
 
 impl ConsumerTracker {
-    /// Create a new tracker with optional SQLite persistence.
-    pub fn new(cache_dir: Option<PathBuf>) -> Self {
+    /// Create a new tracker. Loads any existing offsets from `<offsets_dir>`
+    /// so state survives restart. `None` = in-memory only (tests).
+    pub fn new(offsets_dir: Option<PathBuf>) -> Self {
+        let loaded = offsets_dir
+            .as_ref()
+            .and_then(|d| offsets::load(d).ok())
+            .unwrap_or_default();
         Self {
-            offsets: RwLock::new(HashMap::new()),
-            cache_dir,
+            offsets: RwLock::new(loaded),
+            offsets_dir,
+            dirty: AtomicBool::new(false),
         }
     }
 
-    /// Commit an offset for a consumer. Persists to SQLite when available.
+    /// Commit an offset for a consumer. Updates memory and marks dirty.
     pub fn commit(
         &self,
         namespace: &str,
@@ -44,7 +51,6 @@ impl ConsumerTracker {
             consumer_group.to_string(),
             consumer_id.to_string(),
         );
-        // In-memory cache
         {
             let mut map = self
                 .offsets
@@ -52,22 +58,10 @@ impl ConsumerTracker {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.insert(key, seq);
         }
-        // SQLite persistence
-        if let Some(dir) = &self.cache_dir {
-            let db_path = dir.join(db_filename(namespace, stream));
-            if db_path.exists() {
-                if let Ok(conn) = Connection::open(&db_path) {
-                    let _ = conn.execute(
-                        "INSERT OR REPLACE INTO consumer_offsets (consumer_group, consumer_id, committed_seq)
-                         VALUES (?1, ?2, ?3)",
-                        rusqlite::params![consumer_group, consumer_id, seq as i64],
-                    );
-                }
-            }
-        }
+        self.dirty.store(true, Ordering::Release);
     }
 
-    /// Get the last committed offset for a consumer. Falls back to SQLite on cache miss.
+    /// Get the last committed offset for a consumer (0 if none).
     pub fn get(
         &self,
         namespace: &str,
@@ -81,42 +75,11 @@ impl ConsumerTracker {
             consumer_group.to_string(),
             consumer_id.to_string(),
         );
-        // In-memory first
-        {
-            let map = self
-                .offsets
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(&val) = map.get(&key) {
-                return val;
-            }
-        }
-        // SQLite fallback
-        if let Some(dir) = &self.cache_dir {
-            let db_path = dir.join(db_filename(namespace, stream));
-            if db_path.exists() {
-                if let Ok(conn) = Connection::open(&db_path) {
-                    let result: Result<i64, _> = conn.query_row(
-                        "SELECT committed_seq FROM consumer_offsets
-                         WHERE consumer_group = ?1 AND consumer_id = ?2",
-                        rusqlite::params![consumer_group, consumer_id],
-                        |row| row.get(0),
-                    );
-                    if let Ok(seq) = result {
-                        if seq > 0 {
-                            // Cache in memory for next lookup
-                            let mut map = self
-                                .offsets
-                                .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            map.insert(key, seq as u64);
-                            return seq as u64;
-                        }
-                    }
-                }
-            }
-        }
-        0
+        let map = self
+            .offsets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(&key).copied().unwrap_or(0)
     }
 
     /// List all committed offsets for a consumer group in a stream.
@@ -130,15 +93,44 @@ impl ConsumerTracker {
             .offsets
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prefix = (
-            namespace.to_string(),
-            stream.to_string(),
-            consumer_group.to_string(),
-        );
         map.iter()
-            .filter(|((ns, s, g, _), _)| *ns == prefix.0 && *s == prefix.1 && *g == prefix.2)
+            .filter(|((ns, s, g, _), _)| *ns == namespace && *s == stream && *g == consumer_group)
             .map(|((_, _, _, id), seq)| (id.clone(), *seq))
             .collect()
+    }
+
+    /// Flush dirty offsets to disk atomically. No-op if clean or no dir.
+    pub fn flush(&self) -> Result<(), offsets::OffsetError> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(dir) = &self.offsets_dir {
+            let snapshot = self
+                .offsets
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            offsets::save(dir, &snapshot)?;
+        }
+        self.dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Spawn a background thread that flushes every `interval`.
+    /// Best-effort; the caller should also `flush()` on shutdown.
+    pub fn start_flush_loop(self: &Arc<Self>, interval: Duration) -> std::thread::JoinHandle<()> {
+        let this = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("logdbd-offset-flush".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(interval);
+                    if let Err(e) = this.flush() {
+                        tracing::warn!(error = %e, "consumer offset flush failed");
+                    }
+                }
+            })
+            .expect("spawn offset-flush thread")
     }
 }
 
@@ -176,37 +168,21 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_persistence_roundtrip() {
+    fn binary_persistence_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let cache_dir = dir.path().to_path_buf();
+        let offsets_dir = dir.path().to_path_buf();
 
-        // Create the db file with proper schema
-        let db_path = cache_dir.join("ns.stream.db");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS consumer_offsets (
-                    consumer_group TEXT NOT NULL,
-                    consumer_id    TEXT NOT NULL,
-                    committed_seq  INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (consumer_group, consumer_id)
-                );",
-            )
-            .unwrap();
-        }
-
-        let tracker = ConsumerTracker::new(Some(cache_dir));
-
-        // Commit
+        let tracker = ConsumerTracker::new(Some(offsets_dir.clone()));
         tracker.commit("ns", "stream", "g1", "c1", 99);
+        tracker.flush().unwrap();
 
-        // Read back from a fresh tracker (simulates restart)
-        let tracker2 = ConsumerTracker::new(Some(dir.path().to_path_buf()));
+        // Fresh tracker on the same dir simulates a restart
+        let tracker2 = ConsumerTracker::new(Some(offsets_dir));
         assert_eq!(tracker2.get("ns", "stream", "g1", "c1"), 99);
     }
 
     #[test]
-    fn sqlite_nonexistent_returns_zero() {
+    fn nonexistent_returns_zero() {
         let tracker = ConsumerTracker::new(None);
         // No consumer committed anything yet
         assert_eq!(tracker.get("ns", "s", "g", "unknown"), 0);

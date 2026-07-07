@@ -6,6 +6,7 @@ pub mod config;
 pub mod consumer;
 pub mod node;
 pub mod offsets;
+pub mod query;
 pub mod record;
 pub mod replication;
 pub mod service;

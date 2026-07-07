@@ -21,15 +21,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub struct SubscribePublisher {
     storage: Arc<Storage>,
     subscribe_hub: Arc<SubscribeHub>,
+    tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
     last_gid: AtomicU64,
     running: AtomicBool,
 }
 
 impl SubscribePublisher {
-    pub fn new(storage: Arc<Storage>, hub: Arc<SubscribeHub>) -> Self {
+    pub fn new(
+        storage: Arc<Storage>,
+        hub: Arc<SubscribeHub>,
+        tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
+    ) -> Self {
         Self {
             storage,
             subscribe_hub: hub,
+            tombstone_tracker,
             last_gid: AtomicU64::new(0),
             running: AtomicBool::new(false),
         }
@@ -58,7 +64,13 @@ impl SubscribePublisher {
                 match self.storage.scan(last, durable) {
                     Ok(records) => {
                         for rec in &records {
-                            self.subscribe_hub.publish(rec.stream_id, rec);
+                            if rec.event_type == crate::tombstone::STREAM_DELETED_EVENT {
+                                // Track the cutoff (mainly for replicated tombstones on
+                                // standbys); never push tombstones to subscribers.
+                                self.tombstone_tracker.record(rec.stream_id, rec.seq);
+                            } else if self.tombstone_tracker.is_live(rec.stream_id, rec.seq) {
+                                self.subscribe_hub.publish(rec.stream_id, rec);
+                            }
                         }
                         // Half-open [last, durable): everything below durable is done.
                         self.last_gid.store(durable, Ordering::Release);
@@ -107,6 +119,7 @@ mod tests {
         let publisher = Arc::new(SubscribePublisher::new(
             Arc::clone(&storage),
             Arc::clone(&hub),
+            Arc::new(crate::tombstone::TombstoneTracker::new()),
         ));
         publisher.clone().start();
 
@@ -135,6 +148,82 @@ mod tests {
 
         // Non-blocking stop: the poller exits within one POLL_INTERVAL (10 ms).
         // Mirrors the Indexer tests — we don't join the thread.
+        publisher.stop();
+    }
+
+    #[tokio::test]
+    async fn publisher_tracks_tombstone_and_skips_pushing_it() {
+        let (st, _dir) = test_storage();
+        let storage = Arc::new(st);
+        let hub = Arc::new(SubscribeHub::new());
+        let tombstones = Arc::new(crate::tombstone::TombstoneTracker::new());
+
+        // Subscribe BEFORE appending so the broadcast receiver exists. Match the
+        // tombstone event type too so we can prove it is never pushed.
+        let ets: HashSet<String> = ["tool.call".into(), crate::tombstone::STREAM_DELETED_EVENT.into()].into();
+        let mut handle = hub.subscribe(1, ets);
+
+        let publisher = Arc::new(SubscribePublisher::new(
+            Arc::clone(&storage),
+            Arc::clone(&hub),
+            Arc::clone(&tombstones),
+        ));
+        publisher.clone().start();
+
+        // 1) A normal record is appended + flushed ⇒ it must be pushed.
+        storage
+            .append(
+                1,
+                1,
+                "tool.call",
+                "text/plain",
+                &BTreeMap::new(),
+                1,
+                b"pre-delete",
+            )
+            .unwrap();
+        storage.flush().unwrap();
+
+        let rec = tokio::time::timeout(Duration::from_secs(2), handle.next_matching())
+            .await
+            .expect("normal record not pushed within 2s")
+            .expect("hub closed");
+        assert_eq!(rec.event_type, "tool.call");
+        assert_eq!(rec.user_content, b"pre-delete");
+
+        // 2) Append + flush a tombstone. The publisher must track it (cutoff ==
+        // its seq) and must NOT push it to subscribers.
+        storage
+            .append(
+                1,
+                1,
+                crate::tombstone::STREAM_DELETED_EVENT,
+                "application/json",
+                &BTreeMap::new(),
+                2,
+                &[],
+            )
+            .unwrap();
+        storage.flush().unwrap();
+
+        // Give the poller a few cycles to observe the tombstone.
+        let mut cutoff = 0u64;
+        for _ in 0..50 {
+            cutoff = tombstones.cutoff(1);
+            if cutoff == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cutoff, 2, "publisher must track the tombstone cutoff");
+
+        // The tombstone must NOT be pushed: next_matching should time out.
+        let pushed = tokio::time::timeout(Duration::from_millis(150), handle.next_matching()).await;
+        assert!(
+            pushed.is_err(),
+            "tombstone record must not be pushed to subscribers"
+        );
+
         publisher.stop();
     }
 }

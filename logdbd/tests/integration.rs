@@ -1,7 +1,6 @@
 //! Integration tests for logdbd gRPC service (v0.4 proto).
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,7 +53,6 @@ async fn start_test_server() -> (SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(test_storage(dir.path()));
     let catalog = test_catalog(dir.path());
-    let cache_dir = dir.path().join("cache");
     let svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
@@ -62,7 +60,6 @@ async fn start_test_server() -> (SocketAddr, tempfile::TempDir) {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "test-node".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(svc);
 
@@ -90,7 +87,6 @@ async fn start_node(role: &str, standby_addrs: Vec<String>) -> (SocketAddr, temp
         role,
         dir.path().file_name().unwrap().to_string_lossy()
     );
-    let cache_dir = dir.path().join("cache");
     let log_svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
@@ -98,7 +94,6 @@ async fn start_node(role: &str, standby_addrs: Vec<String>) -> (SocketAddr, temp
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         node_id.clone(),
         role.into(),
-        cache_dir,
     );
     let repl_svc = ReplicationServiceImpl::new(Arc::clone(&storage), "test-cluster".into(), 1);
 
@@ -335,7 +330,6 @@ async fn standby_rejects_writes() {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "standby-node".into(),
         "standby".into(),
-        PathBuf::from("/tmp"),
     );
     let svc = LogDbServiceServer::new(svc);
 
@@ -531,7 +525,6 @@ async fn start_server_with_auth(token: &str) -> (SocketAddr, tempfile::TempDir) 
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "auth-node".into(),
         "primary".into(),
-        PathBuf::from("/tmp"),
     );
     let token_entry = logdbd::auth::TokenEntry {
         token: token.to_string(),
@@ -592,7 +585,6 @@ async fn tls_server_accepts_tls_client_and_rejects_plaintext() {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "tls-node".into(),
         "primary".into(),
-        PathBuf::from("/tmp"),
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -824,7 +816,6 @@ async fn catalog_survives_server_restart() {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "restart-node".into(),
         "primary".into(),
-        PathBuf::from("/tmp"),
     );
     let svc = LogDbServiceServer::new(svc);
 
@@ -1043,7 +1034,6 @@ async fn out_of_retention_graceful() {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "ret-node".into(),
         "primary".into(),
-        PathBuf::from("/tmp"),
     );
     let svc = LogDbServiceServer::new(svc);
 
@@ -1147,7 +1137,6 @@ async fn start_cache_server() -> (SocketAddr, tempfile::TempDir, Arc<logdbd::cac
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "cache-test".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
 
@@ -1225,7 +1214,6 @@ async fn cache_query_after_append() {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "cache-test".into(),
         "primary".into(),
-        cache_dir.clone(),
     );
     let svc = LogDbServiceServer::new(log_svc);
 
@@ -1487,7 +1475,6 @@ async fn cache_query_with_metadata_index() {
         Arc::new(logdbd::subscribe::SubscribeHub::new()),
         "meta-idx-test".into(),
         "primary".into(),
-        cache_dir.clone(),
     );
     let svc = LogDbServiceServer::new(log_svc);
 
@@ -1761,6 +1748,7 @@ async fn subscribe_receives_matching_event_types() {
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&hub),
+        Arc::new(logdbd::tombstone::TombstoneTracker::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -1771,7 +1759,6 @@ async fn subscribe_receives_matching_event_types() {
         Arc::clone(&hub),
         "subscribe-test".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
 
@@ -1883,6 +1870,7 @@ async fn subscribe_multi_consumer_same_group() {
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&hub),
+        Arc::new(logdbd::tombstone::TombstoneTracker::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -1893,7 +1881,6 @@ async fn subscribe_multi_consumer_same_group() {
         Arc::clone(&hub),
         "multi-cons".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
 
@@ -2039,6 +2026,7 @@ async fn subscribe_reconnect_replays_from_offset() {
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&hub),
+        Arc::new(logdbd::tombstone::TombstoneTracker::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2049,7 +2037,6 @@ async fn subscribe_reconnect_replays_from_offset() {
         Arc::clone(&hub),
         "reconn-test".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2143,6 +2130,7 @@ async fn subscribe_replays_missed_records_from_offset() {
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&hub),
+        Arc::new(logdbd::tombstone::TombstoneTracker::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2155,7 +2143,6 @@ async fn subscribe_replays_missed_records_from_offset() {
             Arc::clone(&hub),
             "replay-svc".into(),
             "primary".into(),
-            cache_dir.clone(),
         );
         let svc = LogDbServiceServer::new(log_svc);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2197,7 +2184,6 @@ async fn subscribe_replays_missed_records_from_offset() {
         Arc::clone(&hub),
         "replay-svc2".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2285,6 +2271,7 @@ async fn subscribe_concurrent_stress() {
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&hub),
+        Arc::new(logdbd::tombstone::TombstoneTracker::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2295,7 +2282,6 @@ async fn subscribe_concurrent_stress() {
         Arc::clone(&hub),
         "stress".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2421,6 +2407,7 @@ async fn subscribe_100_concurrent_subscribers_stress() {
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&hub),
+        Arc::new(logdbd::tombstone::TombstoneTracker::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2431,7 +2418,6 @@ async fn subscribe_100_concurrent_subscribers_stress() {
         Arc::clone(&hub),
         "stress-100".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2558,6 +2544,7 @@ async fn subscribe_500_subs_replay_stress() {
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&hub),
+        Arc::new(logdbd::tombstone::TombstoneTracker::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2596,7 +2583,6 @@ async fn subscribe_500_subs_replay_stress() {
         Arc::clone(&hub),
         "stress-500".into(),
         "primary".into(),
-        cache_dir,
     );
     let svc = LogDbServiceServer::new(log_svc);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2700,4 +2686,123 @@ async fn subscribe_500_subs_replay_stress() {
 
     indexer.stop();
     subscribe_publisher.stop();
+}
+
+/// cr-027 phase 5: `delete_stream` appends a tombstone record to the segment
+/// (replicable, survives restart) whose seq is the per-stream deletion cutoff.
+/// Reads filter via `TombstoneTracker::is_live`; a later append (seq > cutoff)
+/// is still visible, so the stream is re-creatable.
+#[tokio::test]
+async fn delete_stream_tombstones_then_recreate() {
+    // Minimal inline server (no publisher needed — query reads committed,
+    // filtered by the service's internal tombstone_tracker).
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let mut db_config = logdb::Config::default();
+    db_config.data_dir = data_dir;
+    db_config.shards = 1;
+    let db = logdb::LogDb::open(db_config).unwrap();
+    let storage = Arc::new(logdbd::storage::Storage::new(db, 1));
+    let catalog = Arc::new(test_catalog(dir.path()));
+    let svc = LogDbServiceImpl::new(
+        Arc::clone(&storage),
+        Arc::clone(&catalog),
+        Arc::new(logdbd::consumer::ConsumerTracker::new(None)),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
+        "t".into(),
+        "primary".into(),
+    );
+    let svc = logdbd::pb::log_db_service_server::LogDbServiceServer::new(svc);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Helper: COUNT query for (namespace, stream).
+    async fn query_count(
+        c: &mut LogDbServiceClient<tonic::transport::Channel>,
+        ns: &str,
+        stream: &str,
+    ) -> u64 {
+        let resp = c
+            .query(QueryRequest {
+                namespace: ns.into(),
+                stream: stream.into(),
+                result: QueryResult::Count.into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        match resp.result {
+            Some(query_response::Result::Count(n)) => n,
+            _ => 0,
+        }
+    }
+
+    // append 3 records
+    for _ in 0..3 {
+        c.append(pb::AppendRequest {
+            namespace: "d".into(),
+            stream: "s".into(),
+            event_type: "test.event".into(),
+            content: b"x".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    // wait until the 3 records are committed/queryable
+    let mut n = 0u64;
+    for _ in 0..50 {
+        n = query_count(&mut c, "d", "s").await;
+        if n == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(n, 3, "3 appends should be queryable before delete");
+
+    // delete the stream — appends a tombstone, sync-updates the tracker
+    c.delete_stream(pb::DeleteStreamRequest {
+        namespace: "d".into(),
+        stream: "s".into(),
+    })
+    .await
+    .unwrap();
+
+    // query COUNT must be 0 (delete is visible immediately via the tracker,
+    // even before the tombstone record itself becomes committed).
+    assert_eq!(query_count(&mut c, "d", "s").await, 0);
+
+    // re-create: a new append (seq > cutoff) is visible
+    c.append(pb::AppendRequest {
+        namespace: "d".into(),
+        stream: "s".into(),
+        event_type: "test.event".into(),
+        content: b"y".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    // poll until committed catches up (re-append becomes queryable)
+    let mut n = 0u64;
+    for _ in 0..50 {
+        n = query_count(&mut c, "d", "s").await;
+        if n == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(n, 1, "stream is re-creatable after delete");
 }

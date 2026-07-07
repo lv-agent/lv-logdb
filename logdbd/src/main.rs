@@ -190,28 +190,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Subscribe publisher — chases the durable cursor and fans records out to
     // the hub. Replaces the Indexer as the hub's publisher (cr-027 phase 4).
+    // The publisher also tracks replicated tombstones on standbys (cr-027 phase 5).
+    // Tombstone + quota trackers — seeded once from the committed prefix.
+    // Replace the SQLite Indexer for delete-stream visibility and quota
+    // enforcement (cr-027 phase 5). Quota is then maintained incrementally.
+    let committed = storage.committed_gid();
+    let seed_records = storage.scan(0, committed).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "seed scan failed; starting empty");
+        Vec::new()
+    });
+    let tombstone_tracker = Arc::new(
+        logdbd::tombstone::TombstoneTracker::rebuild_from_records(&seed_records),
+    );
+    let quota_tracker = Arc::new(logdbd::quota::QuotaTracker::seed_from_records(
+        &seed_records,
+        {
+            let tt = Arc::clone(&tombstone_tracker);
+            move |sid, seq| tt.is_live(sid, seq)
+        },
+    ));
+
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&subscribe_hub),
+        Arc::clone(&tombstone_tracker),
     ));
     subscribe_publisher.clone().start();
 
     let hostname = node.id.clone();
     let role_str = node.role.to_string();
     let quotas = config.limits.quotas.clone();
-
-    // Quota tracker — seeded once from the committed prefix, then maintained
-    // incrementally by appends (cr-027 phase 5). Replaces the SQLite COUNT(*)
-    // that check_quota used to run.
-    let committed = storage.committed_gid();
-    let seed_records = storage.scan(0, committed).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "quota seed scan failed; starting from zero usage");
-        Vec::new()
-    });
-    let quota_tracker = Arc::new(logdbd::quota::QuotaTracker::seed_from_records(
-        &seed_records,
-        |_, _| true, // no tombstones exist yet — Task 4 refines this predicate
-    ));
 
     let log_svc = LogDbServiceImpl::with_quotas(
         Arc::clone(&storage),
@@ -221,8 +229,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quotas,
         hostname,
         role_str,
-        config.cache.dir.clone(),
         Arc::clone(&quota_tracker),
+        Arc::clone(&tombstone_tracker),
     );
     let repl_svc = ReplicationServiceImpl::new(
         Arc::clone(&storage),

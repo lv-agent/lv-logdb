@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
@@ -99,8 +98,8 @@ fn decoded_to_pb(r: &crate::record::DecodedRecord) -> pb::Record {
 
 /// Stream-replay helper for `subscribe`: read durable records from the segment,
 /// keep only those matching `stream_id` + `seq > last_committed` + `event_types`,
-/// and forward them on `tx`. Tombstones are NOT filtered — the native engine has
-/// no tombstone and lv-fixus does not use them (cr-027 phase 4).
+/// and forward them on `tx`. Tombstoned records (seq ≤ the stream's cutoff) are
+/// filtered out via `tombstones` (cr-027 phase 5).
 ///
 /// TODO(cr-027 phase 5): this materializes the whole durable prefix into a Vec on
 /// every Subscribe call. Stream + filter without collecting once phase 5 removes
@@ -111,12 +110,14 @@ async fn scan_stream_replay(
     stream_id: u64,
     last_committed: u64,
     event_types: &std::collections::HashSet<String>,
+    tombstones: &crate::tombstone::TombstoneTracker,
     tx: &tokio::sync::mpsc::Sender<Result<pb::Record, Status>>,
 ) -> Result<(), crate::storage::StorageError> {
     for rec in storage.scan(0, durable)? {
         if rec.stream_id == stream_id
             && rec.seq > last_committed
             && event_types.contains(&rec.event_type)
+            && tombstones.is_live(stream_id, rec.seq)
         {
             if tx.send(Ok(decoded_to_pb(&rec))).await.is_err() {
                 return Ok(()); // client disconnected
@@ -134,8 +135,8 @@ pub struct LogDbServiceImpl {
     quotas: Vec<crate::config::StreamQuota>,
     hostname: String,
     role: String,
-    cache_dir: PathBuf,
     quota_tracker: Arc<crate::quota::QuotaTracker>,
+    tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
 }
 
 impl LogDbServiceImpl {
@@ -146,7 +147,6 @@ impl LogDbServiceImpl {
         subscribe_hub: Arc<SubscribeHub>,
         hostname: String,
         role: String,
-        cache_dir: PathBuf,
     ) -> Self {
         Self {
             storage,
@@ -156,12 +156,13 @@ impl LogDbServiceImpl {
             quotas: Vec::new(),
             hostname,
             role,
-            cache_dir,
             quota_tracker: Arc::new(crate::quota::QuotaTracker::new()),
+            tombstone_tracker: Arc::new(crate::tombstone::TombstoneTracker::new()),
         }
     }
 
     /// Same as `new` but with stream quotas.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_quotas(
         storage: Arc<Storage>,
         catalog: Arc<Catalog>,
@@ -170,8 +171,8 @@ impl LogDbServiceImpl {
         quotas: Vec<crate::config::StreamQuota>,
         hostname: String,
         role: String,
-        cache_dir: PathBuf,
         quota_tracker: Arc<crate::quota::QuotaTracker>,
+        tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
     ) -> Self {
         Self {
             storage,
@@ -181,8 +182,8 @@ impl LogDbServiceImpl {
             quotas,
             hostname,
             role,
-            cache_dir,
             quota_tracker,
+            tombstone_tracker,
         }
     }
 
@@ -364,19 +365,27 @@ impl LogDbService for LogDbServiceImpl {
         let (_ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
 
         match self.storage.read(stream_id, r.seq) {
-            Ok(Some(rec)) => Ok(Response::new(pb::ReadResponse {
-                record: Some(pb::Record {
-                    namespace_id: rec.namespace_id,
-                    stream_id: rec.stream_id,
-                    seq: rec.seq,
-                    event_type: rec.event_type,
-                    timestamp_ns: rec.timestamp_ns,
-                    content_type: rec.content_type,
-                    metadata: to_hashmap(&rec.metadata),
-                    content: rec.user_content,
-                }),
-                found: true,
-            })),
+            Ok(Some(rec)) => {
+                if !self.tombstone_tracker.is_live(stream_id, rec.seq) {
+                    return Ok(Response::new(pb::ReadResponse {
+                        record: None,
+                        found: false,
+                    }));
+                }
+                Ok(Response::new(pb::ReadResponse {
+                    record: Some(pb::Record {
+                        namespace_id: rec.namespace_id,
+                        stream_id: rec.stream_id,
+                        seq: rec.seq,
+                        event_type: rec.event_type,
+                        timestamp_ns: rec.timestamp_ns,
+                        content_type: rec.content_type,
+                        metadata: to_hashmap(&rec.metadata),
+                        content: rec.user_content,
+                    }),
+                    found: true,
+                }))
+            }
             Ok(None) => Ok(Response::new(pb::ReadResponse {
                 record: None,
                 found: false,
@@ -401,6 +410,7 @@ impl LogDbService for LogDbServiceImpl {
         };
 
         let storage = Arc::clone(&self.storage);
+        let tombstones = Arc::clone(&self.tombstone_tracker);
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         tokio::spawn(async move {
@@ -416,7 +426,9 @@ impl LogDbService for LogDbServiceImpl {
             };
             let stream_records: Vec<_> = all
                 .into_iter()
-                .filter(|r| r.stream_id == stream_id && r.seq >= from)
+                .filter(|r| {
+                    r.stream_id == stream_id && r.seq >= from && tombstones.is_live(stream_id, r.seq)
+                })
                 .collect();
 
             let total_chunks = stream_records.len().div_ceil(limit);
@@ -467,6 +479,7 @@ impl LogDbService for LogDbServiceImpl {
 
         let storage = Arc::clone(&self.storage);
         let tracker = Arc::clone(&self.consumer_tracker);
+        let tombstones = Arc::clone(&self.tombstone_tracker);
         let ns = r.namespace.clone();
         let stream = r.stream.clone();
         let group = r.consumer_group.clone();
@@ -506,7 +519,11 @@ impl LogDbService for LogDbServiceImpl {
                 };
                 let new_records: Vec<_> = all
                     .into_iter()
-                    .filter(|r| r.stream_id == stream_id && r.seq >= last_seq)
+                    .filter(|r| {
+                        r.stream_id == stream_id
+                            && r.seq >= last_seq
+                            && tombstones.is_live(stream_id, r.seq)
+                    })
                     .take(batch_size as usize)
                     .collect();
 
@@ -788,7 +805,9 @@ impl LogDbService for LogDbServiceImpl {
         // The engine operates on one stream's records.
         let stream_records: Vec<crate::record::DecodedRecord> = all
             .into_iter()
-            .filter(|rec| rec.stream_id == stream_id)
+            .filter(|rec| {
+                rec.stream_id == stream_id && self.tombstone_tracker.is_live(stream_id, rec.seq)
+            })
             .collect();
 
         let q = build_query(r);
@@ -826,6 +845,7 @@ impl LogDbService for LogDbServiceImpl {
         // Clone what we need for the spawned task
         let storage = Arc::clone(&self.storage);
         let hub = Arc::clone(&self.subscribe_hub);
+        let tombstones = Arc::clone(&self.tombstone_tracker);
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         tokio::spawn(async move {
@@ -839,6 +859,7 @@ impl LogDbService for LogDbServiceImpl {
                 stream_id,
                 last_committed,
                 &event_types,
+                &tombstones,
                 &tx,
             )
             .await
@@ -850,6 +871,8 @@ impl LogDbService for LogDbServiceImpl {
             }
 
             // Phase 2: subscribe to real-time hub (unchanged model; uses decoded_to_pb).
+            // The publisher already filters tombstones before pushing to the hub, so
+            // the LIVE-push loop here needs no tombstone filter (cr-027 phase 5).
             let mut handle = hub.subscribe(stream_id, event_types);
             loop {
                 match handle.next_matching().await {
@@ -895,23 +918,39 @@ impl LogDbService for LogDbServiceImpl {
         req: Request<pb::DeleteStreamRequest>,
     ) -> Result<Response<pb::DeleteStreamResponse>, Status> {
         crate::auth::require_role(&req, crate::auth::Role::Admin)?;
+        // Appending a tombstone is a write ⇒ primary only. (v0.6.0 allowed this
+        // on standbys only because it mutated local SQLite, which never replicated.)
+        self.check_write()?;
         let r = req.get_ref();
-        let (_ns_id, _stream_id) = self.resolve(&r.namespace, &r.stream)?;
-        let db_name = crate::cache::indexer::db_filename(&r.namespace, &r.stream);
-        let db_path = self.cache_dir.join(db_name);
-        let deleted = if db_path.exists() {
-            let conn = rusqlite::Connection::open(&db_path)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            conn.execute(
-                "UPDATE records SET deleted = 1 WHERE deleted = 0 AND event_type != 'logdb.tombstone'",
-                [],
-            ).map_err(|e| Status::internal(e.to_string()))? as u64
-        } else {
-            0
-        };
+        let (ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
+
+        // Records that will be logically deleted (reported in the response).
+        let deleted_count = self.quota_tracker.usage(ns_id, stream_id).records;
+
+        // Append a tombstone record to the segment. Its seq becomes the cutoff:
+        // every record in this stream with seq ≤ cutoff is logically deleted.
+        // A normal record ⇒ replicates to standbys and survives restart.
+        let result = self
+            .storage
+            .append(
+                ns_id,
+                stream_id,
+                crate::tombstone::STREAM_DELETED_EVENT,
+                "application/json",
+                &std::collections::BTreeMap::new(),
+                0,
+                &[],
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Sync-update so reads respect the delete immediately (no ~10ms
+        // publisher lag). The publisher also updates it later (idempotent).
+        self.tombstone_tracker.record(stream_id, result.stream_seq);
+        self.quota_tracker.reset(ns_id, stream_id);
+
         Ok(Response::new(pb::DeleteStreamResponse {
             deleted: true,
-            deleted_count: deleted,
+            deleted_count,
         }))
     }
 }

@@ -5,7 +5,8 @@ import * as path from 'path';
 import { TailStream } from './tail-stream';
 import type {
   AppendResult, BatchAppendResult, NamespaceInfo, LogRecord,
-  StreamInfo, StatusResult, Watermark, VerifyResult, TailOptions,
+  QueryRequest, QueryResponse, StreamInfo, StatusResult,
+  Watermark, VerifyResult, TailOptions,
 } from './types';
 
 export interface ClientOptions {
@@ -24,8 +25,12 @@ let protoDef: any = null;
 function loadProto(): any {
   if (protoDef) return protoDef;
   const protoPath = path.join(__dirname, '..', 'proto', 'logdbd.proto');
+  // keepCase: false — field names are camelCased (eventType, fromSeq, …) to
+  // match the rest of this SDK. With true they'd be snake_case and every
+  // multi-word request field would be silently dropped / response field read
+  // as undefined (empirically confirmed against a live server).
   const pkgDef = protoLoader.loadSync(protoPath, {
-    keepCase: true,
+    keepCase: false,
     longs: String,
     enums: String,
     defaults: true,
@@ -205,16 +210,22 @@ export class Client {
 
   // ── Query ──────────────────────────────────────────────────────────
 
-  /** Execute a read-only SQL query against a stream's query cache.
+  /** Execute a structured query against a stream.
    *
-   * Only SELECT is allowed — enforced at the SQLite kernel level.
-   * Each row is returned as a JSON string.
+   * Reads the log segment directly at the committed cursor (no SQL, no
+   * SQLite cache — cr-027). Build a `QueryRequest` with predicates + a result
+   * shape; the returned `QueryResponse` is a discriminated union keyed on
+   * `kind` (e.g. `{ kind: 'count', count: 3 }`).
+   *
+   * `fromSeq`/`toSeq` are an inclusive closed interval; `result` defaults to
+   * RECORDS; `limit = 0` means unlimited; aggregations skip records lacking
+   * `aggregateField`.
    */
-  query(namespace: string, stream: string, sql: string): Promise<string[]> {
+  query(req: QueryRequest): Promise<QueryResponse> {
     return new Promise((resolve, reject) => {
-      this.client.Query({ namespace, stream, sql }, (err: any, resp: any) => {
+      this.client.Query(req, (err: any, resp: any) => {
         if (err) return reject(err);
-        resolve(resp.rows || []);
+        resolve(parseQueryResponse(resp));
       });
     });
   }
@@ -369,4 +380,29 @@ function convertRecord(r: any): LogRecord {
     metadata: r.metadata || {},
     content: Buffer.isBuffer(r.content) ? r.content : Buffer.from(r.content || ''),
   };
+}
+
+/** Resolve the QueryResponse `result` oneof (set by proto-loader because
+ * `oneofs: true`) into the typed discriminated union. */
+function parseQueryResponse(resp: any): QueryResponse {
+  switch (resp.result) {
+    case 'count':
+      return { kind: 'count', count: Number(resp.count) };
+    case 'exists':
+      return { kind: 'exists', exists: !!resp.exists };
+    case 'countDistinct':
+      return { kind: 'countDistinct', countDistinct: Number(resp.countDistinct) };
+    case 'min':
+      return { kind: 'min', min: Number(resp.min) };
+    case 'max':
+      return { kind: 'max', max: Number(resp.max) };
+    case 'distinctValues':
+      return { kind: 'distinctValues', values: resp.distinctValues?.values || [] };
+    case 'records':
+    default:
+      return {
+        kind: 'records',
+        records: (resp.records?.records || []).map(convertRecord),
+      };
+  }
 }

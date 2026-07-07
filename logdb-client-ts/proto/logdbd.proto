@@ -19,6 +19,16 @@ service LogDbService {
   // Catalog — namespace & stream management
   rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse);
   rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
+
+  // Management API — stream lifecycle + quota
+  rpc CreateStream(CreateStreamRequest) returns (CreateStreamResponse);
+  rpc DeleteStream(DeleteStreamRequest) returns (DeleteStreamResponse);
+
+  // Query — native structured filter against the log segment
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Subscribe — real-time event-type push with consumer-group offset tracking
+  rpc Subscribe(SubscribeRequest) returns (stream Record);
 }
 
 // ─── Record (full logdbd record) ─────────────────────────────────────────
@@ -259,4 +269,96 @@ message StreamInfo {
 
 message ListStreamsResponse {
   repeated StreamInfo streams = 1;
+}
+
+// ─── Query (native structured filter engine) ──────────────────────────────
+// Reads the log segment directly at the committed cursor (no SQLite cache).
+// See veps/cr-027-native-query-engine.md ("读边界").
+message QueryRequest {
+  string namespace = 1;
+  string stream    = 2;
+  // Predicates (all AND-combined).
+  repeated string event_types    = 3;   // IN filter on event_type (empty = all).
+  optional uint64 from_seq       = 4;   // seq >= (inclusive). Absent = no lower bound.
+  optional uint64 to_seq         = 5;   // seq <= (inclusive). Absent = no upper bound.
+  repeated MetadataFilter metadata = 6; // Equality on metadata fields.
+  // Result shape.
+  QueryResult result          = 7;      // Defaults to RECORDS (=0).
+  string aggregate_field      = 8;      // COUNT_DISTINCT/MIN/MAX/DISTINCT_VALUES target. "" = use seq.
+  // Anti-join (NOT EXISTS): drop filtered records whose join_key value also
+  // appears on a record matching peer_event_types.
+  AbsentMatch absent          = 9;
+  // Paging / order.
+  int32 limit                  = 10;    // 0 = unlimited. Ignored for aggregations.
+  bool   descending            = 11;    // Order records/values by seq descending.
+}
+message MetadataFilter {
+  string key   = 1;
+  string value = 2;
+}
+message AbsentMatch {
+  repeated string peer_event_types = 1;  // Event types that "complete" a group (e.g. turn_completed).
+  string join_key                  = 2;  // Metadata field joining candidates to peers (e.g. turn_id).
+}
+enum QueryResult {
+  RECORDS         = 0;
+  COUNT           = 1;
+  COUNT_DISTINCT  = 2;
+  MIN             = 3;
+  MAX             = 4;
+  EXISTS          = 5;
+  DISTINCT_VALUES = 6;
+}
+message QueryResponse {
+  oneof result {
+    RecordsResult        records         = 1;
+    uint64               count           = 2;
+    bool                 exists          = 3;
+    uint64               count_distinct  = 4;
+    uint64               min             = 5;
+    uint64               max             = 6;
+    DistinctValuesResult distinct_values = 7;
+  }
+}
+message RecordsResult {
+  repeated Record records = 1;
+}
+message DistinctValuesResult {
+  repeated string values = 1;
+}
+
+// ─── Subscribe (event-type push) ──────────────────────────────────────────
+
+message SubscribeRequest {
+  string namespace       = 1;
+  string stream          = 2;
+  repeated string event_types = 3;  // subscribe to these event types
+  string consumer_group  = 4;       // for offset tracking
+  string consumer_id     = 5;       // unique consumer within group
+}
+
+// ─── Management API ──────────────────────────────────────────────────────
+
+message CreateStreamRequest {
+  string namespace = 1;
+  string stream    = 2;
+  // Optional quota settings
+  uint64 max_records = 3;  // 0 = unlimited
+  uint64 max_bytes   = 4;  // 0 = unlimited
+}
+
+message CreateStreamResponse {
+  uint32 namespace_id = 1;
+  uint64 stream_id    = 2;
+  bool   created      = 3;  // false if already existed
+}
+
+message DeleteStreamRequest {
+  string namespace = 1;
+  string stream    = 2;
+}
+
+message DeleteStreamResponse {
+  bool   deleted = 1;
+  uint64 deleted_count = 2;  // number of records marked deleted
 }

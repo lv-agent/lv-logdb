@@ -21,4 +21,7 @@
 
 export { Client, ClientOptions } from './client';
 export { TailStream } from './tail-stream';
-export { LogRecord, AppendResult, Watermark, VerifyResult, TailOptions } from './types';
+export {
+  LogRecord, AppendResult, Watermark, VerifyResult, TailOptions,
+  QueryRequest, QueryResponse, QueryResultKind, MetadataFilter, AbsentMatch,
+} from './types';

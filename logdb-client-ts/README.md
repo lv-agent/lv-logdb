@@ -50,6 +50,7 @@ sub.on('data', (rec) => {
 | `append(ns, stream, eventType, content)` | Write a record |
 | `read(ns, stream, seq)` | Point read |
 | `scanAll(ns, stream, fromSeq)` | Scan all records |
+| `query(req)` | Structured query → discriminated `QueryResponse` (see Query) |
 | `tail(ns, stream, opts)` | Live subscription (async iterable) |
 | `subscribe(ns, stream, eventTypes, group, id)` | Event-type push subscription |
 | `listNamespaces()` | List all namespaces |
@@ -64,12 +65,49 @@ sub.on('data', (rec) => {
 
 logdbd's `Query` RPC is a native structured-filter engine that reads the log
 segment directly at the committed cursor (no SQL, no SQLite cache, no Indexer).
-The TypeScript SDK is being migrated to this structured API (tracked in
-cr-027). Until that migration lands, use the Rust SDK (`logdb-client`) for
-structured queries — `client.query(QueryRequest { ... })` with predicates
-(`event_types`, `from_seq`/`to_seq`, `metadata`, `absent`) and result shapes
-(`RECORDS`, `COUNT`, `EXISTS`, `COUNT_DISTINCT`, `MIN`, `MAX`,
-`DISTINCT_VALUES`).
+Build a `QueryRequest` with predicates + a result shape; the response is a
+discriminated union keyed on `kind`.
+
+```typescript
+// Count records of a given type
+const { count } = await client.query({
+  namespace: 'my-app', stream: 'main',
+  eventTypes: ['tool.call'],
+  result: 'COUNT',
+});
+
+// Filter by metadata + seq range, return records (newest first, top 10)
+const { records } = await client.query({
+  namespace: 'my-app', stream: 'main',
+  fromSeq: 100, toSeq: 200,
+  metadata: [{ key: 'turn_id', value: '7' }],
+  result: 'RECORDS',
+  descending: true, limit: 10,
+});
+
+// Max of a metadata field (numeric; the engine parses string values as u64)
+const { max } = await client.query({
+  namespace: 'my-app', stream: 'main',
+  eventTypes: ['turn_started'],
+  aggregateField: 'turn_id',
+  result: 'MAX',
+});
+
+// Anti-join: turn_started with no matching turn terminal
+const { records: incomplete } = await client.query({
+  namespace: 'my-app', stream: 'main',
+  eventTypes: ['turn_started'],
+  absent: {
+    peerEventTypes: ['turn_completed', 'turn_failed', 'turn_canceled', 'turn_blocked'],
+    joinKey: 'turn_id',
+  },
+  result: 'RECORDS',
+});
+```
+
+Predicates (all AND-combined): `eventTypes`, `fromSeq`/`toSeq` (inclusive),
+`metadata` (`key` = `value`), `absent` (anti-join). Result shapes: `RECORDS`,
+`COUNT`, `EXISTS`, `COUNT_DISTINCT`, `MIN`, `MAX`, `DISTINCT_VALUES`.
 
 ## TLS / mTLS
 

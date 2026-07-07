@@ -14,3 +14,4 @@ pub mod service;
 pub mod snapshot;
 pub mod storage;
 pub mod subscribe;
+pub mod tombstone;

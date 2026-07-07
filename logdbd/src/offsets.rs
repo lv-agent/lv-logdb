@@ -18,26 +18,28 @@ const VERSION: u8 = 1;
 const FILENAME: &str = "offsets.bin";
 const TMP_FILENAME: &str = "offsets.bin.tmp";
 
-pub fn encode(map: &HashMap<OffsetKey, u64>) -> Vec<u8> {
+pub fn encode(map: &HashMap<OffsetKey, u64>) -> Result<Vec<u8>, OffsetError> {
     let mut buf = Vec::with_capacity(16 + map.len() * 64);
     buf.extend_from_slice(MAGIC);
     buf.push(VERSION);
     buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
     for ((ns, stream, group, id), seq) in map {
-        write_str(&mut buf, ns);
-        write_str(&mut buf, stream);
-        write_str(&mut buf, group);
-        write_str(&mut buf, id);
+        write_str(&mut buf, ns)?;
+        write_str(&mut buf, stream)?;
+        write_str(&mut buf, group)?;
+        write_str(&mut buf, id)?;
         buf.extend_from_slice(&seq.to_le_bytes());
     }
-    buf
+    Ok(buf)
 }
 
-fn write_str(buf: &mut Vec<u8>, s: &str) {
+fn write_str(buf: &mut Vec<u8>, s: &str) -> Result<(), OffsetError> {
     let bytes = s.as_bytes();
-    let len = u16::try_from(bytes.len()).expect("offset string length exceeds u16::MAX");
+    let len =
+        u16::try_from(bytes.len()).map_err(|_| OffsetError::StringTooLong { len: bytes.len() })?;
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(bytes);
+    Ok(())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<HashMap<OffsetKey, u64>, OffsetError> {
@@ -100,7 +102,7 @@ pub fn save(dir: &Path, map: &HashMap<OffsetKey, u64>) -> Result<(), OffsetError
     std::fs::create_dir_all(dir).map_err(|e| OffsetError::Io(e.to_string()))?;
     let tmp = dir.join(TMP_FILENAME);
     let final_path = dir.join(FILENAME);
-    let bytes = encode(map);
+    let bytes = encode(map)?;
     std::fs::write(&tmp, &bytes).map_err(|e| OffsetError::Io(e.to_string()))?;
     std::fs::rename(&tmp, &final_path).map_err(|e| OffsetError::Io(e.to_string()))?;
     Ok(())
@@ -112,6 +114,7 @@ pub enum OffsetError {
     UnsupportedVersion(u8),
     UnexpectedEof,
     BadUtf8,
+    StringTooLong { len: usize },
     Io(String),
 }
 
@@ -122,6 +125,11 @@ impl std::fmt::Display for OffsetError {
             Self::UnsupportedVersion(v) => write!(f, "offsets.bin: unsupported version {}", v),
             Self::UnexpectedEof => write!(f, "offsets.bin: unexpected end of file"),
             Self::BadUtf8 => write!(f, "offsets.bin: invalid utf-8"),
+            Self::StringTooLong { len } => write!(
+                f,
+                "offsets.bin: string length {} exceeds u16::MAX (65535)",
+                len
+            ),
             Self::Io(e) => write!(f, "offsets.bin: io: {}", e),
         }
     }
@@ -142,7 +150,7 @@ mod tests {
             7,
         );
 
-        let bytes = encode(&map);
+        let bytes = encode(&map).unwrap();
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, map);
     }
@@ -155,7 +163,7 @@ mod tests {
     #[test]
     fn empty_map_roundtrips() {
         let map = HashMap::new();
-        let bytes = encode(&map);
+        let bytes = encode(&map).unwrap();
         assert_eq!(decode(&bytes).unwrap(), map);
     }
 
@@ -213,7 +221,7 @@ mod tests {
             ("消费者".into(), "".into(), "grp".into(), "id-1".into()),
             7u64,
         );
-        let bytes = encode(&map);
+        let bytes = encode(&map).unwrap();
         assert_eq!(decode(&bytes).unwrap(), map);
     }
 
@@ -247,5 +255,16 @@ mod tests {
         let map = HashMap::new();
         save(&nested, &map).unwrap();
         assert!(nested.join("offsets.bin").exists());
+    }
+
+    #[test]
+    fn encode_rejects_oversized_string() {
+        let mut map = HashMap::new();
+        let huge = "x".repeat(70_000);
+        map.insert(("ns".into(), huge, "g".into(), "id".into()), 1u64);
+        assert!(matches!(
+            encode(&map),
+            Err(OffsetError::StringTooLong { len: 70_000 })
+        ));
     }
 }

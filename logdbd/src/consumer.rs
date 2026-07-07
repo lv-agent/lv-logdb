@@ -25,10 +25,20 @@ impl ConsumerTracker {
     /// Create a new tracker. Loads any existing offsets from `<offsets_dir>`
     /// so state survives restart. `None` = in-memory only (tests).
     pub fn new(offsets_dir: Option<PathBuf>) -> Self {
-        let loaded = offsets_dir
-            .as_ref()
-            .and_then(|d| offsets::load(d).ok())
-            .unwrap_or_default();
+        let loaded = match &offsets_dir {
+            Some(d) => match offsets::load(d) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        offsets_dir = ?d,
+                        "failed to load offsets.bin; starting empty (consumers will re-deliver from offset 0)"
+                    );
+                    HashMap::new()
+                }
+            },
+            None => HashMap::new(),
+        };
         Self {
             offsets: RwLock::new(loaded),
             offsets_dir,

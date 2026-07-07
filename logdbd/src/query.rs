@@ -3,6 +3,7 @@
 //! Query RPC, replacing the SQLite cache).
 
 use crate::record::DecodedRecord;
+use std::collections::HashSet;
 
 /// A structured query over one stream's records.
 #[derive(Debug, Clone, Default)]
@@ -88,13 +89,32 @@ pub fn execute(query: &Query, records: &[DecodedRecord]) -> ResultSet {
         }
         QueryResult::Count => ResultSet::Count(filtered.len() as u64),
         QueryResult::Exists => ResultSet::Exists(!filtered.is_empty()),
-        // Aggregations land in Task 2.
-        QueryResult::CountDistinct
-        | QueryResult::Min
-        | QueryResult::Max
-        | QueryResult::DistinctValues => {
-            unimplemented!("aggregations added in Task 2")
+        QueryResult::CountDistinct => {
+            let n = distinct_field_values(&filtered, query.aggregate_field.as_deref()).len();
+            ResultSet::CountDistinct(n as u64)
         }
+        QueryResult::DistinctValues => {
+            let mut vals = distinct_field_values(&filtered, query.aggregate_field.as_deref());
+            if query.descending {
+                vals.sort_by(|a, b| b.cmp(a));
+            } else {
+                vals.sort();
+            }
+            if query.limit > 0 && vals.len() > query.limit {
+                vals.truncate(query.limit);
+            }
+            ResultSet::DistinctValues(vals)
+        }
+        QueryResult::Min => ResultSet::Min(numeric_extremum(
+            &filtered,
+            query.aggregate_field.as_deref(),
+            true,
+        )),
+        QueryResult::Max => ResultSet::Max(numeric_extremum(
+            &filtered,
+            query.aggregate_field.as_deref(),
+            false,
+        )),
     }
 }
 
@@ -121,6 +141,56 @@ fn sort_and_limit(rows: &mut Vec<DecodedRecord>, descending: bool, limit: usize)
     if limit > 0 && rows.len() > limit {
         rows.truncate(limit);
     }
+}
+
+/// Distinct string values of `field` across `records`. If `field` is None, uses
+/// `seq` (stringified). Records lacking the field are skipped.
+fn distinct_field_values(records: &[&DecodedRecord], field: Option<&str>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for r in records {
+        let v = match field {
+            Some(f) => match r.metadata.get(f) {
+                Some(val) => val.clone(),
+                None => continue,
+            },
+            None => r.seq.to_string(),
+        };
+        if seen.insert(v.clone()) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Min (is_min=true) or Max of a numeric field. If `field` is None, uses `seq`.
+/// Records lacking the field or with a non-numeric value are skipped.
+/// Returns 0 if none qualify (mirrors SQL `COALESCE(MIN/MAX(..), 0)`).
+fn numeric_extremum(records: &[&DecodedRecord], field: Option<&str>, is_min: bool) -> u64 {
+    let mut best: Option<u64> = None;
+    for r in records {
+        let n = match field {
+            Some(f) => match r.metadata.get(f) {
+                Some(v) => match v.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                },
+                None => continue,
+            },
+            None => r.seq,
+        };
+        best = Some(match best {
+            None => n,
+            Some(b) => {
+                if is_min {
+                    b.min(n)
+                } else {
+                    b.max(n)
+                }
+            }
+        });
+    }
+    best.unwrap_or(0)
 }
 
 /// Anti-join. Task 1 returns the candidates unchanged when `absent` is None;
@@ -271,5 +341,88 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(execute(&no, &records()), ResultSet::Exists(false)));
+    }
+
+    #[test]
+    fn count_distinct_metadata_field() {
+        // turn_id values among turn_started records: "10", "20" → 2 distinct
+        let q = Query {
+            event_types: vec!["turn_started".into()],
+            result: QueryResult::CountDistinct,
+            aggregate_field: Some("turn_id".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            execute(&q, &records()),
+            ResultSet::CountDistinct(2)
+        ));
+    }
+
+    #[test]
+    fn count_distinct_skips_records_lacking_field() {
+        // distinct step_id across ALL records: "s1","s2" (turn_started lack it) → 2
+        let q = Query {
+            result: QueryResult::CountDistinct,
+            aggregate_field: Some("step_id".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            execute(&q, &records()),
+            ResultSet::CountDistinct(2)
+        ));
+    }
+
+    #[test]
+    fn max_of_numeric_metadata_field() {
+        let q = Query {
+            result: QueryResult::Max,
+            aggregate_field: Some("turn_id".into()),
+            ..Default::default()
+        };
+        assert!(matches!(execute(&q, &records()), ResultSet::Max(20)));
+    }
+
+    #[test]
+    fn min_of_numeric_metadata_field() {
+        let q = Query {
+            result: QueryResult::Min,
+            aggregate_field: Some("turn_id".into()),
+            ..Default::default()
+        };
+        assert!(matches!(execute(&q, &records()), ResultSet::Min(10)));
+    }
+
+    #[test]
+    fn max_with_no_matching_field_is_zero() {
+        let q = Query {
+            result: QueryResult::Max,
+            aggregate_field: Some("nonexistent".into()),
+            ..Default::default()
+        };
+        assert!(matches!(execute(&q, &records()), ResultSet::Max(0)));
+    }
+
+    #[test]
+    fn max_of_seq_when_no_aggregate_field() {
+        let q = Query {
+            result: QueryResult::Max,
+            ..Default::default()
+        };
+        assert!(matches!(execute(&q, &records()), ResultSet::Max(4)));
+    }
+
+    #[test]
+    fn distinct_values_metadata_field() {
+        let q = Query {
+            result: QueryResult::DistinctValues,
+            aggregate_field: Some("turn_id".into()),
+            ..Default::default()
+        };
+        match execute(&q, &records()) {
+            ResultSet::DistinctValues(vals) => {
+                assert_eq!(vals, vec!["10".to_string(), "20".to_string()])
+            }
+            _ => panic!("expected DistinctValues"),
+        }
     }
 }

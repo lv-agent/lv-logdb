@@ -77,7 +77,7 @@ pub fn execute(query: &Query, records: &[DecodedRecord]) -> ResultSet {
         .filter(|r| matches_metadata(r, &query.metadata))
         .collect();
 
-    // 2. Anti-join (Task 3 fills this in; for now a no-op pass-through).
+    // 2. Anti-join (NOT EXISTS): drop candidates whose join_key has a matching peer.
     let filtered = apply_absent(&filtered, records, query.absent.as_ref());
 
     // 3. Compute result.

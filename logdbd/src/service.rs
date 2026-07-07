@@ -135,6 +135,7 @@ pub struct LogDbServiceImpl {
     hostname: String,
     role: String,
     cache_dir: PathBuf,
+    quota_tracker: Arc<crate::quota::QuotaTracker>,
 }
 
 impl LogDbServiceImpl {
@@ -156,6 +157,7 @@ impl LogDbServiceImpl {
             hostname,
             role,
             cache_dir,
+            quota_tracker: Arc::new(crate::quota::QuotaTracker::new()),
         }
     }
 
@@ -169,6 +171,7 @@ impl LogDbServiceImpl {
         hostname: String,
         role: String,
         cache_dir: PathBuf,
+        quota_tracker: Arc<crate::quota::QuotaTracker>,
     ) -> Self {
         Self {
             storage,
@@ -179,56 +182,38 @@ impl LogDbServiceImpl {
             hostname,
             role,
             cache_dir,
+            quota_tracker,
         }
     }
 
-    /// Check stream quota — reject append if over limit.
+    /// Check stream quota — reject append if over limit. Reads the in-memory
+    /// `QuotaTracker` (segment-seeded, append-maintained); no SQLite.
     fn check_quota(
         &self,
         ns: &str,
         stream: &str,
+        ns_id: u32,
+        stream_id: u64,
         incoming_bytes: usize,
         quotas: &[crate::config::StreamQuota],
     ) -> Result<(), Status> {
         for q in quotas {
             if q.namespace == ns && q.stream == stream {
-                let db_name = crate::cache::indexer::db_filename(ns, stream);
-                let db_path = self.cache_dir.join(db_name);
-                if let Ok(rows) = crate::cache::execute_query(
-                    &db_path,
-                    "SELECT COUNT(*) AS cnt, COALESCE(SUM(LENGTH(content)), 0) AS total_bytes FROM records WHERE deleted = 0 AND event_type != 'logdb.tombstone'",
-                ) {
-                    if let Some(row) = rows.first() {
-                        // Simple parse: first number is COUNT, second is total_bytes
-                        // JSON row looks like: {"cnt":42,"total_bytes":12345}
-                        if let Some(max_recs) = q.max_records {
-                            if let Some(cnt_start) = row.find("\"cnt\":") {
-                                let rest = &row[cnt_start + 6..];
-                                if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
-                                    let count: u64 = rest[..end].parse().unwrap_or(0);
-                                    if count >= max_recs {
-                                        return Err(Status::resource_exhausted(format!(
-                                            "stream {}/{} record limit reached: {}/{}",
-                                            ns, stream, count, max_recs
-                                        )));
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(max_bytes) = q.max_bytes {
-                            if let Some(tb_start) = row.find("\"total_bytes\":") {
-                                let rest = &row[tb_start + 14..];
-                                if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
-                                    let used: u64 = rest[..end].parse().unwrap_or(0);
-                                    if used + incoming_bytes as u64 > max_bytes {
-                                        return Err(Status::resource_exhausted(format!(
-                                            "stream {}/{} byte limit reached: {}/{}",
-                                            ns, stream, used, max_bytes
-                                        )));
-                                    }
-                                }
-                            }
-                        }
+                let usage = self.quota_tracker.usage(ns_id, stream_id);
+                if let Some(max_records) = q.max_records {
+                    if usage.records >= max_records {
+                        return Err(Status::resource_exhausted(format!(
+                            "stream {}/{} record limit reached: {}/{}",
+                            ns, stream, usage.records, max_records
+                        )));
+                    }
+                }
+                if let Some(max_bytes) = q.max_bytes {
+                    if usage.bytes + incoming_bytes as u64 > max_bytes {
+                        return Err(Status::resource_exhausted(format!(
+                            "stream {}/{} byte limit reached: {}/{}",
+                            ns, stream, usage.bytes, max_bytes
+                        )));
                     }
                 }
             }
@@ -263,16 +248,19 @@ impl LogDbService for LogDbServiceImpl {
         crate::auth::require_role(&req, crate::auth::Role::Writer)?;
         self.check_write()?;
         let r = req.get_ref();
-        self.check_quota(&r.namespace, &r.stream, r.content.len(), &self.quotas)?;
 
         let (ns_id, stream_id) = self.resolve(&r.namespace, &r.stream)?;
+        self.check_quota(
+            &r.namespace,
+            &r.stream,
+            ns_id,
+            stream_id,
+            r.content.len(),
+            &self.quotas,
+        )?;
 
         let meta = to_btree(&r.metadata);
-        let ts = if r.timestamp_ns > 0 {
-            r.timestamp_ns
-        } else {
-            0
-        };
+        let ts = if r.timestamp_ns > 0 { r.timestamp_ns } else { 0 };
         let ct = if r.content_type.is_empty() {
             "application/json"
         } else {
@@ -283,6 +271,9 @@ impl LogDbService for LogDbServiceImpl {
             .storage
             .append(ns_id, stream_id, &r.event_type, ct, &meta, ts, &r.content)
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Incremental quota update — only on a successful append.
+        self.quota_tracker.add(ns_id, stream_id, r.content.len());
 
         Ok(Response::new(pb::AppendResponse {
             namespace_id: ns_id,

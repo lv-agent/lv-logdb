@@ -199,6 +199,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hostname = node.id.clone();
     let role_str = node.role.to_string();
     let quotas = config.limits.quotas.clone();
+
+    // Quota tracker — seeded once from the committed prefix, then maintained
+    // incrementally by appends (cr-027 phase 5). Replaces the SQLite COUNT(*)
+    // that check_quota used to run.
+    let committed = storage.committed_gid();
+    let seed_records = storage.scan(0, committed).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "quota seed scan failed; starting from zero usage");
+        Vec::new()
+    });
+    let quota_tracker = Arc::new(logdbd::quota::QuotaTracker::seed_from_records(
+        &seed_records,
+        |_, _| true, // no tombstones exist yet — Task 4 refines this predicate
+    ));
+
     let log_svc = LogDbServiceImpl::with_quotas(
         Arc::clone(&storage),
         Arc::clone(&catalog),
@@ -208,6 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hostname,
         role_str,
         config.cache.dir.clone(),
+        Arc::clone(&quota_tracker),
     );
     let repl_svc = ReplicationServiceImpl::new(
         Arc::clone(&storage),

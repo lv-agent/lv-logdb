@@ -118,7 +118,13 @@ impl ConsumerTracker {
             self.offsets_dir.as_ref().map(|_| map.clone())
         };
         if let (Some(dir), Some(snap)) = (self.offsets_dir.as_ref(), snapshot) {
-            offsets::save(dir, &snap)?;
+            if let Err(e) = offsets::save(dir, &snap) {
+                // Save failed: re-mark dirty so the next flush cycle retries.
+                // Without this, a failed save would leave dirty=false and the
+                // unsaved state could be dropped on graceful shutdown.
+                self.dirty.store(true, Ordering::Release);
+                return Err(e);
+            }
         }
         Ok(())
     }

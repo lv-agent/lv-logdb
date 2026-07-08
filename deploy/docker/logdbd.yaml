@@ -1,0 +1,51 @@
+# logdbd container default config.
+#
+# Binds 0.0.0.0:50051 (required inside a container). TLS and auth are DISABLED
+# in this default, so starting on a non-loopback address is refused unless
+# LOGDBD_ALLOW_INSECURE=1 is set — intended for local/dev trials only.
+#
+# For production, mount a real config (with server.tls and server.auth) at
+# /etc/logdbd/logdbd.yaml, plus TLS certs and an auth token. See
+# deploy/helm/logdbd/ for a Kubernetes deployment that wires all of this up.
+
+node:
+  id: "${HOSTNAME}"
+  role: primary
+  cluster_id: "logdbd"
+  epoch: 1
+
+server:
+  bind: "0.0.0.0:50051"
+  tls:
+    mode: disabled
+
+logdb:
+  data_dir: /var/lib/logdbd
+  shards: 4
+  segment_size: 268435456       # 256 MiB
+  ring_size: 65536
+  durability_mode: sync
+  flush_timeout_ms: 5000
+
+storage:
+  compression:
+    enabled: true
+    algorithm: zstd
+    level: 1
+
+audit:
+  hash_chain: true
+  hash_algorithm: blake3
+
+limits:
+  max_record_size: 1048576      # 1 MiB
+  max_batch_records: 1000
+  max_batch_bytes: 16777216     # 16 MiB
+  max_scan_limit: 10000
+  max_tail_batch_size: 10000
+
+observability:
+  health_bind: ""
+  metrics: false
+  metrics_bind: ""
+  log_level: info

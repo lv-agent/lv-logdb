@@ -1,0 +1,30 @@
+# Local trial of logdbd via Docker Compose.
+#
+# Dev mode: LOGDBD_ALLOW_INSECURE=1, no TLS, no auth — NOT for production.
+# Data persists in the `logdbd-data` volume.
+#
+#   docker compose -f deploy/docker/docker-compose.yml up --build
+#   # in another shell, with the Rust SDK:
+#   #   client → 127.0.0.1:50051  (no auth)
+#
+# For production (TLS + auth + replication + persistence on k8s), see
+# deploy/helm/logdbd/.
+
+services:
+  logdbd:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: logdbd:dev
+    container_name: logdbd-dev
+    ports:
+      - "50051:50051"
+    environment:
+      # Dev only: allow plaintext bind on 0.0.0.0 without TLS+auth.
+      LOGDBD_ALLOW_INSECURE: "1"
+    volumes:
+      - logdbd-data:/var/lib/logdbd
+    restart: unless-stopped
+
+volumes:
+  logdbd-data:

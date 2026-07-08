@@ -1,0 +1,11 @@
+apiVersion: v2
+name: logdbd
+description: |
+  logdbd — clustered append-only audit log database (gRPC) with hash-chain
+  tamper-evidence and structured queries.
+type: application
+version: 0.1.0
+appVersion: "0.7.0"
+home: https://github.com/lv-agent/lv-logdb
+maintainers:
+  - name: lv-agent

@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "logdbd.fullname" . }}
+  labels:
+    {{- include "logdbd.labels" . | nindent 4 }}
+data:
+  logdbd.yaml: |
+    node:
+      id: {{ .Values.primary.node.id | quote }}
+      role: primary
+      cluster_id: {{ .Values.primary.node.cluster_id | quote }}
+      epoch: {{ .Values.primary.node.epoch }}
+
+    server:
+      bind: {{ .Values.server.bind | quote }}
+      tls:
+        mode: {{ .Values.server.tls.mode | quote }}
+        {{- if and (ne .Values.server.tls.mode "disabled") .Values.server.tls.secretName }}
+        cert_file: /etc/logdbd/certs/tls.crt
+        key_file: /etc/logdbd/certs/tls.key
+        {{- if .Values.server.tls.caSecretName }}
+        ca_file: /etc/logdbd/certs/ca.crt
+        {{- end }}
+        {{- end }}
+      {{- if or .Values.server.auth.token .Values.server.auth.secretName }}
+      auth:
+        token_file: /etc/logdbd/auth/token
+      {{- end }}
+
+    logdb:
+      data_dir: {{ .Values.logdb.dataDir | quote }}
+      shards: {{ .Values.logdb.shards }}
+      segment_size: {{ .Values.logdb.segmentSize }}
+      ring_size: {{ .Values.logdb.ringSize }}
+      durability_mode: {{ .Values.logdb.durabilityMode | quote }}
+      flush_timeout_ms: {{ .Values.logdb.flushTimeoutMs }}
+
+    storage:
+      compression:
+        enabled: {{ .Values.logdb.compression.enabled }}
+        algorithm: {{ .Values.logdb.compression.algorithm | quote }}
+        level: {{ .Values.logdb.compression.level }}
+
+    audit:
+      hash_chain: {{ .Values.logdb.hashChain }}
+      hash_algorithm: {{ .Values.logdb.hashAlgorithm | quote }}
+
+    observability:
+      metrics: {{ .Values.observability.metrics }}
+      metrics_bind: {{ .Values.observability.metricsBind | quote }}
+      log_level: {{ .Values.observability.logLevel | quote }}

@@ -1,0 +1,29 @@
+# Build artifacts
+target/
+**/target/
+
+# VCS / editor / internal
+.git/
+.gitignore
+.claude/
+veps/
+
+# Deployment artifacts not needed to build the image (the image only needs
+# deploy/docker/logdbd.yaml; excluding the rest keeps `COPY . .` cache stable).
+deploy/helm/
+deploy/docker/docker-compose.yml
+deploy/docker/README.md
+deploy/alerts.yml
+deploy/failover-runbook.md
+deploy/logdbd.service
+
+# TS SDK (not needed to build the logdbd Rust image)
+logdb-client-ts/
+
+# Node / generated
+**/node_modules/
+**/dist/
+
+# Logs / temp
+*.log
+/tmp/

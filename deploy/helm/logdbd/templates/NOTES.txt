@@ -1,0 +1,26 @@
+logdbd is deployed as a single primary writer.
+
+{{- if eq (int .Values.standby.replicaCount) 0 }}
+NOTE: standby.replicaCount is 0 — this is a single-node deployment (no
+      replication). Set standby.replicaCount > 0 once horizontal read
+      scaling / failover is configured (cr-026).
+{{- end }}
+
+{{- if .Values.allowInsecure }}
+WARNING: allowInsecure is true — the server binds plaintext on 0.0.0.0 with
+         no TLS/auth. This must NEVER be enabled in production.
+{{- else if and (eq .Values.server.tls.mode "disabled") (not (or .Values.server.auth.token .Values.server.auth.secretName)) }}
+WARNING: TLS is disabled and no auth token is set, but allowInsecure is false.
+         The primary will REFUSE to start (non-loopback bind requires TLS+auth).
+         Either configure server.tls + server.auth, or set allowInsecure=true
+         for a dev trial.
+{{- end }}
+
+Connect a client to the gRPC Service:
+
+  export LOGDBD={{ include "logdbd.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+Back up data (run on a stopped pod — see deploy/docker/README.md):
+
+  kubectl exec -it {{ include "logdbd.fullname" . }}-0 -- logdbd-admin \
+      backup --data-dir {{ .Values.logdb.dataDir }} --out /tmp/snap.logdbbak

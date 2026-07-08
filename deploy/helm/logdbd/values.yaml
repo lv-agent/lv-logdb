@@ -1,0 +1,82 @@
+# Default values for the logdbd Helm chart.
+# See deploy/docker/README.md and the comments inline.
+
+image:
+  repository: ghcr.io/lv-agent/logdbd
+  tag: ""                # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+  pullSecrets: []        # [{ name: regcred }] for private registries
+
+# Single primary writer. (Horizontal write scaling is cr-026, not yet shipped.)
+primary:
+  node:
+    id: "logdbd-primary"
+    cluster_id: "logdbd"
+    epoch: 1
+
+# Standby read-replicas receiving replication from the primary. Leave
+# replicaCount at 0 for a single-node deployment.
+standby:
+  replicaCount: 0
+  # When > 0, standbys replicate from the primary's Service (below).
+  syncPolicy: all       # all | quorum | n
+
+logdb:
+  dataDir: /var/lib/logdbd
+  shards: 4
+  segmentSize: "268435456"   # 256 MiB (string to preserve precision in YAML)
+  ringSize: 65536
+  durabilityMode: sync       # sync | batch | async
+  flushTimeoutMs: 5000
+  compression:
+    enabled: true
+    algorithm: zstd
+    level: 1
+  hashChain: true
+  hashAlgorithm: blake3      # blake3 | sha256
+
+server:
+  bind: "0.0.0.0:50051"
+  tls:
+    # disabled | tls | mtls. When not disabled, mount an existing Secret
+    # (keys: tls.crt, tls.key, optionally ca.crt) via `secretName`.
+    mode: disabled
+    secretName: ""
+    caSecretName: ""
+  auth:
+    # Token auth. Either reference an existing Secret (key: token) via
+    # `secretName`, or set `token` to generate one (dev only — prefer a
+    # pre-provisioned Secret).
+    secretName: ""
+    token: ""
+
+persistence:
+  enabled: true
+  storageClass: ""        # "" → cluster default
+  accessMode: ReadWriteOnce
+  size: 10Gi
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+service:
+  type: ClusterIP
+  port: 50051
+
+observability:
+  metrics: false
+  metricsBind: ""         # e.g. ":9091" to expose Prometheus /metrics
+  logLevel: info
+
+# Dev only: allow plaintext bind on 0.0.0.0 without TLS+auth (sets
+# LOGDBD_ALLOW_INSECURE=1). NEVER enable in production.
+allowInsecure: false
+
+nodeSelector: {}
+affinity: {}
+tolerations: []

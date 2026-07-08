@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "logdbd.fullname" . }}
+  labels:
+    {{- include "logdbd.labels" . | nindent 4 }}
+spec:
+  replicas: 1   # the primary is a single writer
+  selector:
+    matchLabels:
+      {{- include "logdbd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "logdbd.selectorLabels" . | nindent 8 }}
+        logdbd.lv-agent.io/role: primary
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: logdbd
+          image: {{ include "logdbd.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/logdbd/logdbd.yaml"]
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.observability.logLevel | quote }}
+            {{- if .Values.allowInsecure }}
+            - name: LOGDBD_ALLOW_INSECURE
+              value: "1"
+            {{- end }}
+          ports:
+            - name: grpc
+              containerPort: 50051
+          volumeMounts:
+            - name: config
+              mountPath: /etc/logdbd
+              readOnly: true
+            - name: data
+              mountPath: {{ .Values.logdb.dataDir }}
+            {{- if and (ne .Values.server.tls.mode "disabled") .Values.server.tls.secretName }}
+            - name: tls
+              mountPath: /etc/logdbd/certs
+              readOnly: true
+            {{- end }}
+            {{- if or .Values.server.auth.token .Values.server.auth.secretName }}
+            - name: auth
+              mountPath: /etc/logdbd/auth
+              readOnly: true
+            {{- end }}
+          # logdbd-admin ping exits 0 on a healthy gRPC server.
+          livenessProbe:
+            exec:
+              command: ["logdbd-admin", "ping", "127.0.0.1:50051"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command: ["logdbd-admin", "ping", "127.0.0.1:50051"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "logdbd.fullname" . }}
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "logdbd.fullname" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if and (ne .Values.server.tls.mode "disabled") .Values.server.tls.secretName }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.server.tls.secretName }}
+        {{- end }}
+        {{- if or .Values.server.auth.token .Values.server.auth.secretName }}
+        - name: auth
+          secret:
+            secretName: {{ include "logdbd.authSecretName" . }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

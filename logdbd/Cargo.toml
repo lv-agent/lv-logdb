@@ -8,7 +8,7 @@ license = "Apache-2.0"
 
 [dependencies]
 logdb = { version = "0.5.0", path = "../logdb", features = ["compression", "encryption", "hash-chain", "metrics", "tracing"] }
-logdbd-proto = { path = "../logdbd-proto" }
+logdbd-proto = { version = "0.3.1", path = "../logdbd-proto" }
 tonic = { version = "0.12", features = ["tls"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

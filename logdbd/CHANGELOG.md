@@ -1,5 +1,47 @@
 # Changelog — logdbd
 
+## [Unreleased]
+
+### Added
+
+- **Backup / restore for disaster recovery** (cr-029): `logdbd::backup` writes a
+  self-describing `.logdbbak` tar + sha256 sidecar of a stopped node's data dir;
+  `restore` verifies the checksum, refuses to overwrite a non-empty target, and
+  optionally re-opens the log (`--verify`) to re-run CRC + hash-chain + torn-write
+  recovery. CLI: `logdbd-admin backup --data-dir <dir> --out <file.logdbbak>`,
+  `restore --backup <file> --data-dir <dir> [--verify] [--config <server.yaml>]`.
+- **Encryption key management + rotation** (cr-032): the server now actually wires
+  `storage.encryption` to the core. Multi-key rotation via `keys` +
+  `active_key_id`; `${ENV}` interpolation for `key_hex`; rotation works with the
+  hash chain enabled. `EncryptionConfig::resolve_key_ring()` builds the core
+  `KeyRing`.
+- **`KeyProvider` port + built-in `FileKeyProvider`** (cr-032 Phase 2): a
+  `crypto::KeyProvider` trait resolves keys at startup (never on the record path),
+  so the core library carries no vendor dependency. `encryption.provider`
+  (`file` | `awskms` | `vault`; default `file`) selects the source; AWS KMS /
+  Vault are out-of-tree opt-in crates.
+- **Container / Kubernetes deployment** (cr-030): multi-stage Dockerfile
+  (non-root, fixed UID/GID 65532), `docker-compose` dev setup, and a Helm chart
+  (Deployment/Service/ConfigMap/PVC/optional auth Secret, exec health probe).
+- **`restore --verify --config <yaml>`** (cr-032): encryption-aware restore verify
+  loads the server config to resolve the key ring, so encrypted backups verify
+  correctly instead of silently dropping ciphertext frames.
+
+### Fixed
+
+- **`storage.encryption.enabled: true` was a silent no-op** (cr-032 Phase 0): the
+  server parsed the encryption config but never passed it to the core, writing
+  data in plaintext despite encryption being "on". Now resolved.
+- **Flaky tests stabilized** (cr-031): subscribe stress tests gated behind
+  `#[ignore]`; `logdb-client` / `logdb-exporter` integration tests fixed for the
+  post-SQLite API; `LogDb::refresh_manifests()` makes segment-roll timing tests
+  deterministic on coarse-mtime filesystems (WSL2).
+
+> Note: the `[0.4.0]` section below (and the intervening published 0.5.x / 0.6.x
+> releases) predates this CHANGELOG being kept current; reconstruction of those
+> entries is tracked separately. This `[Unreleased]` captures the
+> `feat/commercial-readiness` branch (cr-029 … cr-032).
+
 ## [0.4.0] — unreleased
 
 ### Added

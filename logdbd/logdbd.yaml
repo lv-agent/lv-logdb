@@ -39,12 +39,25 @@ storage:
     algorithm: zstd
     level: 1
   encryption:
-    enabled: false
-    algorithm: aes-256-gcm
-    # keys:
-    #   - key_id: "2026-07"
-    #     key_hex: "<your-32-byte-key-in-hex>"
-    active_key_id: ""
+    enabled: false                     # AES-256-GCM at rest. When true, keys are
+                                       # REQUIRED (startup fails otherwise).
+    algorithm: aes-256-gcm             # only aes-256-gcm is supported
+    # Where keys come from. "file" (default, built-in) reads them from `keys`
+    # below (after ${ENV} substitution). "awskms" / "vault" select out-of-tree
+    # provider crates (opt-in; the core never takes a vendor dependency).
+    provider: file
+    # Generate a key: `openssl rand -hex 32` (64 hex chars = 32 bytes).
+    # key_hex may reference an env var so the secret never lives in the YAML:
+    #   key_hex: "${LOGDBD_ENC_KEY_HEX}"
+    keys:
+      - key_id: "2026-07"
+        key_hex: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+      # Prior keys stay in the decrypt window so records written under them
+      # remain readable after a rotation. To ROTATE: add the new key below,
+      # set active_key_id to it, and keep the old key(s) listed.
+      # - key_id: "2026-09"
+      #   key_hex: "<new-32-byte-key-in-hex>"
+    active_key_id: "2026-07"           # which `keys` entry encrypts new writes
 
 audit:
   hash_chain: true

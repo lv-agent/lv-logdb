@@ -3,6 +3,37 @@
 All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **`KeyRing`: rotation-capable encryption keys** (cr-032). Replaces the single
+  `Config.encryption_key: Option<[u8; 32]>` with
+  `Config.encryption_keys: Option<Arc<KeyRing>>`. A `KeyRing` carries an `active`
+  key (encrypts new writes) plus a decrypt window of prior keys; reads try each
+  until one authenticates (AES-256-GCM AEAD), so rotating the active key keeps
+  older records readable with **no on-disk format change**. Construct with
+  `KeyRing::single`, `KeyRing::new`, or `KeyRing::with_ids`.
+- **Segment-header `encryption_key_id`** (cr-032 Phase 3): each segment records
+  the 128-bit id of the key that encrypted it (in previously-reserved header
+  bytes; no `FORMAT_VERSION` bump). Recovery uses it as an O(1) decrypt hint and
+  operators can see which key a segment depends on.
+
+### Changed
+
+- **Hash-chain key under encryption is now a stable secret, masked on disk**
+  (cr-032 Phase 3). Previously (0.3.0) the chain key was derived from the active
+  encryption key and the header stored zeros; rotating the key therefore severed
+  the chain and made recovery truncate pre-rotation records (silent history loss).
+  The chain key is now a random per-shard secret independent of the active key,
+  stored masked (`header.hash_init = chain_key ⊕ derive(active)`) so it stays
+  off-disk-plaintext, and recovery unmasks+verifies it. Rotating the active key
+  no longer breaks the hash chain. (Encrypted + hash-chain was unreleased, so
+  there is no migration story.)
+- **BREAKING: `Config.encryption_key` → `Config.encryption_keys`** — callers must
+  pass `KeyRing::single(..)` (or `KeyRing::new` / `with_ids`) instead of a raw
+  `[u8; 32]`.
+
 ## [0.3.0] — 2026-07-01
 
 ### Changed (BREAKING)

@@ -1,6 +1,6 @@
 [package]
 name = "logdb-client"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Rust client SDK for logdbd — the append-only audit log database"
@@ -8,13 +8,13 @@ license = "Apache-2.0"
 repository = "https://github.com/lv-agent/lv-logdb"
 
 [dependencies]
-logdbd-proto = { version = "0.3.0", path = "../logdbd-proto" }
+logdbd-proto = { version = "0.3.1", path = "../logdbd-proto" }
 tonic = { version = "0.12", features = ["tls"] }
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
-logdbd = { path = "../logdbd" }
+logdbd = { version = "0.7.0", path = "../logdbd" }
 tokio = { version = "1", features = ["full", "rt-multi-thread", "macros"] }
 tokio-stream = "0.1"
 tempfile = "3"
-logdb = { path = "../logdb" }
+logdb = { version = "0.5.0", path = "../logdb" }

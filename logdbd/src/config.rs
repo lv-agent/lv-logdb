@@ -317,6 +317,10 @@ pub struct EncryptionConfig {
     pub keys: Vec<EncryptionKey>,
     #[serde(default)]
     pub active_key_id: Option<String>,
+    /// Where keys come from (cr-032 Phase 2). `file` (default) reads keys from
+    /// this config; `awskms` / `vault` select out-of-tree provider crates.
+    #[serde(default)]
+    pub provider: ProviderType,
 }
 
 fn default_encryption_algo() -> String {
@@ -330,8 +334,24 @@ impl Default for EncryptionConfig {
             algorithm: "aes-256-gcm".into(),
             keys: vec![],
             active_key_id: None,
+            provider: ProviderType::default(),
         }
     }
+}
+
+/// The encryption key source (cr-032 Phase 2). `file` reads keys from the YAML
+/// (built-in [`crate::crypto::FileKeyProvider`]); `awskms` / `vault` are
+/// out-of-tree provider crates selected via `encryption.provider`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderType {
+    /// Keys read from the config (default; built-in).
+    #[default]
+    File,
+    /// AWS KMS — requires the out-of-tree `logdb-keyprovider-awskms` crate.
+    AwsKms,
+    /// HashiCorp Vault — requires the out-of-tree `logdb-keyprovider-vault` crate.
+    Vault,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -345,70 +365,21 @@ impl EncryptionConfig {
     /// Resolve the configured keys into a [`logdb::KeyRing`], or `Ok(None)` when
     /// encryption is disabled.
     ///
-    /// This is the "file" key source: keys are read from the YAML (after
-    /// `${ENV}` interpolation by [`Config::load`]). The active key is chosen by
-    /// `active_key_id`; every other configured key stays in the decrypt ring so
-    /// records written under a prior key remain readable after a rotation
-    /// (cr-032 Phase 1). Vendor/KMS providers (Phase 2) plug in behind the same
-    /// `Config.encryption_keys` field — the core only ever sees this resolved
-    /// ring, never a provider, so it carries no vendor dependency.
+    /// This is the thin facade over the provider layer (cr-032 Phase 2): it
+    /// short-circuits to `None` when disabled, then delegates to
+    /// [`crate::crypto::build_provider`] so every key source — the built-in file
+    /// provider and out-of-tree KMS adapters — flows through the same
+    /// [`crate::crypto::KeyProvider`] port. The core only ever sees the resolved
+    /// ring, never a provider, so it carries no vendor dependency. The active key
+    /// is chosen by `active_key_id`; every other configured key stays in the
+    /// decrypt ring so records written under a prior key remain readable after a
+    /// rotation (cr-032 Phase 1).
     pub fn resolve_key_ring(&self) -> Result<Option<Arc<logdb::KeyRing>>, String> {
         if !self.enabled {
             return Ok(None);
         }
-        if self.algorithm != "aes-256-gcm" {
-            return Err(format!(
-                "unsupported encryption algorithm '{}': only 'aes-256-gcm' is supported",
-                self.algorithm
-            ));
-        }
-        if self.keys.is_empty() {
-            return Err(
-                "encryption is enabled but storage.encryption.keys is empty".to_string(),
-            );
-        }
-
-        // Decode every configured key (key_hex → 32 bytes).
-        let mut decoded: Vec<(&str, [u8; 32])> = Vec::with_capacity(self.keys.len());
-        for k in &self.keys {
-            let bytes = hex::decode(k.key_hex.trim())
-                .map_err(|e| format!("invalid hex for key '{}': {}", k.key_id, e))?;
-            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                format!(
-                    "key '{}' is {} bytes; AES-256 needs exactly 32 bytes (64 hex chars)",
-                    k.key_id,
-                    bytes.len()
-                )
-            })?;
-            decoded.push((&k.key_id, arr));
-        }
-
-        // Select the active key; the rest become prior (still-readable) keys.
-        let active_id = self.active_key_id.as_deref().ok_or_else(|| {
-            "encryption is enabled but storage.encryption.active_key_id is unset".to_string()
-        })?;
-        let active_idx = decoded
-            .iter()
-            .position(|(id, _)| *id == active_id)
-            .ok_or_else(|| {
-                format!(
-                    "active_key_id '{}' not found among configured keys [{}]",
-                    active_id,
-                    self.keys
-                        .iter()
-                        .map(|k| k.key_id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?;
-        let active = decoded[active_idx].1;
-        let prior: Vec<[u8; 32]> = decoded
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != active_idx)
-            .map(|(_, (_, k))| *k)
-            .collect();
-        Ok(Some(logdb::KeyRing::new(active, prior)))
+        let provider = crate::crypto::build_provider(self).map_err(|e| e.to_string())?;
+        provider.resolve().map(Some).map_err(|e| e.to_string())
     }
 }
 
@@ -979,6 +950,80 @@ mod tests {
         let e = enc(vec![("k1", "42".repeat(32))], Some("nope"));
         let err = e.resolve_key_ring().unwrap_err();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    /// cr-032 Phase 2: the file provider reads keys through `Config::load`, which
+    /// substitutes `${ENV_VAR}` at load time — so a key hex can be supplied via
+    /// the environment without ever appearing in the YAML on disk.
+    #[test]
+    fn encryption_key_hex_can_come_from_env() {
+        // Unique var name so parallel tests never collide on the shared env.
+        const VAR: &str = "LOGDBD_TEST_ENC_KEY_HEX_CR032";
+        const KEY_HEX: &str = "4242424242424242424242424242424242424242424242424242424242424242";
+        // SAFETY: unique var name — no other code reads/writes it, so no data race.
+        unsafe { std::env::set_var(VAR, KEY_HEX); }
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("logdbd.yaml");
+        write_temp(
+            &p,
+            r#"
+node:
+  id: "primary-1"
+  role: primary
+  cluster_id: "c"
+  epoch: 1
+logdb:
+  data_dir: "/var/lib/logdbd"
+storage:
+  encryption:
+    enabled: true
+    active_key_id: "k1"
+    keys:
+      - key_id: "k1"
+        key_hex: "${LOGDBD_TEST_ENC_KEY_HEX_CR032}"
+"#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        // The env-supplied hex resolved into a real key ring.
+        assert!(cfg.storage.encryption.resolve_key_ring().unwrap().is_some());
+
+        // SAFETY: unique var name — no other code reads/writes it.
+        unsafe { std::env::remove_var(VAR); }
+    }
+
+    /// cr-032 Phase 2: `encryption.provider` defaults to `file` and parses the
+    /// other types so operators get a clear error if they select a provider that
+    /// is not built into this `logdbd`.
+    #[test]
+    fn provider_type_parses_and_defaults_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("logdbd.yaml");
+        write_temp(
+            &p,
+            r#"
+node: { id: "n", role: primary, cluster_id: "c", epoch: 1 }
+logdb: { data_dir: "/var/lib/logdbd" }
+storage:
+  encryption:
+    enabled: true
+    provider: awskms
+"#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.storage.encryption.provider, super::ProviderType::AwsKms);
+        // Default (omitted) is file:
+        let p2 = dir.path().join("b.yaml");
+        write_temp(
+            &p2,
+            r#"
+node: { id: "n", role: primary, cluster_id: "c", epoch: 1 }
+logdb: { data_dir: "/var/lib/logdbd" }
+storage: { encryption: { enabled: false } }
+"#,
+        );
+        let cfg2 = Config::load(&p2).unwrap();
+        assert_eq!(cfg2.storage.encryption.provider, super::ProviderType::File);
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod backup;
 pub mod catalog;
 pub mod config;
 pub mod consumer;
+pub mod crypto;
 pub mod node;
 pub mod offsets;
 pub mod publisher;

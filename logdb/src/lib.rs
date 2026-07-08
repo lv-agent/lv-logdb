@@ -123,39 +123,72 @@ pub(crate) type KeyHandle = Arc<zeroize::Zeroizing<[u8; 32]>>;
 /// while keeping the old key in `decrypt_keys`"; retirement is "drop a key from
 /// `decrypt_keys`" (its data becomes unreadable).
 ///
+/// Each key carries a 128-bit `id` (cr-032 Phase 3). Written into the segment
+/// header, it lets recovery pick the decrypt key in O(1) and lets an operator
+/// see which key a segment depends on (explicit retirement, backup manifests).
+/// A header `key_id == 0` means "absent" (no id recorded) — recovery falls back
+/// to try-in-order. The id is opaque to the core; the provider assigns it
+/// (e.g. a hash of the config `key_id` string).
+///
 /// The library **never** knows where keys come from (KMS, file, env). It holds
 /// only this resolved ring; provider/vendor logic lives entirely in the server,
 /// so the core carries no vendor dependency (cr-032 design rule).
 pub struct KeyRing {
     /// Encrypts new writes + derives the hash-chain key.
     active: KeyHandle,
-    /// All keys valid for decryption. `[0] == active`; the rest are prior keys
-    /// still in the read window. Tried in order, so the common case (current
-    /// key) decrypts in one AEAD attempt.
-    pub(crate) decrypt_keys: Vec<KeyHandle>,
+    /// The active key's 128-bit id (written to segment headers).
+    active_id: u128,
+    /// All keys valid for decryption. `[0] == (active_id, active)`; the rest are
+    /// prior keys still in the read window. Tried in order, so the common case
+    /// (current key) decrypts in one AEAD attempt.
+    pub(crate) decrypt_keys: Vec<(u128, KeyHandle)>,
 }
 
 impl KeyRing {
-    /// Single-key ring (no rotation) — the common case.
+    /// Single-key ring (no rotation) — the common case. The key gets a stable
+    /// id derived from its bytes.
     pub fn single(key: [u8; 32]) -> Arc<Self> {
+        let id = key_id_from_bytes(&key);
         let h: KeyHandle = Arc::new(Zeroizing::new(key));
         Arc::new(Self {
             active: h.clone(),
-            decrypt_keys: vec![h],
+            active_id: id,
+            decrypt_keys: vec![(id, h)],
         })
     }
 
     /// Rotation-capable ring: `active` encrypts new writes; each key in `prior`
     /// (older keys that must remain readable) is appended after `active`. The
-    /// decrypt ring is therefore `[active, ...prior]`.
+    /// decrypt ring is therefore `[active, ...prior]`. Ids are derived from the
+    /// key bytes (stable across reopens with the same keys).
     pub fn new(active: [u8; 32], prior: Vec<[u8; 32]>) -> Arc<Self> {
+        let active_id = key_id_from_bytes(&active);
         let active_h: KeyHandle = Arc::new(Zeroizing::new(active));
-        let mut decrypt_keys = vec![active_h.clone()];
+        let mut decrypt_keys = vec![(active_id, active_h.clone())];
         for k in prior {
-            decrypt_keys.push(Arc::new(Zeroizing::new(k)));
+            let id = key_id_from_bytes(&k);
+            decrypt_keys.push((id, Arc::new(Zeroizing::new(k))));
         }
         Arc::new(Self {
             active: active_h,
+            active_id,
+            decrypt_keys,
+        })
+    }
+
+    /// Rotation-capable ring with explicit ids (one per key). Used by providers
+    /// that source ids from config (e.g. a hash of the `key_id` string). `active`
+    /// carries `active_id`; each `(id, key)` in `prior` follows. `prior` ids must
+    /// not collide with `active_id` or each other.
+    pub fn with_ids(active_id: u128, active: [u8; 32], prior: Vec<(u128, [u8; 32])>) -> Arc<Self> {
+        let active_h: KeyHandle = Arc::new(Zeroizing::new(active));
+        let mut decrypt_keys = vec![(active_id, active_h.clone())];
+        for (id, k) in prior {
+            decrypt_keys.push((id, Arc::new(Zeroizing::new(k))));
+        }
+        Arc::new(Self {
+            active: active_h,
+            active_id,
             decrypt_keys,
         })
     }
@@ -165,6 +198,39 @@ impl KeyRing {
     /// handle; no manual dereferencing needed.)
     pub(crate) fn active_slice(&self) -> &[u8; 32] {
         &self.active
+    }
+
+    /// The active key's 128-bit id (written to segment headers).
+    pub(crate) fn active_id(&self) -> u128 {
+        self.active_id
+    }
+
+    /// Look up a key by its 128-bit id (recovery / O(1) decrypt). `None` if the
+    /// id is not in the ring (e.g. the key has been retired).
+    pub(crate) fn key_for_id(&self, id: u128) -> Option<&KeyHandle> {
+        self.decrypt_keys
+            .iter()
+            .find(|(kid, _)| *kid == id)
+            .map(|(_, k)| k)
+    }
+}
+
+/// A stable, 128-bit id for a key, derived from its bytes via FNV-1a (zero-dep,
+/// always available — unlike BLAKE3, which is `hash-chain`-gated). Used when no
+/// config id is supplied; providers may instead hash the `key_id` string. Only
+/// needs to be collision-resistant among the (small) set of configured keys.
+fn key_id_from_bytes(b: &[u8]) -> u128 {
+    // FNV-1a 128-bit offset basis and prime.
+    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for &byte in b {
+        h ^= byte as u128;
+        h = h.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    // Guarantee non-zero: a zero id is the "absent" sentinel in segment headers.
+    if h == 0 {
+        1
+    } else {
+        h
     }
 }
 
@@ -225,21 +291,6 @@ impl LogDb {
         // the last holder's drop scrubs the bytes).
         let encryption_keys: Option<Arc<KeyRing>> = config.encryption_keys.take();
 
-        // Hash-chain key strategy. With encryption, the chain key is DERIVED
-        // from the active key (real MAC — not persistable); the segment header
-        // then stores zeros (not the key). Without a key, the chain is seeded
-        // from non-secret entropy / the header (tamper-evidence only).
-        #[cfg(feature = "hash-chain")]
-        let derived_chain_key: Option<[u8; 32]> = if hash_enabled {
-            encryption_keys
-                .as_ref()
-                .map(|kr| derive_hash_init(kr.active_slice()))
-        } else {
-            None
-        };
-        // Header stores the chain key only when NOT key-derived; else zeros.
-        let header_stores_chain_key = encryption_keys.is_none();
-
         let num_shards = config.shards;
         let shard_bits = shard::shard_bits(num_shards);
 
@@ -282,22 +333,26 @@ impl LogDb {
                 seg_mgrs.push(st.segment_manager);
                 initial_seqs.push(initial_local);
             } else {
-                // Fresh shard.
-                #[cfg(feature = "hash-chain")]
-                let hi = { derived_chain_key.unwrap_or_else(generate_hash_init) };
-                #[cfg(not(feature = "hash-chain"))]
+                // Fresh shard. `hi` is the stable per-shard hash-chain key
+                // (cr-032 Phase 3): a random secret, independent of which
+                // encryption key is active, so rotating the key no longer severs
+                // the chain. It is stored MASKED on disk (chain_key ⊕
+                // derive(active)) so it stays off-disk-plaintext — secret, as
+                // before — and recovery unmasks it. Without encryption it is the
+                // plaintext header seed (the released unencrypted hash-chain
+                // behavior, unchanged).
                 let hi = generate_hash_init();
 
                 shard_hash_inits.push(hi);
                 shard_last_hashes.push([0u8; 32]);
 
-                // Header stores the chain key only without an encryption key;
-                // with one, store zeros (the real key is derived, never stored).
-                let header_hash_init = if header_stores_chain_key {
-                    hi
-                } else {
-                    [0u8; 32]
+                #[cfg(feature = "hash-chain")]
+                let header_hash_init = match &encryption_keys {
+                    Some(kr) if hash_enabled => xor32(hi, derive_hash_init(kr.active_slice())),
+                    _ => hi,
                 };
+                #[cfg(not(feature = "hash-chain"))]
+                let header_hash_init = hi;
                 let sm = SegmentManager::create(
                     sdir,
                     config.segment_size,
@@ -1096,6 +1151,20 @@ pub(crate) fn derive_hash_init(key: &[u8; 32]) -> [u8; 32] {
     *blake3::keyed_hash(key, b"logdb-hash-chain-init-v1").as_bytes()
 }
 
+/// XOR two 32-byte values. Used to mask the hash-chain key into the segment
+/// header under encryption (cr-032 Phase 3): `stored = chain_key ⊕
+/// derive(active)`. Recovery inverts it (`chain_key = stored ⊕ derive(key)`),
+/// so the chain key never appears in plaintext on disk yet is stable across key
+/// rotation (it is no longer derived from the active key).
+#[cfg(feature = "hash-chain")]
+pub(crate) fn xor32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = a[i] ^ b[i];
+    }
+    out
+}
+
 fn generate_hash_init() -> [u8; 32] {
     #[cfg(feature = "hash-chain")]
     {
@@ -1211,15 +1280,29 @@ mod tests {
             }
         }
 
-        // The segment header must NOT carry the key-derived chain key.
+        // cr-032 Phase 3: the chain key is a stable per-shard secret stored
+        // MASKED on disk (`chain_key ⊕ derive(active)`) — never plaintext, never
+        // zeros. An attacker with the disk but not the key sees only the mask;
+        // recovery unmasks it (verifying against the first record) to rebuild
+        // the chain. So the header must hold a non-zero, non-plain value.
         let seg = data_dir.join("segment-00000001.log");
         let mut buf = [0u8; SEGMENT_HEADER_SIZE];
         let mut f = std::fs::File::open(&seg).unwrap();
         f.read_exact(&mut buf).unwrap();
         let header = SegmentHeader::deserialize(&buf).unwrap();
-        assert_eq!(
+        assert_ne!(
             header.hash_init, [0u8; 32],
-            "header must store zeros, not the key-derived chain key"
+            "header must not store zeros — the chain key is now masked, not derived at runtime"
+        );
+        let derived = crate::derive_hash_init(&key);
+        assert_ne!(
+            header.hash_init, derived,
+            "header must store the MASKED chain key, not the bare key-derived value"
+        );
+        // The active key's id is stamped into the header (cr-032 Phase 3).
+        assert_ne!(
+            header.encryption_key_id, 0,
+            "header must carry the active key id for O(1) recovery / retirement"
         );
 
         // Reopen with the SAME key: chain re-derives, records read back.

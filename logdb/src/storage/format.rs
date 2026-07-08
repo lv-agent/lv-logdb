@@ -17,7 +17,8 @@
 //! | 72     | 4    | header_crc       | CRC32C of bytes [0, 72)                  |
 //! | 76     | 32   | prev_last_hash   | Previous segment's final hash_n          |
 //! | 108    | 1    | record_format    | Record encoding format version           |
-//! | 109    | 19   | _reserved        | Future extensions                        |
+//! | 109    | 16   | enc_key_id       | Encryption key id (0 = absent); cr-032   |
+//! | 125    | 3    | _reserved        | Future extensions                        |
 //! | 128    |      |                  | END                                      |
 //!
 //! # Record Layout
@@ -105,6 +106,11 @@ pub struct SegmentHeader {
     pub max_timestamp_ns: u64,
     pub prev_last_hash: [u8; 32],
     pub record_format: u8,
+    /// The 128-bit id of the key that encrypted this segment (cr-032 Phase 3).
+    /// `0` means "absent" — no id was recorded (recovery falls back to
+    /// try-in-order). Stored in the non-CRC'd reserved bytes, so it is treated
+    /// as advisory: recovery verifies any key it selects against the chain.
+    pub encryption_key_id: u128,
 }
 
 impl SegmentHeader {
@@ -133,7 +139,8 @@ impl SegmentHeader {
         // header_crc at 72..76 — filled below
         buf[76..108].copy_from_slice(&last_hash);
         buf[108] = self.record_format;
-        // _reserved at 109..128 — already zero
+        buf[109..125].copy_from_slice(&self.encryption_key_id.to_le_bytes());
+        // _reserved at 125..128 — already zero
 
         let crc = crc32c::crc32c(&buf[..HEADER_CRC_END]);
         buf[72..76].copy_from_slice(&crc.to_le_bytes());
@@ -185,6 +192,7 @@ impl SegmentHeader {
         prev_last_hash.copy_from_slice(&buf[76..108]);
 
         let record_format = buf[108];
+        let encryption_key_id = u128::from_le_bytes(buf[109..125].try_into().unwrap());
 
         Ok(Self {
             format_version,
@@ -198,6 +206,7 @@ impl SegmentHeader {
             max_timestamp_ns,
             prev_last_hash,
             record_format,
+            encryption_key_id,
         })
     }
 
@@ -226,6 +235,7 @@ impl SegmentHeader {
             max_timestamp_ns: 0,
             prev_last_hash: [0u8; 32],
             record_format: RECORD_FORMAT_V1,
+            encryption_key_id: 0,
         }
     }
 
@@ -248,6 +258,7 @@ impl SegmentHeader {
             max_timestamp_ns: 0,
             prev_last_hash,
             record_format: RECORD_FORMAT_V1,
+            encryption_key_id: 0,
         }
     }
 }
@@ -376,7 +387,10 @@ mod tests {
     #[test]
     fn header_round_trip() {
         let hash_init = [0xABu8; 32];
-        let header = SegmentHeader::first_segment(hash_init, 0, 0, 1, false, HASH_ALGO_SHA256);
+        let mut header = SegmentHeader::first_segment(hash_init, 0, 0, 1, false, HASH_ALGO_SHA256);
+        // cr-032 Phase 3: the encryption key id lives in the (non-CRC'd)
+        // reserved bytes and must survive a serialize/deserialize round trip.
+        header.encryption_key_id = 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF;
 
         let mut buf = [0u8; SEGMENT_HEADER_SIZE];
         header.serialize(&mut buf, [0u8; 32]);
@@ -391,6 +405,10 @@ mod tests {
         assert_eq!(parsed.partition_id, 0);
         assert_eq!(parsed.segment_id, 1);
         assert_eq!(parsed.record_format, RECORD_FORMAT_V1);
+        assert_eq!(
+            parsed.encryption_key_id, 0x0123_4567_89AB_CDEF_0123_4567_89AB_CDEF,
+            "encryption_key_id must round-trip through the reserved bytes"
+        );
     }
 
     #[test]

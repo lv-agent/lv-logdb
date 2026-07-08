@@ -369,6 +369,9 @@ impl SegmentManager {
             format::HASH_ALGO_BLAKE3,
         );
         header.flags = flags;
+        // Stamp the active key's id so recovery can pick the decrypt key in O(1)
+        // and operators can see which key a segment depends on (cr-032 Phase 3).
+        header.encryption_key_id = encryption_keys.as_ref().map(|kr| kr.active_id()).unwrap_or(0);
         let active = ActiveSegment::create(&dir, segment_id, &header, [0u8; 32], compressed)?;
 
         // Sync directory to ensure the new segment file is durable
@@ -584,6 +587,7 @@ impl SegmentManager {
             max_timestamp_ns: 0,
             prev_last_hash: self.last_hash,
             record_format: format::RECORD_FORMAT_V1,
+            encryption_key_id: self.encryption_keys.as_ref().map(|kr| kr.active_id()).unwrap_or(0),
         };
 
         let seg = ActiveSegment::create(
@@ -660,6 +664,7 @@ impl SegmentManager {
                 max_timestamp_ns: 0,
                 prev_last_hash: self.last_hash,
                 record_format: format::RECORD_FORMAT_V1,
+                encryption_key_id: self.encryption_keys.as_ref().map(|kr| kr.active_id()).unwrap_or(0),
             };
 
             let new_active = ActiveSegment::create(

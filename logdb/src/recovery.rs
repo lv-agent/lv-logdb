@@ -109,6 +109,120 @@ pub struct RecoveryState {
     pub recovered_count: u64,
 }
 
+/// Decode the first record of a segment (frame mode: decrypt + decompress the
+/// first frame, then parse the first record). Used to verify the hash-chain key
+/// during recovery. Returns `None` if the segment has no readable first record.
+fn decode_first_record(
+    path: &Path,
+    compressed: bool,
+    encrypted: bool,
+    ring: &KeyRing,
+) -> Option<(Vec<u8>, [u8; 32])> {
+    let mut file = File::open(path).ok()?;
+    file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64)).ok()?;
+    let mut fh = [0u8; FRAME_HEADER_SIZE];
+    file.read_exact(&mut fh).ok()?;
+    let (cl, _dl) = read_frame_header(&fh);
+    if cl == 0 {
+        return None;
+    }
+    let mut payload = vec![0u8; cl as usize];
+    file.read_exact(&mut payload).ok()?;
+    let plain =
+        crate::reader::decode_frame_payload(&payload, compressed, encrypted, Some(ring)).ok()?;
+    if plain.len() < MIN_RECORD_SIZE {
+        return None;
+    }
+    let len = u32::from_le_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+    if len > plain.len() {
+        return None;
+    }
+    let (record, _) = deserialize_record(&plain[..len]).ok()?;
+    Some((record.content, record.hash_n))
+}
+
+/// Resolve the per-shard hash-chain key for verification (cr-032 Phase 3).
+///
+/// Without encryption: the plaintext seed straight from the header (unchanged
+/// behavior for the released unencrypted hash chain).
+///
+/// With encryption: the chain key is a STABLE secret stored MASKED on disk
+/// (`header.hash_init = chain_key ⊕ derive(segment_key)`). Recovery unmasks it
+/// by decoding the first segment's first record and finding the key whose
+/// derivation authenticates that record's `hash_n` — `chain_key = header ⊕
+/// derive(K)`. The header's `key_id` is tried first (O(1) typical), then every
+/// decrypt key, so a corrupted (non-CRC'd) `key_id` is harmless: the verify
+/// falls through to the authenticating key. Because the chain key no longer
+/// depends on the active key, rotating the active key no longer severs the chain.
+#[cfg(feature = "hash-chain")]
+fn resolve_chain_key(
+    first_path: &Path,
+    first_header: &SegmentHeader,
+    encryption_key: Option<&KeyRing>,
+) -> [u8; 32] {
+    use crate::pipeline::sealer::blake3_keyed_chain;
+
+    let Some(ring) = encryption_key else {
+        return first_header.hash_init; // unencrypted: plaintext seed
+    };
+    let is_compressed = first_header.flags & FLAG_COMPRESSED_ZSTD != 0;
+    let is_encrypted = first_header.flags & FLAG_ENCRYPTED_AES256GCM != 0;
+    let Some((content, hash_n)) = decode_first_record(first_path, is_compressed, is_encrypted, ring)
+    else {
+        // Empty / unreadable first segment: best-effort — derive from the active
+        // key (the scan will simply find no records to verify).
+        return crate::derive_hash_init(ring.active_slice());
+    };
+    let prev = first_header.prev_last_hash;
+
+    // Candidate keys: the header's key_id hint first (typical O(1)), then every
+    // decrypt key. Trying the same key twice is harmless (one wasted BLAKE3).
+    let mut cands: Vec<&[u8; 32]> = Vec::new();
+    if first_header.encryption_key_id != 0 {
+        if let Some(k) = ring.key_for_id(first_header.encryption_key_id) {
+            cands.push(&***k);
+        }
+    }
+    for (_, k) in &ring.decrypt_keys {
+        cands.push(&***k);
+    }
+    for k in cands {
+        let cand = crate::xor32(first_header.hash_init, crate::derive_hash_init(k));
+        if blake3_keyed_chain(&cand, &prev, &content) == hash_n {
+            return cand;
+        }
+    }
+    // No key authenticates (e.g. the segment's key was retired): fall back to
+    // the active key — the scan will treat the records as unverifiable.
+    crate::derive_hash_init(ring.active_slice())
+}
+
+#[cfg(not(feature = "hash-chain"))]
+fn resolve_chain_key(
+    _first_path: &Path,
+    first_header: &SegmentHeader,
+    _encryption_key: Option<&KeyRing>,
+) -> [u8; 32] {
+    first_header.hash_init
+}
+
+/// Re-mask the chain key for storage in a NEW segment header under the CURRENT
+/// active key (`masked = chain_key ⊕ derive(active)`), so rolled segments stay
+/// masked by the key that encrypts them. Without encryption (or the hash-chain
+/// feature) the key is stored plaintext (unchanged).
+#[cfg(feature = "hash-chain")]
+fn mask_chain_key(chain_key: [u8; 32], encryption_key: Option<&KeyRing>) -> [u8; 32] {
+    match encryption_key {
+        Some(kr) => crate::xor32(chain_key, crate::derive_hash_init(kr.active_slice())),
+        None => chain_key,
+    }
+}
+
+#[cfg(not(feature = "hash-chain"))]
+fn mask_chain_key(chain_key: [u8; 32], _encryption_key: Option<&KeyRing>) -> [u8; 32] {
+    chain_key
+}
+
 /// Recover a single shard's directory. `shard_dir` is `data_dir` for
 /// `shards == 1` (flat layout) or `data_dir/s<shard>/` for `shards > 1`.
 ///
@@ -120,22 +234,6 @@ pub struct RecoveryState {
 ///
 /// Returns `Ok(RecoveryState)` on success. Returns `Err(String)` if recovery
 /// fails catastrophically (no valid segments found, etc.).
-
-/// Resolve the hash-chain key for verification: derived from the encryption
-/// key when one is configured (real MAC — matches what the sealer used), else
-/// the segment header's stored value (clock-seeded tamper-evidence).
-#[cfg(feature = "hash-chain")]
-fn chain_key(encryption_key: Option<&[u8; 32]>, header_value: &[u8; 32]) -> [u8; 32] {
-    match encryption_key {
-        Some(k) => crate::derive_hash_init(k),
-        None => *header_value,
-    }
-}
-#[cfg(not(feature = "hash-chain"))]
-fn chain_key(_encryption_key: Option<&[u8; 32]>, header_value: &[u8; 32]) -> [u8; 32] {
-    *header_value
-}
-
 pub fn recover_shard(
     shard_dir: &Path,
     shard_bits: u32,
@@ -232,8 +330,11 @@ fn recover_shard_inner(
 
     // 3. Extract metadata from the first valid segment
     let first_header = &valid_segments[0].2; // (seg_id, path, header, size)
+    let first_path = &valid_segments[0].1;
     let hash_enabled = first_header.hash_enabled();
-    let hash_init = chain_key(encryption_key.as_ref().map(|kr| kr.active_slice()), &first_header.hash_init);
+    // Resolve the per-shard chain key: for encrypted shards it is unmasked from
+    // the first segment (cr-032 Phase 3); otherwise it is the plaintext header seed.
+    let hash_init = resolve_chain_key(first_path, first_header, encryption_key.as_deref());
 
     // 4. Scan the last segment for torn writes
     let last_idx = valid_segments.len() - 1;
@@ -244,6 +345,7 @@ fn recover_shard_inner(
             *last_seg_id,
             last_header,
             hash_enabled,
+            hash_init,
             encryption_key.clone(),
             shard_bits,
         )?;
@@ -276,6 +378,8 @@ fn recover_shard_inner(
     // The last valid offset in the active segment (after truncation)
     let final_offset = active_offset;
 
+    // Future rolls re-mask the chain key by the CURRENT active key.
+    let masked_hash_init = mask_chain_key(hash_init, encryption_key.as_deref());
     let seg_mgr = SegmentManager::open_existing(
         shard_dir.to_path_buf(),
         last_path.clone(),
@@ -284,7 +388,7 @@ fn recover_shard_inner(
         last_header,
         segment_size,
         last_hash,
-        hash_init,
+        masked_hash_init,
         hash_enabled,
         encryption_key,
         retention,
@@ -347,6 +451,7 @@ fn scan_last_segment(
     segment_id: u32,
     header: &SegmentHeader,
     hash_enabled: bool,
+    chain_key: [u8; 32],
     encryption_key: Option<Arc<KeyRing>>,
     shard_bits: u32,
 ) -> Result<(u64, [u8; 32], u64, Vec<RecoveryWarning>, u64), RecoveryError> {
@@ -379,13 +484,15 @@ fn scan_last_segment(
 
     // Hash-chain verification (P0-4): recompute BLAKE3 keyed chain over each
     // record and compare to the stored hash_n. A mismatch means tampering or
-    // corruption → treat as a break and stop trusting data past it.
+    // corruption → treat as a break and stop trusting data past it. The chain
+    // key is the shard-wide one resolved by the caller (cr-032 Phase 3: a stable
+    // secret unmasked from the first segment, independent of the active key).
     #[cfg(feature = "hash-chain")]
-    let hash_init = chain_key(encryption_key.as_ref().map(|kr| kr.active_slice()), &header.hash_init);
+    let hash_init = chain_key;
     #[cfg(feature = "hash-chain")]
     let mut chain_prev = header.prev_last_hash; // [0;32] for the first segment
     #[cfg(not(feature = "hash-chain"))]
-    let _ = hash_enabled;
+    let _ = (hash_enabled, chain_key);
 
     // Truncate the file to `last_valid_offset` and record a torn-write warning.
     // Defined as a macro so it expands in place (no borrow held across the

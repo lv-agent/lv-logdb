@@ -232,27 +232,42 @@ fn rotation_keeps_all_records_readable() {
     assert_eq!(scan_count(dir.path(), &with_b, false), 6, "all records must decrypt after rotation");
 }
 
-/// cr-032 Phase 1: hash-chain + multi-key (rotation) encryption must be rejected
-/// at open — NOT silently truncate pre-rotation records. The chain-MAC key is
-/// derived from the active key; rotating it would change the MAC key and make
-/// recovery treat every pre-rotation record as a torn write (silent history
-/// loss). Phase 3 (segment-header key_id) lifts this restriction.
+/// cr-032 Phase 3: hash-chain + multi-key rotation now WORKS end-to-end. The
+/// chain key is a stable per-shard secret masked on disk (independent of the
+/// active key), so rotating the active key no longer severs the chain. This is
+/// the test Phase 1 had to reject — it now must succeed: write under A, rotate
+/// to B (A retained), write more, reopen, and ALL records read back with the
+/// hash chain intact.
 #[test]
-fn hash_chain_with_multi_key_is_rejected() {
-    use logdb::{ConfigError, OpenError};
-
+fn rotation_with_hash_chain_now_works() {
     let dir = tempfile::tempdir().unwrap();
-    let multi = enc_multi(&[("a", KEY_A_HEX), ("b", KEY_B_HEX)], "b");
-    let c = db_config_with(dir.path(), &multi, true); // hash ON + 2 keys
 
-    let err = match LogDb::open(c) {
-        Ok(_) => panic!("expected open() to reject hash-chain + multi-key encryption"),
-        Err(e) => e,
-    };
-    match err {
-        OpenError::InvalidConfig(ConfigError::HashChainMultiKeyEncryption) => { /* expected */ }
-        other => panic!("expected HashChainMultiKeyEncryption, got: {other:?}"),
-    }
+    // Session 1: active = A, hash chain ON.
+    let with_a = enc_multi(&[("a", KEY_A_HEX), ("b", KEY_B_HEX)], "a");
+    write_and_drain(
+        dir.path(),
+        &with_a,
+        true, // hash ON
+        &(0..3u64).map(|i| format!("old-{i}").into_bytes()).collect::<Vec<_>>(),
+        3,
+    );
+
+    // Session 2: rotate to B (A retained), hash chain ON, write more.
+    let with_b = enc_multi(&[("a", KEY_A_HEX), ("b", KEY_B_HEX)], "b");
+    write_and_drain(
+        dir.path(),
+        &with_b,
+        true,
+        &(0..3u64).map(|i| format!("new-{i}").into_bytes()).collect::<Vec<_>>(),
+        6,
+    );
+
+    // Reopen: all 6 records readable, chain intact — no truncation.
+    assert_eq!(
+        scan_count(dir.path(), &with_b, true),
+        6,
+        "rotation must not sever the hash chain (cr-032 Phase 3)"
+    );
 }
 
 /// cr-032 Phase 1: single-key encryption + hash-chain is fully supported (no

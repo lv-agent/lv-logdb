@@ -60,7 +60,7 @@ fn decrypt_frame_data(keys: &KeyRing, encrypted: &[u8]) -> Result<Vec<u8>, Strin
     use aes_gcm::{Aes256Gcm, Key, Nonce};
     let nonce = Nonce::from_slice(&encrypted[..nonce_size]);
     let ct = &encrypted[nonce_size..];
-    for k in &keys.decrypt_keys {
+    for (_id, k) in &keys.decrypt_keys {
         // `k` is `&Arc<Zeroizing<[u8; 32]>>`; deref Arc → Zeroizing → [u8; 32].
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&***k));
         if let Ok(plain) = cipher.decrypt(nonce, ct) {

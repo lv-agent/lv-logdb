@@ -208,20 +208,6 @@ impl Config {
         if self.index_stride == 0 {
             return Err(ConfigError::ZeroIndexStride);
         }
-        // cr-032 Phase 1: hash-chain + a multi-key (rotation-capable) encryption
-        // ring are incompatible for now. The chain-MAC key is derived from the
-        // active key; rotating it would change the MAC key and make recovery
-        // truncate pre-rotation records (silent history loss). Phase 3 stores a
-        // key_id per segment, which lifts this restriction. Single-key encryption
-        // + hash-chain is fully supported.
-        #[cfg(feature = "hash-chain")]
-        if self.hash_enabled {
-            if let Some(ring) = &self.encryption_keys {
-                if ring.decrypt_keys.len() > 1 {
-                    return Err(ConfigError::HashChainMultiKeyEncryption);
-                }
-            }
-        }
         // Per-shard hash chain: each shard independently sealed with its own
         // hash_init and last_hash, so multi-shard hash-chain is supported.
         // (The pre-v0.4 single-shard constraint has been removed.)
@@ -286,18 +272,16 @@ mod tests {
         assert!(matches!(c.validate(), Err(ConfigError::SegmentTooSmall(_))));
     }
 
-    // cr-032 Phase 1: hash-chain + multi-key encryption is rejected (rotating the
-    // active key would sever the chain-MAC and truncate pre-rotation records).
+    // cr-032 Phase 3: hash-chain + multi-key encryption is now SUPPORTED (the
+    // chain key is a stable secret masked on disk, independent of the active
+    // key, so rotation no longer severs it). Phase 1 temporarily rejected this.
     #[cfg(all(feature = "hash-chain", feature = "encryption"))]
     #[test]
-    fn rejects_hash_chain_with_multi_key_encryption() {
+    fn allows_hash_chain_with_multi_key_encryption() {
         let mut c = Config::default();
         c.hash_enabled = true;
         c.encryption_keys = Some(crate::KeyRing::new([0xAAu8; 32], vec![[0xBBu8; 32]]));
-        assert!(matches!(
-            c.validate(),
-            Err(ConfigError::HashChainMultiKeyEncryption)
-        ));
+        assert!(c.validate().is_ok(), "multi-key + hash-chain must validate (cr-032 Phase 3)");
     }
 
     #[cfg(all(feature = "hash-chain", feature = "encryption"))]

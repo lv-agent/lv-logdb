@@ -118,6 +118,19 @@ pub enum ConfigError {
         /// The offending shard count.
         shards: usize,
     },
+    /// `hash-chain` + a multi-key encryption ring are not supported together
+    /// yet (cr-032 Phase 3 lifts this). The hash-chain MAC key is derived from
+    /// the active encryption key, so rotating it would change the MAC key and
+    /// make recovery truncate every pre-rotation record (silent history loss).
+    /// Use a single encryption key, or disable `audit.hash_chain`, until
+    /// segment-header key_id lands. Only present under the `hash-chain` feature.
+    #[cfg(feature = "hash-chain")]
+    #[error(
+        "hash-chain + multi-key encryption is not supported together yet (cr-032 Phase 3): \
+         rotating the active key would sever the hash chain and truncate pre-rotation records. \
+         Use a single encryption key, or disable audit.hash_chain"
+    )]
+    HashChainMultiKeyEncryption,
 }
 
 /// Errors that can occur while opening a [`LogDb`](crate::LogDb).

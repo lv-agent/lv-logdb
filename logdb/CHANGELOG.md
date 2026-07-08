@@ -16,8 +16,9 @@ is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `KeyRing::single`, `KeyRing::new`, or `KeyRing::with_ids`.
 - **Segment-header `encryption_key_id`** (cr-032 Phase 3): each segment records
   the 128-bit id of the key that encrypted it (in previously-reserved header
-  bytes; no `FORMAT_VERSION` bump). Recovery uses it as an O(1) decrypt hint and
-  operators can see which key a segment depends on.
+  bytes; no `FORMAT_VERSION` bump). Recovery uses it as an O(1) hint to unmask
+  the hash-chain key, and operators can see which key a segment depends on
+  (retirement metadata, backup manifests).
 
 ### Changed
 

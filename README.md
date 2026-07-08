@@ -2,6 +2,16 @@
 
 A cargo workspace for building tamper-proof, append-only audit log infrastructure.
 
+## Production capabilities
+
+- **Encryption at rest + key rotation** — AES-256-GCM segments; rotate the active
+  key with no downtime and no disk-format change; the hash chain stays intact.
+- **Disaster recovery** — file-level `backup` / `restore --verify` snapshots.
+- **Replication & failover** — primary-standby (sync/async, quorum), mTLS + auth.
+- **Deployable** — Docker image + Helm chart for Kubernetes.
+
+See [`logdbd/README.md`](logdbd/README.md) for configuration and operations.
+
 ## Crates
 
 | Crate | Path | What it is |
@@ -52,7 +62,7 @@ lv-logdb/
 ├── logdbd/                 # gRPC service + admin CLI
 ├── logdb-exporter/         # CDC exporter
 ├── logdb-client/           # Rust SDK
-├── deploy/                 # systemd, alerts, runbook
+├── deploy/                 # systemd, alerts, runbook, Docker image, Helm chart
 ├── docs/                   # upgrade guide
 └── veps/                   # design documents
 ```

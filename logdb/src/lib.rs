@@ -205,8 +205,11 @@ impl KeyRing {
         self.active_id
     }
 
-    /// Look up a key by its 128-bit id (recovery / O(1) decrypt). `None` if the
-    /// id is not in the ring (e.g. the key has been retired).
+    /// Look up a key by its 128-bit id (O(1)). `None` if the id is not in the
+    /// ring (e.g. the key has been retired). Currently used by hash-chain
+    /// recovery to unmask the chain key from a segment's `key_id` hint; available
+    /// for future O(1) read paths.
+    #[cfg_attr(not(feature = "hash-chain"), allow(dead_code))]
     pub(crate) fn key_for_id(&self, id: u128) -> Option<&KeyHandle> {
         self.decrypt_keys
             .iter()

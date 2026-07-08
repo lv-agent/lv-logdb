@@ -10,7 +10,7 @@
 //! `iter_for_segment`, so raw/compressed/encrypted framing is handled
 //! identically to point reads.
 
-use crate::KeyHandle;
+use crate::KeyRing;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ use super::{iter_for_segment, ManifestEntry, SegmentManifest};
 
 /// Single-shard, cross-segment ascending iterator over `[from_id, to_id)`.
 struct ShardScanner {
-    key: Option<KeyHandle>,
+    key: Option<Arc<KeyRing>>,
     from_id: u64,
     to_id: u64,
     /// Candidate segments, from the one containing `from_id` onward. Fetched
@@ -38,7 +38,7 @@ struct ShardScanner {
 impl ShardScanner {
     fn new(
         manifest: Arc<Mutex<SegmentManifest>>,
-        key: Option<KeyHandle>,
+        key: Option<Arc<KeyRing>>,
         from_id: u64,
         to_id: u64,
     ) -> Result<Self, ReadError> {
@@ -186,7 +186,7 @@ impl ScanIter {
     /// single stream; several yield a k-way merge by global id.
     pub(crate) fn build(
         manifests: Vec<Arc<Mutex<SegmentManifest>>>,
-        key: Option<KeyHandle>,
+        key: Option<Arc<KeyRing>>,
         from_id: u64,
         to_id: u64,
     ) -> Result<Self, ReadError> {

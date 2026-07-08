@@ -5,6 +5,7 @@
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Top-level logdbd configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -338,6 +339,77 @@ impl Default for EncryptionConfig {
 pub struct EncryptionKey {
     pub key_id: String,
     pub key_hex: String,
+}
+
+impl EncryptionConfig {
+    /// Resolve the configured keys into a [`logdb::KeyRing`], or `Ok(None)` when
+    /// encryption is disabled.
+    ///
+    /// This is the "file" key source: keys are read from the YAML (after
+    /// `${ENV}` interpolation by [`Config::load`]). The active key is chosen by
+    /// `active_key_id`; every other configured key stays in the decrypt ring so
+    /// records written under a prior key remain readable after a rotation
+    /// (cr-032 Phase 1). Vendor/KMS providers (Phase 2) plug in behind the same
+    /// `Config.encryption_keys` field — the core only ever sees this resolved
+    /// ring, never a provider, so it carries no vendor dependency.
+    pub fn resolve_key_ring(&self) -> Result<Option<Arc<logdb::KeyRing>>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        if self.algorithm != "aes-256-gcm" {
+            return Err(format!(
+                "unsupported encryption algorithm '{}': only 'aes-256-gcm' is supported",
+                self.algorithm
+            ));
+        }
+        if self.keys.is_empty() {
+            return Err(
+                "encryption is enabled but storage.encryption.keys is empty".to_string(),
+            );
+        }
+
+        // Decode every configured key (key_hex → 32 bytes).
+        let mut decoded: Vec<(&str, [u8; 32])> = Vec::with_capacity(self.keys.len());
+        for k in &self.keys {
+            let bytes = hex::decode(k.key_hex.trim())
+                .map_err(|e| format!("invalid hex for key '{}': {}", k.key_id, e))?;
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                format!(
+                    "key '{}' is {} bytes; AES-256 needs exactly 32 bytes (64 hex chars)",
+                    k.key_id,
+                    bytes.len()
+                )
+            })?;
+            decoded.push((&k.key_id, arr));
+        }
+
+        // Select the active key; the rest become prior (still-readable) keys.
+        let active_id = self.active_key_id.as_deref().ok_or_else(|| {
+            "encryption is enabled but storage.encryption.active_key_id is unset".to_string()
+        })?;
+        let active_idx = decoded
+            .iter()
+            .position(|(id, _)| *id == active_id)
+            .ok_or_else(|| {
+                format!(
+                    "active_key_id '{}' not found among configured keys [{}]",
+                    active_id,
+                    self.keys
+                        .iter()
+                        .map(|k| k.key_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        let active = decoded[active_idx].1;
+        let prior: Vec<[u8; 32]> = decoded
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != active_idx)
+            .map(|(_, (_, k))| *k)
+            .collect();
+        Ok(Some(logdb::KeyRing::new(active, prior)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -840,6 +912,73 @@ mod tests {
     fn write_temp(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    // ── EncryptionConfig::resolve_key_ring (cr-032) ────────────────────────
+
+    /// Build an enabled EncryptionConfig from `(key_id, key_hex)` pairs.
+    fn enc(keys: Vec<(&str, String)>, active: Option<&str>) -> EncryptionConfig {
+        let mut e = EncryptionConfig::default();
+        e.enabled = true;
+        e.active_key_id = active.map(String::from);
+        e.keys = keys
+            .into_iter()
+            .map(|(id, hex)| EncryptionKey {
+                key_id: id.into(),
+                key_hex: hex,
+            })
+            .collect();
+        e
+    }
+
+    #[test]
+    fn resolve_key_ring_disabled_is_none() {
+        assert!(EncryptionConfig::default()
+            .resolve_key_ring()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_key_ring_single_key_resolves() {
+        let e = enc(vec![("k1", "42".repeat(32))], Some("k1"));
+        assert!(e.resolve_key_ring().unwrap().is_some());
+    }
+
+    #[test]
+    fn resolve_key_ring_rejects_unsupported_algorithm() {
+        let mut e = enc(vec![("k1", "42".repeat(32))], Some("k1"));
+        e.algorithm = "aes-128-gcm".into();
+        let err = e.resolve_key_ring().unwrap_err();
+        assert!(err.contains("aes-256-gcm"), "{err}");
+    }
+
+    #[test]
+    fn resolve_key_ring_rejects_empty_keys() {
+        let e = enc(vec![], Some("k1"));
+        let err = e.resolve_key_ring().unwrap_err();
+        assert!(err.contains("keys is empty"), "{err}");
+    }
+
+    #[test]
+    fn resolve_key_ring_rejects_bad_hex_length() {
+        let e = enc(vec![("k1", "11223344".into())], Some("k1")); // 4 bytes
+        let err = e.resolve_key_ring().unwrap_err();
+        assert!(err.contains("32 bytes"), "{err}");
+    }
+
+    #[test]
+    fn resolve_key_ring_rejects_unset_active() {
+        let e = enc(vec![("k1", "42".repeat(32))], None);
+        let err = e.resolve_key_ring().unwrap_err();
+        assert!(err.contains("active_key_id is unset"), "{err}");
+    }
+
+    #[test]
+    fn resolve_key_ring_rejects_unknown_active() {
+        let e = enc(vec![("k1", "42".repeat(32))], Some("nope"));
+        let err = e.resolve_key_ring().unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 
     #[test]

@@ -111,6 +111,73 @@ use health::HealthState;
 /// [`Arc`]. All internal components (SegmentManager, Reader, Tailer, …) hold a
 /// clone of this handle — no [`Copy`] duplicates left in memory.
 pub(crate) type KeyHandle = Arc<zeroize::Zeroizing<[u8; 32]>>;
+
+/// A resolved, in-memory set of AES-256-GCM keys supporting rotation **without
+/// a disk-format change** (cr-032).
+///
+/// `active` encrypts new writes (and seeds the hash-chain MAC). On read, every
+/// key in `decrypt_keys` — which always begins with `active`, followed by prior
+/// keys still in the read window — is tried until one authenticates: AES-GCM is
+/// an AEAD, so a wrong key deterministically fails the auth tag and the first
+/// success is unambiguously correct. Rotation is therefore "add a new `active`
+/// while keeping the old key in `decrypt_keys`"; retirement is "drop a key from
+/// `decrypt_keys`" (its data becomes unreadable).
+///
+/// The library **never** knows where keys come from (KMS, file, env). It holds
+/// only this resolved ring; provider/vendor logic lives entirely in the server,
+/// so the core carries no vendor dependency (cr-032 design rule).
+pub struct KeyRing {
+    /// Encrypts new writes + derives the hash-chain key.
+    active: KeyHandle,
+    /// All keys valid for decryption. `[0] == active`; the rest are prior keys
+    /// still in the read window. Tried in order, so the common case (current
+    /// key) decrypts in one AEAD attempt.
+    pub(crate) decrypt_keys: Vec<KeyHandle>,
+}
+
+impl KeyRing {
+    /// Single-key ring (no rotation) — the common case.
+    pub fn single(key: [u8; 32]) -> Arc<Self> {
+        let h: KeyHandle = Arc::new(Zeroizing::new(key));
+        Arc::new(Self {
+            active: h.clone(),
+            decrypt_keys: vec![h],
+        })
+    }
+
+    /// Rotation-capable ring: `active` encrypts new writes; each key in `prior`
+    /// (older keys that must remain readable) is appended after `active`. The
+    /// decrypt ring is therefore `[active, ...prior]`.
+    pub fn new(active: [u8; 32], prior: Vec<[u8; 32]>) -> Arc<Self> {
+        let active_h: KeyHandle = Arc::new(Zeroizing::new(active));
+        let mut decrypt_keys = vec![active_h.clone()];
+        for k in prior {
+            decrypt_keys.push(Arc::new(Zeroizing::new(k)));
+        }
+        Arc::new(Self {
+            active: active_h,
+            decrypt_keys,
+        })
+    }
+
+    /// The active key slice — used for encryption and hash-chain derivation.
+    /// (Deref coercion — Arc → Zeroizing → [u8; 32] — yields the slice from the
+    /// handle; no manual dereferencing needed.)
+    pub(crate) fn active_slice(&self) -> &[u8; 32] {
+        &self.active
+    }
+}
+
+impl std::fmt::Debug for KeyRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never emit key material.
+        f.debug_struct("KeyRing")
+            .field("active", &"<redacted>")
+            .field("decrypt_keys", &self.decrypt_keys.len())
+            .finish()
+    }
+}
+
 use pipeline::signal::{FlushSignal, ShutdownState};
 use pipeline::trigger::CommitTrigger;
 use ring::Ring;
@@ -124,7 +191,7 @@ pub struct LogDb {
 
 struct LogDbInner {
     config: config::Config,
-    key_handle: Option<KeyHandle>,
+    encryption_keys: Option<Arc<KeyRing>>,
     shards: ShardMap,
     health: Arc<HealthState>,
     flush: Arc<FlushSignal>,
@@ -146,31 +213,32 @@ impl LogDb {
     /// fresh log), and spawns the background Committer (and Sealer, under
     /// `hash-chain`). Returns a structured [`OpenError`] on failure so callers
     /// can match on the category (invalid config, recovery, segment, thread).
-    pub fn open(config: Config) -> Result<Self, OpenError> {
+    pub fn open(mut config: Config) -> Result<Self, OpenError> {
         config.validate()?;
 
         let data_dir = config.data_dir.clone();
         let hash_enabled = config.hash_enabled;
 
-        // Extract the encryption key into a zeroizing handle. From here on
-        // every component that needs the key gets an Arc clone of this handle
-        // — no raw [u8; 32] copies left in memory. The last holder's drop
-        // scrubs the key bytes.
-        let encryption_key: Option<KeyHandle> =
-            config.encryption_key.map(|k| Arc::new(Zeroizing::new(k)));
+        // Take the resolved key ring out of the config. From here on every
+        // component that needs the keys gets an Arc clone of the ring — no raw
+        // [u8; 32] copies left in memory (each key is wrapped in Zeroizing, so
+        // the last holder's drop scrubs the bytes).
+        let encryption_keys: Option<Arc<KeyRing>> = config.encryption_keys.take();
 
-        // Hash-chain key strategy. With an encryption key, the chain key is
-        // DERIVED from it (real MAC — not persistable); the segment header then
-        // stores zeros (not the key). Without a key, the chain is seeded from
-        // non-secret entropy / the header (tamper-evidence only).
+        // Hash-chain key strategy. With encryption, the chain key is DERIVED
+        // from the active key (real MAC — not persistable); the segment header
+        // then stores zeros (not the key). Without a key, the chain is seeded
+        // from non-secret entropy / the header (tamper-evidence only).
         #[cfg(feature = "hash-chain")]
         let derived_chain_key: Option<[u8; 32]> = if hash_enabled {
-            encryption_key.as_ref().map(|k| derive_hash_init(k))
+            encryption_keys
+                .as_ref()
+                .map(|kr| derive_hash_init(kr.active_slice()))
         } else {
             None
         };
         // Header stores the chain key only when NOT key-derived; else zeros.
-        let header_stores_chain_key = encryption_key.is_none();
+        let header_stores_chain_key = encryption_keys.is_none();
 
         let num_shards = config.shards;
         let shard_bits = shard::shard_bits(num_shards);
@@ -199,7 +267,7 @@ impl LogDb {
                     shard_bits,
                     config.segment_size,
                     config.retention.clone(),
-                    encryption_key.clone(),
+                    encryption_keys.clone(),
                 )
                 .map_err(|reason| OpenError::Recovery { shard: s, reason })?;
                 // Resume this shard's ring at the LOCAL seq after the last recovered
@@ -235,7 +303,7 @@ impl LogDb {
                     config.segment_size,
                     hash_enabled,
                     config.compression_enabled,
-                    encryption_key.clone(),
+                    encryption_keys.clone(),
                     header_hash_init,
                     config.retention.clone(),
                     0,
@@ -346,7 +414,7 @@ impl LogDb {
         Ok(Self {
             inner: Arc::new(LogDbInner {
                 config,
-                key_handle: encryption_key,
+                encryption_keys,
                 shards,
                 health,
                 flush,
@@ -612,7 +680,7 @@ impl LogDb {
         }
         let reader = reader::Reader::new(
             Arc::clone(&inner.manifests[shard]),
-            inner.key_handle.clone(),
+            inner.encryption_keys.clone(),
         );
         reader.read(record_id)
     }
@@ -669,7 +737,7 @@ impl LogDb {
             }
             let reader = reader::Reader::new(
                 Arc::clone(&inner.manifests[shard]),
-                inner.key_handle.clone(),
+                inner.encryption_keys.clone(),
             );
             let shard_ids: Vec<u64> = live.iter().map(|&(_, id)| id).collect();
             let mut batch = reader.read_batch(&shard_ids)?;
@@ -751,7 +819,7 @@ impl LogDb {
             rings,
             self.inner.shards.shard_bits(),
             name,
-            self.inner.key_handle.clone(),
+            self.inner.encryption_keys.clone(),
             self.inner.data_dir.clone(),
         )
     }
@@ -762,7 +830,7 @@ impl LogDb {
     /// empty iterator (no error).
     pub fn scan(&self, from_id: u64, to_id: u64) -> Result<ScanIter, ReadError> {
         let manifests = self.inner.manifests.iter().map(Arc::clone).collect();
-        reader::ScanIter::build(manifests, self.inner.key_handle.clone(), from_id, to_id)
+        reader::ScanIter::build(manifests, self.inner.encryption_keys.clone(), from_id, to_id)
     }
 
     /// Mark `sequence` as the WAL checkpoint.
@@ -1117,11 +1185,11 @@ mod tests {
         let key = [0x99u8; 32];
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().to_path_buf();
-        let mut mk = || {
+        let mk = || {
             let mut c = Config::default();
             c.data_dir = data_dir.clone();
             c.hash_enabled = true;
-            c.encryption_key = Some(key);
+            c.encryption_keys = Some(KeyRing::single(key));
             c.ring_size = 64;
             c.durability_mode = DurabilityMode::Sync;
             c.flush_timeout = Duration::from_secs(5);
@@ -2930,7 +2998,7 @@ mod tests {
         config.data_dir = dir.path().to_path_buf();
         config.shards = 4;
         config.ring_size = 256;
-        config.encryption_key = Some([0x42u8; 32]);
+        config.encryption_keys = Some(KeyRing::single([0x42u8; 32]));
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(5);
         let db = Arc::new(LogDb::open(config.clone()).unwrap());
@@ -3020,7 +3088,7 @@ mod tests {
         config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
         config.ring_size = 8192;
         config.compression_enabled = compressed;
-        config.encryption_key = key;
+        config.encryption_keys = key.map(KeyRing::single);
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(60);
         let db = LogDb::open(config).unwrap();

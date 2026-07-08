@@ -31,10 +31,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let backup_path = flag(&args, "--backup")?.ok_or("--backup required")?;
             let data_dir = flag(&args, "--data-dir")?.ok_or("--data-dir required")?;
             let verify = args.iter().any(|a| a == "--verify");
+            // Encryption keys for --verify: load the server config (the same
+            // YAML the primary runs with) and resolve its key ring. Without
+            // these, recovery silently drops encrypted frames and the verify
+            // would pass on an empty database.
+            let key_ring = match flag(&args, "--config")? {
+                Some(cfg_path) => {
+                    let cfg = logdbd::config::Config::load(&cfg_path)
+                        .map_err(|e| format!("load --config {cfg_path}: {e}"))?;
+                    cfg.storage
+                        .encryption
+                        .resolve_key_ring()
+                        .map_err(|e| format!("encryption config: {e}"))?
+                }
+                None => None,
+            };
             cmd_restore(
                 std::path::Path::new(backup_path),
                 std::path::Path::new(data_dir),
                 verify,
+                key_ring,
             )?;
             return Ok(());
         }
@@ -107,7 +123,7 @@ fn usage(prog: &str) {
         prog
     );
     eprintln!(
-        "  {} restore  --backup <file.logdbbak> --data-dir <dir> [--verify]",
+        "  {} restore  --backup <file.logdbbak> --data-dir <dir> [--verify] [--config <server.yaml>]",
         prog
     );
 }
@@ -254,8 +270,9 @@ fn cmd_restore(
     backup_path: &std::path::Path,
     data_dir: &std::path::Path,
     verify: bool,
+    key_ring: Option<std::sync::Arc<logdb::KeyRing>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = logdbd::backup::restore(backup_path, data_dir, verify)?;
+    let manifest = logdbd::backup::restore(backup_path, data_dir, verify, key_ring)?;
     println!(
         "Restored {} → {}",
         backup_path.display(),

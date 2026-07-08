@@ -150,6 +150,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db_config.flush_timeout = std::time::Duration::from_millis(config.logdb.flush_timeout_ms);
     db_config.hash_enabled = config.audit.hash_chain;
     db_config.compression_enabled = config.storage.compression.enabled;
+    db_config.encryption_keys = config
+        .storage
+        .encryption
+        .resolve_key_ring()
+        .map_err(|e| format!("encryption config: {}", e))?;
 
     let db = LogDb::open(db_config).map_err(|e| format!("logdb open: {}", e))?;
     let num_shards = config.logdb.shards;

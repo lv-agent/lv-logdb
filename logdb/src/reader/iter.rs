@@ -6,10 +6,11 @@
 //! (each frame is decoded — decrypt then decompress — and its records yielded
 //! in order).
 
-use crate::KeyHandle;
+use crate::KeyRing;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::ReadError;
 use crate::record::Record;
@@ -40,7 +41,7 @@ pub struct RecordIter {
     // ── Frame mode only ──
     is_compressed: bool,
     is_encrypted: bool,
-    key: Option<KeyHandle>,
+    key: Option<Arc<KeyRing>>,
     /// Decoded bytes of the current frame (raw records). Empty when no frame
     /// is loaded and we need to read the next one.
     frame_data: Vec<u8>,
@@ -74,7 +75,7 @@ impl RecordIter {
         end_id: u64,
         is_compressed: bool,
         is_encrypted: bool,
-        key: Option<KeyHandle>,
+        key: Option<Arc<KeyRing>>,
     ) -> Result<Self, ReadError> {
         let file = File::open(&segment_path)
             .map_err(|e| ReadError::Io(format!("open {:?}: {}", segment_path, e)))?;
@@ -130,7 +131,7 @@ impl RecordIter {
             &payload,
             self.is_compressed,
             self.is_encrypted,
-            self.key.as_deref().map(|z| &**z),
+            self.key.as_deref(),
         ) {
             Ok(d) => d,
             Err(_) => return false,

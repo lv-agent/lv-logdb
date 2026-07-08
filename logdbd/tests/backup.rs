@@ -87,7 +87,7 @@ fn backup_restore_round_trips_real_data() {
     assert!(!data_dir.exists());
 
     // Restore with verify (re-runs logdb recovery: CRC + hash chain + torn writes).
-    let restored_manifest = backup::restore(&out, &data_dir, true).expect("restore --verify");
+    let restored_manifest = backup::restore(&out, &data_dir, true, None).expect("restore --verify");
     assert_eq!(restored_manifest.magic, manifest.magic);
     assert_eq!(restored_manifest.file_count, manifest.file_count);
 

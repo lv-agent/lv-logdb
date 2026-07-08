@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use logdb::{Config, DurabilityMode, LogDb};
+use logdb::{Config, DurabilityMode, KeyRing, LogDb};
 
 fn main() {
     let dir = tempfile::tempdir().unwrap();
@@ -15,7 +15,7 @@ fn main() {
 
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
-    config.encryption_key = Some(key); // requires the `encryption` feature
+    config.encryption_keys = Some(KeyRing::single(key)); // requires the `encryption` feature
     config.durability_mode = DurabilityMode::Sync;
     config.flush_timeout = Duration::from_secs(5);
     let db = LogDb::open(config).unwrap();
@@ -43,7 +43,7 @@ fn main() {
     // records survive (scan is empty). This proves the key is essential.
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
-    config.encryption_key = None;
+    config.encryption_keys = None;
     let db = LogDb::open(config).unwrap();
     let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
     assert_eq!(

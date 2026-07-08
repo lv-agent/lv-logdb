@@ -3,9 +3,11 @@
 //! All configuration is validated at construction time via [`Config::validate`].
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::ConfigError;
+use crate::KeyRing;
 
 /// Policy when the ring buffer is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +115,7 @@ pub struct Config {
     pub hash_enabled: bool,
     /// Enable streaming zstd compression (requires "compression" feature).
     pub compression_enabled: bool,
-    pub encryption_key: Option<[u8; 32]>, // Requires "encryption" feature
+    pub encryption_keys: Option<Arc<KeyRing>>, // Requires "encryption" feature
 
     /// Durability mode. Default: Batch.
     pub durability_mode: DurabilityMode,
@@ -167,7 +169,7 @@ impl Default for Config {
             max_content_size: 1 * 1024 * 1024, // 1MB
             hash_enabled: false,
             compression_enabled: false,
-            encryption_key: None,
+            encryption_keys: None,
             durability_mode: DurabilityMode::Batch,
             io_backend: IoBackend::Pwrite,
             queue_full_policy: QueueFullPolicy::Block,

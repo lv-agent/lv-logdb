@@ -12,7 +12,7 @@
 //! 3. Open the segment file, seek to the anchor's file_offset, and sequentially
 //!    scan forward to the target record_id.
 
-use crate::KeyHandle;
+use crate::KeyRing;
 pub mod iter;
 pub mod scan;
 pub use scan::ScanIter;
@@ -45,24 +45,33 @@ fn decompress_frame(_compressed: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Decrypt AES-256-GCM encrypted frame data. Input is {nonce:12B | ciphertext}.
+///
+/// Tries every key in the ring until one authenticates — AES-GCM is an AEAD, so
+/// a wrong key deterministically fails the auth tag and the first success is
+/// unambiguously correct. This is what lets the reader decrypt records written
+/// under a prior key after a rotation, with no on-disk key id (cr-032).
 #[cfg(feature = "encryption")]
-fn decrypt_frame_data(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, String> {
+fn decrypt_frame_data(keys: &KeyRing, encrypted: &[u8]) -> Result<Vec<u8>, String> {
     let nonce_size = crate::storage::format::ENCRYPTION_NONCE_SIZE;
     if encrypted.len() < nonce_size {
         return Err("too short".into());
     }
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Key, Nonce};
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(&encrypted[..nonce_size]);
-    cipher
-        .decrypt(nonce, &encrypted[nonce_size..])
-        .map_err(|_| "decryption failed".into())
+    let ct = &encrypted[nonce_size..];
+    for k in &keys.decrypt_keys {
+        // `k` is `&Arc<Zeroizing<[u8; 32]>>`; deref Arc → Zeroizing → [u8; 32].
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&***k));
+        if let Ok(plain) = cipher.decrypt(nonce, ct) {
+            return Ok(plain);
+        }
+    }
+    Err("decryption failed".into())
 }
 
 #[cfg(not(feature = "encryption"))]
-fn decrypt_frame_data(_key: &[u8; 32], _encrypted: &[u8]) -> Result<Vec<u8>, String> {
+fn decrypt_frame_data(_keys: &KeyRing, _encrypted: &[u8]) -> Result<Vec<u8>, String> {
     Err("encryption feature not enabled".into())
 }
 
@@ -74,11 +83,11 @@ pub(crate) fn decode_frame_payload(
     payload: &[u8],
     compressed: bool,
     encrypted: bool,
-    key: Option<&[u8; 32]>,
+    key_ring: Option<&KeyRing>,
 ) -> Result<Vec<u8>, String> {
     let plain = if encrypted {
-        let k = key.ok_or_else(|| "encrypted frame but no key provided".to_string())?;
-        decrypt_frame_data(k, payload)?
+        let kr = key_ring.ok_or_else(|| "encrypted frame but no key provided".to_string())?;
+        decrypt_frame_data(kr, payload)?
     } else {
         payload.to_vec()
     };
@@ -238,7 +247,7 @@ pub(crate) fn iter_for_segment(
     entry: &ManifestEntry,
     from_id: u64,
     to_id: u64,
-    key: Option<KeyHandle>,
+    key: Option<Arc<KeyRing>>,
 ) -> Result<iter::RecordIter, ReadError> {
     let path = entry.path.clone();
     let is_compressed = entry.flags & crate::storage::format::FLAG_COMPRESSED_ZSTD != 0;
@@ -289,18 +298,18 @@ pub struct Reader {
     manifest: Arc<Mutex<SegmentManifest>>,
     /// Encryption key, if the database was opened with one. Required to read
     /// encrypted frames; without it encrypted records are undecryptable.
-    encryption_key: Option<KeyHandle>,
+    encryption_keys: Option<Arc<KeyRing>>,
 }
 
 impl Reader {
     /// Create a new reader sharing a segment manifest (cached dir listing).
     pub(crate) fn new(
         manifest: Arc<Mutex<SegmentManifest>>,
-        encryption_key: Option<KeyHandle>,
+        encryption_keys: Option<Arc<KeyRing>>,
     ) -> Self {
         Self {
             manifest,
-            encryption_key,
+            encryption_keys,
         }
     }
 
@@ -371,7 +380,7 @@ impl Reader {
             // Frame-based segment: [frame_header(8)][payload], where
             // payload = encrypt?(compress?(raw_records)). Either flag
             // triggers the frame layout (P0-1: encrypted-only also frames).
-            let key = self.encryption_key.as_deref().map(|z| &**z);
+            let key_ring = self.encryption_keys.as_deref();
             while offset < file_size {
                 if offset + FRAME_HEADER_SIZE as u64 > file_size {
                     break;
@@ -390,7 +399,7 @@ impl Reader {
                 let mut cdata = vec![0u8; cl];
                 file.read_exact(&mut cdata)
                     .map_err(|e| ReadError::Io(format!("read frame data: {}", e)))?;
-                let decoded = match decode_frame_payload(&cdata, is_compressed, is_encrypted, key) {
+                let decoded = match decode_frame_payload(&cdata, is_compressed, is_encrypted, key_ring) {
                     Ok(d) => d,
                     Err(_) => break,
                 };
@@ -638,7 +647,7 @@ impl Reader {
             Some(e) => e,
             None => return Err(ReadError::NotFound(from_id)),
         };
-        iter_for_segment(&entry, from_id, to_id, self.encryption_key.clone())
+        iter_for_segment(&entry, from_id, to_id, self.encryption_keys.clone())
     }
 }
 
@@ -774,5 +783,55 @@ mod tests {
             stale.is_none(),
             "find() must not return a stale entry for a deleted segment"
         );
+    }
+}
+
+#[cfg(all(test, feature = "encryption"))]
+mod keyring_tests {
+    use super::decode_frame_payload;
+    use crate::KeyRing;
+
+    /// Encrypt a plaintext with `key` in the on-disk frame layout
+    /// (`nonce:12B ‖ ciphertext`) so `decode_frame_payload` can consume it.
+    fn encrypted_frame(key: [u8; 32], plaintext: &[u8]) -> Vec<u8> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Key, Nonce};
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).unwrap();
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .unwrap();
+        let mut out = Vec::with_capacity(12 + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    /// A frame encrypted with key B must be readable through a ring whose
+    /// decrypt order lists a *wrong* key (A) before B — proving the reader
+    /// tries every key until one authenticates (rotation support, no disk
+    /// format change; cr-032).
+    #[test]
+    fn decrypt_tries_keys_until_one_authenticates() {
+        let key_a = [0xAAu8; 32];
+        let key_b = [0xBBu8; 32];
+        // active=A, decrypt order [A, B]. Encrypt with B (a record written
+        // under a now-superseded key): A is tried first and skipped, B wins.
+        let ring = KeyRing::new(key_a, vec![key_b]);
+        let plaintext = b"hello-rotation-payload";
+        let frame = encrypted_frame(key_b, plaintext);
+        let decoded = decode_frame_payload(&frame, false, true, Some(ring.as_ref())).unwrap();
+        assert_eq!(decoded, plaintext);
+    }
+
+    /// A frame whose key has been retired (absent from the ring) is unreadable,
+    /// surfacing the standard "decryption failed" error.
+    #[test]
+    fn decrypt_fails_when_key_retired() {
+        let ring = KeyRing::single([0xAAu8; 32]); // only A
+        let frame = encrypted_frame([0xBBu8; 32], b"retired"); // written with B
+        let err = decode_frame_payload(&frame, false, true, Some(ring.as_ref())).unwrap_err();
+        assert!(err.contains("decryption failed"), "got: {err}");
     }
 }

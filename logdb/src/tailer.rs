@@ -22,7 +22,7 @@
 //! `shards == 1` collapses to a single-element progress vector and is
 //! byte-for-byte equivalent to the legacy single-shard tailer.
 
-use crate::KeyHandle;
+use crate::KeyRing;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -165,7 +165,7 @@ pub struct Tailer {
     /// One ring per shard (for reading each shard's durable cursor).
     rings: Vec<Arc<Ring>>,
     shard_bits: u32,
-    encryption_key: Option<KeyHandle>,
+    encryption_key: Option<Arc<KeyRing>>,
 }
 
 impl Tailer {
@@ -175,7 +175,7 @@ impl Tailer {
         rings: Vec<Arc<Ring>>,
         shard_bits: u32,
         name: &str,
-        encryption_key: Option<KeyHandle>,
+        encryption_key: Option<Arc<KeyRing>>,
         data_dir: PathBuf,
     ) -> Self {
         let num_shards = manifests.len();

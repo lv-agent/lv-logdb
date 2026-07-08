@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use logdb::{AppendError, LogDb, ShutdownReport};
-use logdb::{Config, DurabilityMode};
+use logdb::{Config, DurabilityMode, KeyRing};
 
 #[test]
 fn full_lifecycle_append_flush_read() {
@@ -456,7 +456,7 @@ fn encrypted_log_roundtrip_survives_restart() {
     {
         let mut config = Config::default();
         config.data_dir = data_dir.clone();
-        config.encryption_key = Some(key);
+        config.encryption_keys = Some(KeyRing::single(key));
         config.ring_size = 256;
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(10);
@@ -479,7 +479,7 @@ fn encrypted_log_roundtrip_survives_restart() {
     // Restart with the SAME key.
     let mut config = Config::default();
     config.data_dir = data_dir.clone();
-    config.encryption_key = Some(key);
+    config.encryption_keys = Some(KeyRing::single(key));
     config.durability_mode = DurabilityMode::Sync;
     config.flush_timeout = Duration::from_secs(10);
     let db = LogDb::open(config).unwrap();
@@ -508,7 +508,7 @@ fn encrypted_log_unreadable_without_key() {
     {
         let mut config = Config::default();
         config.data_dir = data_dir.clone();
-        config.encryption_key = Some(key);
+        config.encryption_keys = Some(KeyRing::single(key));
         config.ring_size = 128;
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(10);

@@ -13,6 +13,7 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -152,6 +153,7 @@ pub fn restore(
     backup_path: &Path,
     data_dir: &Path,
     verify: bool,
+    key_ring: Option<Arc<logdb::KeyRing>>,
 ) -> Result<BackupManifest, BackupError> {
     // Verify checksum sidecar if present.
     let sidecar = sha256_sidecar_path(backup_path);
@@ -200,17 +202,23 @@ pub fn restore(
     }
 
     if verify {
-        verify_recovers(data_dir)?;
+        verify_recovers(data_dir, key_ring)?;
     }
     Ok(manifest)
 }
 
 /// Open the restored data_dir to confirm recovery succeeds; close immediately.
-fn verify_recovers(data_dir: &Path) -> Result<(), BackupError> {
-    // Async is the cheapest durability mode for a verify-only open.
+fn verify_recovers(
+    data_dir: &Path,
+    key_ring: Option<Arc<logdb::KeyRing>>,
+) -> Result<(), BackupError> {
+    // Async is the cheapest durability mode for a verify-only open. The key
+    // ring must match the server's — without it, recovery silently drops
+    // encrypted frames and the verify would pass on an empty database.
     let cfg = logdb::Config {
         data_dir: data_dir.to_path_buf(),
         durability_mode: logdb::DurabilityMode::Async,
+        encryption_keys: key_ring,
         ..Default::default()
     };
     let db = logdb::LogDb::open(cfg).map_err(|e| BackupError::VerifyFailed(e.to_string()))?;
@@ -382,7 +390,7 @@ mod tests {
 
         // Restore into a fresh dir.
         let restored = tmp.path().join("restored");
-        let m2 = restore(&out, &restored, false).expect("restore");
+        let m2 = restore(&out, &restored, false, None).expect("restore");
         assert_eq!(m2, manifest);
         assert_dirs_equal(&data, &restored);
     }
@@ -398,7 +406,7 @@ mod tests {
         let target = tmp.path().join("target");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("preexisting"), b"x").unwrap();
-        let err = restore(&out, &target, false).unwrap_err();
+        let err = restore(&out, &target, false, None).unwrap_err();
         assert!(matches!(err, BackupError::TargetNotEmpty(_)), "{err}");
     }
 
@@ -419,7 +427,7 @@ mod tests {
         drop(f);
 
         let target = tmp.path().join("target");
-        let err = restore(&out, &target, false).unwrap_err();
+        let err = restore(&out, &target, false, None).unwrap_err();
         assert!(matches!(err, BackupError::ChecksumMismatch { .. }), "{err}");
     }
 
@@ -445,7 +453,7 @@ mod tests {
 
         // Restore and confirm active.lock was NOT carried over.
         let restored = tmp.path().join("restored");
-        restore(&out, &restored, false).unwrap();
+        restore(&out, &restored, false, None).unwrap();
         assert!(!restored.join("active.lock").exists(), "active.lock must not be in the backup");
     }
 }

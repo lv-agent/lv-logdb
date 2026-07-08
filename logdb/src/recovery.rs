@@ -16,10 +16,11 @@
 //! 4. Rebuild sparse index for each segment (deferred to Phase 7).
 //! 5. Return recovery state.
 
-use crate::KeyHandle;
+use crate::KeyRing;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::RetentionPolicy;
 use crate::storage::format::{
@@ -140,7 +141,7 @@ pub fn recover_shard(
     shard_bits: u32,
     segment_size: u64,
     retention: RetentionPolicy,
-    encryption_key: Option<KeyHandle>,
+    encryption_key: Option<Arc<KeyRing>>,
 ) -> Result<RecoveryState, RecoveryError> {
     let __t0 = std::time::Instant::now();
     let result = recover_shard_inner(shard_dir, shard_bits, segment_size, retention, encryption_key);
@@ -153,7 +154,7 @@ fn recover_shard_inner(
     shard_bits: u32,
     segment_size: u64,
     retention: RetentionPolicy,
-    encryption_key: Option<KeyHandle>,
+    encryption_key: Option<Arc<KeyRing>>,
 ) -> Result<RecoveryState, RecoveryError> {
     if !shard_dir.exists() {
         return Err(RecoveryError::new(format!("data directory does not exist: {:?}", shard_dir)));
@@ -232,7 +233,7 @@ fn recover_shard_inner(
     // 3. Extract metadata from the first valid segment
     let first_header = &valid_segments[0].2; // (seg_id, path, header, size)
     let hash_enabled = first_header.hash_enabled();
-    let hash_init = chain_key(encryption_key.as_deref().map(|z| &**z), &first_header.hash_init);
+    let hash_init = chain_key(encryption_key.as_ref().map(|kr| kr.active_slice()), &first_header.hash_init);
 
     // 4. Scan the last segment for torn writes
     let last_idx = valid_segments.len() - 1;
@@ -319,7 +320,7 @@ pub fn recover(
     data_dir: &Path,
     segment_size: u64,
     retention: RetentionPolicy,
-    encryption_key: Option<KeyHandle>,
+    encryption_key: Option<Arc<KeyRing>>,
 ) -> Result<RecoveryState, RecoveryError> {
     recover_shard(data_dir, 0, segment_size, retention, encryption_key)
 }
@@ -346,7 +347,7 @@ fn scan_last_segment(
     segment_id: u32,
     header: &SegmentHeader,
     hash_enabled: bool,
-    encryption_key: Option<KeyHandle>,
+    encryption_key: Option<Arc<KeyRing>>,
     shard_bits: u32,
 ) -> Result<(u64, [u8; 32], u64, Vec<RecoveryWarning>, u64), RecoveryError> {
     let mut file = OpenOptions::new()
@@ -380,7 +381,7 @@ fn scan_last_segment(
     // record and compare to the stored hash_n. A mismatch means tampering or
     // corruption → treat as a break and stop trusting data past it.
     #[cfg(feature = "hash-chain")]
-    let hash_init = chain_key(encryption_key.as_deref().map(|z| &**z), &header.hash_init);
+    let hash_init = chain_key(encryption_key.as_ref().map(|kr| kr.active_slice()), &header.hash_init);
     #[cfg(feature = "hash-chain")]
     let mut chain_prev = header.prev_last_hash; // [0;32] for the first segment
     #[cfg(not(feature = "hash-chain"))]
@@ -432,7 +433,7 @@ fn scan_last_segment(
                 &payload,
                 is_compressed,
                 is_encrypted,
-                encryption_key.as_deref().map(|z| &**z),
+                encryption_key.as_deref(),
             ) {
                 Ok(d) => d,
                 Err(_) => {

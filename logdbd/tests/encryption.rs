@@ -292,6 +292,84 @@ fn single_key_encryption_with_hash_chain_works() {
     );
 }
 
+/// cr-032: `logdbd-admin restore --verify --config <yaml>` end-to-end. This is
+/// the exact CLI an operator runs; it exercises the wiring the library-level
+/// `backup::restore(.., Some(ring))` test does NOT — namely the admin binary
+/// loading the server YAML, resolving its key ring, and passing it through to
+/// the encrypted restore verify. (Spawned as a subprocess so the bin's arg
+/// parsing + `cmd_restore` path is covered, not just the library call.)
+#[test]
+fn admin_restore_verify_config_round_trips_encrypted() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Write 3 encrypted records under a single key, durable.
+    let enc = enc_multi(&[("k", KEY_HEX)], "k");
+    {
+        let db = LogDb::open(db_config_with(&data_dir, &enc, false)).unwrap();
+        for i in 0..3u64 {
+            db.append(format!("r-{i}").as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+        while db.durable_cursor() < 3 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Back the stopped node up (archive outside the data_dir — see cr-029 test).
+    let archive = dir.path().join("snap.logdbbak");
+    backup::backup(&data_dir, &archive).unwrap();
+
+    // A server YAML carrying the same encryption config the primary runs with.
+    let yaml_path = dir.path().join("logdbd.yaml");
+    std::fs::write(
+        &yaml_path,
+        format!(
+            r#"
+node: {{ id: "n", role: primary, cluster_id: "c", epoch: 1 }}
+logdb: {{ data_dir: "/var/lib/logdbd" }}
+storage:
+  encryption:
+    enabled: true
+    algorithm: aes-256-gcm
+    provider: file
+    keys:
+      - key_id: "k"
+        key_hex: "{KEY_HEX}"
+    active_key_id: "k"
+"#,
+        ),
+    )
+    .unwrap();
+
+    // Run the admin binary exactly as documented.
+    let restore_dir = dir.path().join("restored");
+    let bin = env!("CARGO_BIN_EXE_logdbd-admin");
+    let out = std::process::Command::new(bin)
+        .arg("restore")
+        .arg("--backup")
+        .arg(&archive)
+        .arg("--data-dir")
+        .arg(&restore_dir)
+        .arg("--verify")
+        .arg("--config")
+        .arg(&yaml_path)
+        .output()
+        .expect("spawn logdbd-admin");
+    assert!(
+        out.status.success(),
+        "restore --verify --config failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The restored data_dir must decrypt back to the 3 records.
+    let db = LogDb::open(db_config_with(&restore_dir, &enc, false)).unwrap();
+    let count = db.scan(0, u64::MAX).unwrap().filter_map(|r| r.ok()).count();
+    assert_eq!(count, 3, "restored encrypted records must be readable via the CLI path");
+    db.shutdown(Duration::from_secs(2)).unwrap();
+}
+
 // NOTE on retirement (cr-032 Phase 1 design doc: "退役旧 key → 旧段不可读"):
 // the crypto behavior — a frame whose key has been retired fails to decrypt —
 // is covered by `decrypt_fails_when_key_retired` in logdb's reader keyring_tests.

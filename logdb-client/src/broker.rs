@@ -106,12 +106,32 @@ impl GroupConsumer {
         &self.assigned_shards
     }
 
-    /// Stream records for this consumer's assigned shards. On a stale-generation
-    /// rejection (a rebalance happened) the call re-joins and retries once —
-    /// Phase 5 replaces this with rebalance signals pushed on the stream.
+    /// Stream records for this consumer's assigned shards. Non-record frames
+    /// (`CaughtUp`, `RebalanceSignal`, `Assignment`) are silently dropped —
+    /// use [`consume_frames`] if you need those.
+    ///
+    /// Auto-rejoins on stale-generation (Phase 5 replaces this with in-stream
+    /// rebalance signals).
     pub async fn consume(
         &mut self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Record, BrokerError>> + Send>>, BrokerError> {
+        self.consume_frames().await.map(|s| {
+            Box::pin(s.filter_map(|item| match item {
+                Ok(resp) => match resp.payload {
+                    Some(ConsumePayload::Record(r)) => Some(Ok(r)),
+                    _ => None,
+                },
+                Err(e) => Some(Err(e)),
+            })) as Pin<Box<dyn Stream<Item = Result<Record, BrokerError>> + Send>>
+        })
+    }
+
+    /// Stream ALL [`ConsumeResponse`] frames (records, `CaughtUp`, rebalance
+    /// signals). Prefer this when you need to know per-shard catch-up progress
+    /// or handle rebalance inline.
+    pub async fn consume_frames(
+        &mut self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ConsumeResponse, BrokerError>> + Send>>, BrokerError> {
         match self.try_consume().await {
             Ok(s) => Ok(s),
             Err(BrokerError::Status(st)) if st.code() == tonic::Code::FailedPrecondition => {
@@ -155,7 +175,10 @@ impl GroupConsumer {
 
     async fn try_consume(
         &mut self,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Record, BrokerError>> + Send>>, BrokerError> {
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ConsumeResponse, BrokerError>> + Send>>,
+        BrokerError,
+    > {
         let streaming = self
             .client
             .consume(ConsumeRequest {
@@ -167,15 +190,8 @@ impl GroupConsumer {
             })
             .await?
             .into_inner();
-        let mapped = streaming.filter_map(|item: Result<ConsumeResponse, tonic::Status>| {
-            // Phase 5: surface rebalance/assignment frames here too.
-            match item {
-                Ok(resp) => match resp.payload {
-                    Some(ConsumePayload::Record(r)) => Some(Ok(r)),
-                    _ => None,
-                },
-                Err(e) => Some(Err(BrokerError::Status(e))),
-            }
+        let mapped = streaming.map(|item: Result<ConsumeResponse, tonic::Status>| {
+            item.map_err(BrokerError::Status)
         });
         Ok(Box::pin(mapped))
     }

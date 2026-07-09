@@ -20,6 +20,7 @@
  */
 
 export { Client, ClientOptions } from './client';
+export { BrokerClient, BrokerProduceOptions, JoinGroupResult, BrokerRecord } from './broker-client';
 export { TailStream } from './tail-stream';
 export {
   LogRecord, AppendResult, Watermark, VerifyResult, TailOptions,

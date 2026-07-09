@@ -1,0 +1,214 @@
+syntax = "proto3";
+package logdbbroker;
+
+// logdb-broker — Kafka-style consumer-group coordinator for logdb/logdbd.
+// Consumers talk ONLY to the broker (symmetric data path, cr-037): the broker
+// assigns shards, and forwards records it Tails from logdbd to each consumer.
+//
+// This proto is a STANDALONE schema: it does NOT import logdbd.proto. The
+// broker's contract with consumers (its own `Record` below) is independent of
+// logdbd's internal record format — logdbd.Record can change without breaking
+// broker consumers. The broker maps logdbd.Record → this `Record` on forward.
+//
+// Phase 2: group membership + round-robin shard assignment.
+// Phase 3: Consume streaming (data forwarding) — broker is in the data path.
+// Phase 5: rebalance signals ride on the Consume stream.
+
+service BrokerService {
+  // Join a consumer group. Returns the joiner's shard assignment + the new
+  // generation. Triggers a rebalance of the whole group.
+  rpc JoinGroup(JoinGroupRequest) returns (JoinGroupResponse);
+
+  // Leave a consumer group. Triggers a rebalance of the remaining members.
+  rpc LeaveGroup(LeaveGroupRequest) returns (LeaveGroupResponse);
+
+  // List current members + their assignments (for debugging/verification).
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+
+  // Stream records for the caller's assigned shards. The broker Tails logdbd
+  // (shard_ids = the consumer's assignment) and forwards each record. Phase 3:
+  // data forwarding only; Phase 5 adds rebalance signals on this same stream.
+  rpc Consume(ConsumeRequest) returns (stream ConsumeResponse);
+
+  // Publish a record. The broker forwards it to logdbd.Append (with shard_key
+  // routing). Makes the broker the symmetric gateway: BOTH producers and
+  // consumers talk only to the broker (Pulsar model); logdbd is the storage
+  // backend, never directly addressed by clients.
+  rpc Produce(ProduceRequest) returns (ProduceResponse);
+
+  // Publish a batch atomically. All records in the batch are committed
+  // together in logdbd (one gRPC call, not N). Prefer this for throughput.
+  rpc BatchProduce(BatchProduceRequest) returns (BatchProduceResponse);
+
+  // Liveness check — call every ~session_timeout/3. A consumer that misses
+  // several heartbeats is evicted from its groups, triggering a rebalance.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Commit a per-shard processed offset for the group. Persisted to logdbd's
+  // meta stream so consumers resume correctly after a broker restart (the
+  // broker is otherwise in-memory). Membership is NOT persisted — consumers
+  // rejoin after a restart; only offsets are durable.
+  rpc CommitShardOffset(CommitShardOffsetRequest) returns (CommitShardOffsetResponse);
+}
+
+// ─── JoinGroup ──────────────────────────────────────────────────────────────
+
+message JoinGroupRequest {
+  string namespace   = 1;
+  string stream      = 2;
+  string group       = 3;
+  string consumer_id = 4;  // unique within the group
+}
+
+message JoinGroupResponse {
+  uint32 generation                  = 1;  // bumped on every membership change
+  uint32 num_shards                  = 2;  // total shards in the stream
+  repeated uint32 assigned_shards    = 3;  // this consumer's shards
+  // Per-shard committed offset the joiner should resume from (shard_id → seq).
+  // Populated from persisted group state (Phase 6); empty until then.
+  map<uint32, uint64> initial_offsets = 4;
+}
+
+// ─── LeaveGroup ─────────────────────────────────────────────────────────────
+
+message LeaveGroupRequest {
+  string namespace   = 1;
+  string stream      = 2;
+  string group       = 3;
+  string consumer_id = 4;
+  uint32 generation  = 5;  // the generation the member believes it is in
+}
+
+message LeaveGroupResponse {
+  bool ok = 1;
+}
+
+// ─── ListMembers ────────────────────────────────────────────────────────────
+
+message ListMembersRequest {
+  string namespace = 1;
+  string stream    = 2;
+  string group     = 3;
+}
+
+message MemberInfo {
+  string consumer_id            = 1;
+  repeated uint32 assigned_shards = 2;
+}
+
+message ListMembersResponse {
+  uint32 generation           = 1;
+  repeated MemberInfo members = 2;
+}
+
+// ─── Consume (data forwarding) ──────────────────────────────────────────────
+
+message ConsumeRequest {
+  string namespace   = 1;
+  string stream      = 2;
+  string group       = 3;
+  string consumer_id = 4;
+  uint32 generation  = 5;  // must match the group's current generation
+}
+
+// A record the broker forwards to a consumer. Independent of logdbd's Record
+// (see file header) — the broker maps logdbd.Record → this and stamps the
+// `shard_id` it routed the Tail by (the consumer needs it to commit per-shard
+// offsets).
+message Record {
+  uint32 namespace_id      = 1;
+  uint64 stream_id         = 2;
+  uint64 seq               = 3;
+  string event_type        = 4;
+  uint64 timestamp_ns      = 5;
+  string content_type      = 6;
+  map<string, string> metadata = 7;
+  bytes  content           = 8;
+  uint32 shard_id          = 9;  // stamped by the broker (per-shard Tail knows it)
+}
+
+// One frame on a Consume stream. `record` carries data; `rebalance` + `assignment`
+// carry the stop-the-world rebalance protocol (Phase 5): on a membership change
+// the broker signals pause, swaps the consumer's forward task to its new shards,
+// then signals resume. The broker manages the data-path switch — these frames
+// are informational (an SDK may simply see a brief record gap and resume).
+message ConsumeResponse {
+  oneof payload {
+    Record record = 1;
+    RebalanceSignal rebalance = 2;
+    Assignment assignment = 3;
+  }
+}
+
+// "Pause: a rebalance is in progress at `generation`." The broker is about to
+// swap this consumer's forward task; records may stop briefly.
+message RebalanceSignal {
+  uint32 generation = 1;  // the ending generation
+}
+
+// "Resume with this new shard set at `generation`." Sent after the broker has
+// swapped the forward task; records resume from each shard's committed offset.
+message Assignment {
+  uint32 generation = 1;            // the new generation
+  repeated uint32 shards = 2;       // the consumer's new shard assignment
+}
+
+// ─── Produce (write forwarding) ─────────────────────────────────────────────
+
+// A producer publish request. Independent schema (see file header); the broker
+// maps it to logdbd.AppendRequest. `shard_key` routes deterministically (same
+// key ⇒ same shard); absent ⇒ logdbd's legacy thread-affine routing.
+message ProduceRequest {
+  string namespace    = 1;
+  string stream       = 2;
+  string event_type   = 3;
+  uint64 timestamp_ns = 4;
+  string content_type = 5;
+  map<string, string> metadata = 6;
+  bytes  content      = 7;
+  optional string shard_key = 8;
+}
+
+// Result of a produce: the logdb global id + per-stream sequence of the record.
+message ProduceResponse {
+  uint64 gid = 1;
+  uint64 seq = 2;
+}
+
+message BatchProduceRequest {
+  repeated ProduceRequest requests = 1;
+}
+
+message BatchProduceResponse {
+  repeated ProduceResponse records = 1;
+}
+
+// ─── Heartbeat (liveness detection) ─────────────────────────────────────────
+
+message HeartbeatRequest {
+  string namespace   = 1;
+  string stream      = 2;
+  string group       = 3;
+  string consumer_id = 4;
+  uint32 generation  = 5;  // consumer's current generation (informational)
+}
+
+message HeartbeatResponse {
+  uint32 generation   = 1;  // group's current generation
+  bool   rebalance    = 2;  // true if a rebalance happened (consumer should re-sync)
+}
+
+// ─── CommitShardOffset (durable per-shard progress) ──────────────────────────
+
+message CommitShardOffsetRequest {
+  string namespace    = 1;
+  string stream       = 2;
+  string group        = 3;
+  uint32 shard_id     = 4;
+  uint64 committed_seq = 5;  // last successfully processed seq on this shard
+}
+
+message CommitShardOffsetResponse {
+  bool advanced = 1;  // true if the offset moved forward (false = stale/no-op)
+}
+

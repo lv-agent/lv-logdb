@@ -212,7 +212,9 @@ impl BrokerProducer {
 
     /// Publish a record, returning its (gid, seq). `shard_key` routes
     /// deterministically (same key ⇒ same shard); `None` ⇒ logdbd legacy
-    /// thread-affine routing.
+    /// thread-affine routing. The remaining fields mirror `ProduceRequest`
+    /// (`timestamp_ns`, `content_type`, `metadata`) — pass defaults for
+    /// simple usage.
     pub async fn produce(
         &mut self,
         namespace: &str,
@@ -221,15 +223,35 @@ impl BrokerProducer {
         content: &[u8],
         shard_key: Option<&str>,
     ) -> Result<(u64, u64), BrokerError> {
+        self.produce_full(
+            namespace, stream, event_type, content, shard_key, 0, "", &std::collections::HashMap::new(),
+        ).await
+    }
+
+    /// Publish a record with ALL fields. The lightweight [`produce`] is a
+    /// convenience wrapper around this.
+    pub async fn produce_full(
+        &mut self,
+        namespace: &str,
+        stream: &str,
+        event_type: &str,
+        content: &[u8],
+        shard_key: Option<&str>,
+        timestamp_ns: u64,
+        content_type: &str,
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<(u64, u64), BrokerError> {
         let resp = self
             .client
             .produce(ProduceRequest {
                 namespace: namespace.into(),
                 stream: stream.into(),
                 event_type: event_type.into(),
+                timestamp_ns,
+                content_type: content_type.into(),
+                metadata: metadata.clone(),
                 content: content.to_vec(),
                 shard_key: shard_key.map(String::from),
-                ..Default::default()
             })
             .await?
             .into_inner();

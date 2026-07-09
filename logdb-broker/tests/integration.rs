@@ -20,7 +20,7 @@ async fn start_broker(num_shards: u32) -> std::net::SocketAddr {
     let registry = Arc::new(CoordinatorRegistry::new(num_shards));
     // No Forwarder/Persistence (membership-only): Consume/Produce/Commit return
     // UNIMPLEMENTED or in-memory-only here.
-    let svc = BrokerServiceImpl::new(registry, None, None);
+    let svc = BrokerServiceImpl::new(registry, None, None, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

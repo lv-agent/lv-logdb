@@ -5,25 +5,25 @@
 ### Added
 
 - **Shard-aware Tail** (cr-037): `TailRequest.shard_ids` filters records to one or
-  more shards (empty ⇒ all, legacy behaviour). The logdb-broker uses this to
-  partition a consumer group's work so each consumer sees only its assigned
-  shards.
-- **Key-based append routing** (cr-037): `AppendRequest.shard_key` (optional) routes
-  the record deterministically by CRC32C — same key ⇒ same shard. Absent ⇒
-  legacy thread-affine routing.
-- **`DecodedRecord.shard_id`**: each decoded record now carries the shard it
-  landed on (decoded from the logdb gid at scan time). Readers can attribute
-  records to shards without re-parsing the gid.
-- **logdb-broker** — a symmetric-gateway consumer-group coordinator (sibling
-  crate). See its CHANGELOG for details.
+  more shards (empty ⇒ all, legacy behaviour).
+- **Key-based append routing** (cr-037): `AppendRequest.shard_key` (optional).
+- **`DecodedRecord.shard_id`**: decoded at read/scan from the gid.
+- **`scan_stream_filtered`**: stream- + shard-scoped durable read via `seq_map`
+  index + `LogDb::read_batch` (cr-037 perf). Replaces full-table scan in the
+  Tail for much lower per-poll CPU.
+- **Long-poll Tail** (cr-037 A): Tail blocks on `Notify` woken by the subscribe
+  publisher (≤10 ms wake-up instead of a fixed 100 ms sleep).
+- **`StatusResponse.num_shards`** (cr-037 F): so the broker can auto-discover
+  the shard count at startup.
+- **Seq-map checkpoint** (cr-037 B): `Storage::write_seq_map_checkpoint` /
+  `try_new_from_checkpoint` to skip a full-scan rebuild on startup.
+- **logdb-broker** — symmetric-gateway consumer-group coordinator (sibling crate).
 
 ### Fixed
 
 - **Multi-shard Tail bounded by `durable_gid` returned incomplete** (cr-037
-  Phase 1): Tail's internal `scan(0, durable_gid)` used the min durable local
-  seq as a global gid cap. Under shards > 1 this returned only early shard‑0
-  records. The cap is removed (`scan(0, MAX)`) — each shard's manifest already
-  self-bounds by durable. No effect in the default `shards=1` config.
+  Phase 1): Tail's `scan(0, durable_gid)` used min durable local seq as global
+  gid cap. Removed — each shard's manifest self-bounds by durable.
 
 ## [0.7.0] — 2026-07-08
 

@@ -11,6 +11,7 @@
 pub mod config;
 pub mod coordinator;
 pub mod forwarder;
+pub mod leader;
 pub mod persistence;
 pub mod service;
 pub mod sessions;

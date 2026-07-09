@@ -86,8 +86,15 @@ pub struct Forwarder {
 impl Forwarder {
     /// Connect to logdbd at `addr` (e.g. "http://127.0.0.1:9090").
     pub async fn connect(addr: String) -> Result<Self, tonic::transport::Error> {
-        let channel = tonic::transport::Endpoint::from_shared(addr)?.connect().await?;
+        let channel = tonic::transport::Endpoint::from_shared(addr)?
+            .connect()
+            .await?;
         Ok(Self { channel })
+    }
+
+    /// Clone of the logdbd transport channel (for leader election, etc.).
+    pub fn channel(&self) -> tonic::transport::Channel {
+        self.channel.clone()
     }
 
     /// Open one Tail per assigned shard and forward records to `tx`, stamping

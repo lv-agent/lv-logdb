@@ -19,6 +19,7 @@ use logdbd_proto::pb::log_db_service_server::LogDbServiceServer;
 
 use logdb_broker::coordinator::CoordinatorRegistry;
 use logdb_broker::forwarder::Forwarder;
+use logdb_broker::leader::LeaderElection;
 use logdb_broker::persistence::{OffsetRecord, Persistence};
 use logdb_broker::service::BrokerServiceImpl;
 use logdb_broker_proto::pb::broker_service_client::BrokerServiceClient;
@@ -72,17 +73,44 @@ async fn start_logdbd(shards: usize) -> (std::net::SocketAddr, tempfile::TempDir
 }
 
 async fn start_broker(logdbd_addr: String, num_shards: u32) -> std::net::SocketAddr {
+    start_broker_with_ha(logdbd_addr, num_shards, None).await
+}
+
+/// Like [`start_broker`] but optionally enables per-group leader election.
+/// `broker_id` + `addr` are used in leader claims via the meta stream.
+async fn start_broker_with_ha(
+    logdbd_addr: String,
+    num_shards: u32,
+    broker_id: Option<&str>,
+) -> std::net::SocketAddr {
     let forwarder = Forwarder::connect(logdbd_addr.clone()).await.unwrap();
     let persistence = Persistence::connect(logdbd_addr).await.unwrap();
     persistence.ensure_meta_stream().await.unwrap();
     let registry = Arc::new(CoordinatorRegistry::new(num_shards));
-    // Recover committed offsets (a fresh broker re-reads the meta stream).
     let recovered = persistence.load_recovered_offsets().await.unwrap();
     for rec in &recovered {
         registry.commit_offset(&rec.ns, &rec.stream, &rec.group, rec.shard, rec.seq);
     }
     let _ = persistence.compact_offsets(&recovered).await;
-    let svc = BrokerServiceImpl::new(registry, Some(forwarder), Some(persistence));
+
+    let leader = broker_id.map(|id| {
+        let le = Arc::new(LeaderElection::new(
+            id.into(),
+            // We don't know the address yet (listener binds 0), so use a
+            // placeholder — the NOT_LEADER address is heuristically the
+            // same host with the ephemeral port, but for tests it doesn't
+            // matter because both brokers are on the same host and the
+            // client just tries both.  A real deployment passes the
+            // configured bind_addr.
+            "127.0.0.1:0".into(),
+            forwarder.channel(),
+            None,
+        ));
+        le.start();
+        le
+    });
+
+    let svc = BrokerServiceImpl::new(registry, Some(forwarder), Some(persistence), leader);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -917,4 +945,77 @@ async fn concurrent_consumers_no_duplicates_no_loss() {
     eprintln!(
         "concurrent_consumers: 10_000 records, {n} consumers, exactly-once, delivered in {elapsed:.2?} ({throughput:.0} rec/s)"
     );
+}
+
+#[tokio::test]
+async fn per_group_leader_election_different_groups() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+
+    // Start two HA brokers sharing the same logdbd.
+    let addr_a = start_broker_with_ha(
+        format!("http://{logdbd_addr}"), shards, Some("broker-a"),
+    ).await;
+    let addr_b = start_broker_with_ha(
+        format!("http://{logdbd_addr}"), shards, Some("broker-b"),
+    ).await;
+    let url_a = format!("http://{addr_a}");
+    let url_b = format!("http://{addr_b}");
+
+    // Give the leader-election background scan time to settle (± lease/3).
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+
+    // Both brokers can serve different groups as leader (first to claim wins).
+    // Produce is stateless — works on either broker regardless.
+    let mut prod =
+        logdb_client::broker::BrokerProducer::connect(url_a.clone())
+            .await
+            .unwrap();
+    for i in 0..8u32 {
+        let key = format!("key-{i}");
+        prod.produce("ns", "s", "e", key.as_bytes(), Some(&key))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Group g1 on broker A (first to claim).
+    let mut client_a = BrokerServiceClient::connect(url_a.clone())
+        .await
+        .unwrap();
+    let j1 = client_a
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g1".into(),
+            consumer_id: "c1".into(),
+        })
+        .await;
+    assert!(j1.is_ok(), "broker A must accept JoinGroup for g1");
+
+    // Group g2 on broker B (first to claim — different group).
+    let mut client_b = BrokerServiceClient::connect(url_b.clone())
+        .await
+        .unwrap();
+    let j2 = client_b
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g2".into(),
+            consumer_id: "c2".into(),
+        })
+        .await;
+    assert!(j2.is_ok(), "broker B must accept JoinGroup for g2 (different group)");
+
+    // Verify consume works on the leader for g1.
+    let c1 = client_a
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g1".into(),
+            consumer_id: "c1".into(),
+            generation: j1.unwrap().into_inner().generation,
+        })
+        .await;
+    assert!(c1.is_ok(), "consume must work on the group's leader");
 }

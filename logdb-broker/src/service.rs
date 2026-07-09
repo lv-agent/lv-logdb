@@ -28,26 +28,16 @@ use crate::sessions::{SessionHandle, Sessions};
 /// `forwarder` is `None` when no logdbd is configured (membership-only test
 /// setups) — `Consume`/`Produce` then return `UNIMPLEMENTED`. `persistence`
 /// is `None` when offset durability is disabled — commits stay in-memory only.
-/// `sessions` tracks open Consume streams so a membership change (rebalance)
-/// can swap each consumer's forward task. A deployed broker supplies
-/// forwarder+persistence (see `main.rs`).
-//
-// TODO(ha): session timeout / heartbeat eviction.  Currently a dead
-// consumer keeps its shards until another join/leave triggers a
-// rebalance (no liveness detection).  Add a periodic heartbeat RPC and
-// evict consumers whose heartbeat gap exceeds `session_timeout_ms`.
-// This is a prerequisite for multi-broker HA (cr-026).
-//
-// TODO(ha): multi-broker HA + leader election.  Single-broker means a
-// restart has a downtime window.  Pulsar/Kafka use multiple brokers +
-// ZooKeeper-coordinated leader election for each topic partition.  For
-// logdb-broker this pairs with cr-026 (ownership ring).
+/// `leader` is `None` in single-broker mode (all RPCs served). When configured
+/// (cr-037 E), only the leader serves coordination RPCs; standbys return
+/// `UNAVAILABLE` with the leader address for redirect.
 #[derive(Clone)]
 pub struct BrokerServiceImpl {
     registry: Arc<CoordinatorRegistry>,
     forwarder: Option<Forwarder>,
     persistence: Option<Persistence>,
     sessions: Arc<Sessions>,
+    leader: Option<Arc<crate::leader::LeaderElection>>,
 }
 
 impl BrokerServiceImpl {
@@ -55,12 +45,23 @@ impl BrokerServiceImpl {
         registry: Arc<CoordinatorRegistry>,
         forwarder: Option<Forwarder>,
         persistence: Option<Persistence>,
+        leader: Option<Arc<crate::leader::LeaderElection>>,
     ) -> Self {
         Self {
             registry,
             forwarder,
             persistence,
             sessions: Arc::new(Sessions::new()),
+            leader,
+        }
+    }
+
+    /// Return `UNAVAILABLE` with the leader address if we are a standby
+    /// for this group.  Single-broker mode (`leader` is `None`) always OK.
+    fn require_leader(&self, key: &GroupKey) -> Result<(), Status> {
+        match &self.leader {
+            None => Ok(()),
+            Some(e) => e.require_leader(key),
         }
     }
 }
@@ -71,6 +72,8 @@ impl BrokerService for BrokerServiceImpl {
         &self,
         req: Request<JoinGroupRequest>,
     ) -> Result<Response<JoinGroupResponse>, Status> {
+        let key = GroupKey::new(&req.get_ref().namespace, &req.get_ref().stream, &req.get_ref().group);
+        self.require_leader(&key)?;
         let r = req.into_inner();
         if r.consumer_id.is_empty() || r.group.is_empty() {
             return Err(Status::invalid_argument(
@@ -104,6 +107,8 @@ impl BrokerService for BrokerServiceImpl {
         &self,
         req: Request<LeaveGroupRequest>,
     ) -> Result<Response<LeaveGroupResponse>, Status> {
+        let key = GroupKey::new(&req.get_ref().namespace, &req.get_ref().stream, &req.get_ref().group);
+        self.require_leader(&key)?;
         let r = req.into_inner();
         let ok = self
             .registry
@@ -146,6 +151,8 @@ impl BrokerService for BrokerServiceImpl {
         &self,
         req: Request<ConsumeRequest>,
     ) -> Result<Response<Self::ConsumeStream>, Status> {
+        let key = GroupKey::new(&req.get_ref().namespace, &req.get_ref().stream, &req.get_ref().group);
+        self.require_leader(&key)?;
         let r = req.into_inner();
         if r.consumer_id.is_empty() || r.group.is_empty() {
             return Err(Status::invalid_argument(
@@ -266,6 +273,8 @@ impl BrokerService for BrokerServiceImpl {
         &self,
         req: Request<CommitShardOffsetRequest>,
     ) -> Result<Response<CommitShardOffsetResponse>, Status> {
+        let key = GroupKey::new(&req.get_ref().namespace, &req.get_ref().stream, &req.get_ref().group);
+        self.require_leader(&key)?;
         let r = req.into_inner();
         // Apply in-memory first (monotonic); only persist if it actually
         // advanced, so no-op/stale commits don't spam the meta stream. If the
@@ -294,6 +303,8 @@ impl BrokerService for BrokerServiceImpl {
         &self,
         req: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        let key = GroupKey::new(&req.get_ref().namespace, &req.get_ref().stream, &req.get_ref().group);
+        self.require_leader(&key)?;
         let r = req.into_inner();
         let key = GroupKey::new(&r.namespace, &r.stream, &r.group);
         let sessions = self.sessions.get_group(&key);

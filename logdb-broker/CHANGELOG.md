@@ -36,9 +36,36 @@
   broker is stateless, state lives in logdbd).
 - **Structured tracing** (`tracing` + `tracing-subscriber`, `RUST_LOG`).
 
-### Not yet done (planned follow-up)
+### Added (post-0.1.0 optimizations, merged to main)
 
-- Multi-broker HA + leader election (pairs with cr-026 ownership ring).
-- Cooperative / sticky assignment (rebalance is stop-the-world).
-- Heartbeat / session-timeout consumer eviction.
-- Automatic `num_shards` discovery from logdbd (currently operator-configured).
+- **Per-group leader election** (E): multiple broker instances elect a leader per
+  `(ns, stream, group)` via the logdbd meta stream (`leader_claim` events,
+  CAS-append). Stateful RPCs return `UNAVAILABLE: leader is at <addr>` on standbys;
+  `Produce` is stateless and works on any broker.
+- **Cooperative sticky rebalance** (C): recompute keeps existing shard
+  assignments; only "foreign" shards (`s % n != index`) are given up. Forward
+  tasks are only restarted for consumers whose shard set changed.
+- **Heartbeat / session eviction** (D): `Heartbeat` RPC; stale consumers
+  (`session_timeout_ms`) are evicted by a periodic liveness check, triggering
+  rebalance so dead consumers don't hold shards.
+- **`num_shards` auto-discovery** (F): broker queries logdbd's `Status` RPC at
+  startup; falls back to config if the server is older.
+- **Seq-map checkpoint** (B): `Storage` persists the `seq_map` to a binary
+  checkpoint for fast startup; incremental per-shard replay via
+  `LogDb::scan_shard`.
+- **Long-poll Tail** (A): `Notify` wakes Tail handlers when the subscribe
+  publisher advances `durable_gid`, reducing idle latency from 100 ms to ≤10 ms.
+- **`BatchProduce` RPC** (1): batch append forwarded to `logdbd.BatchAppend`
+  in one gRPC call.
+- **Tail `batch_size` 100→500** (4): fewer poll cycles per shard.
+- **Offset snapshot compaction** (2): periodic `offset_snapshot` events
+  compact the meta stream so recovery doesn't replay every individual
+  `offset_committed` event from history.
+
+### Not yet done
+
+- Multi-broker global failover / partition-level HA (per-group election is the
+  foundation; global coordination pairs with cr-026 ownership ring).
+- Cooperative sticky assignment upgrade (current is stop-the-world + sticky shed;
+  full cooperative with rebalance delay / group protocol is future).
+- `consume_throughput` criterion bench needs a native-Linux run for reliable numbers.

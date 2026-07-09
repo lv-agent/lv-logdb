@@ -114,7 +114,24 @@ async fn run(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(error = %e, "failed to compact offset meta stream");
     }
 
-    let svc = BrokerServiceImpl::new(registry, Some(forwarder), Some(persistence));
+    // Leader election (cr-037 E): elect a single leader across broker instances
+    // via logdbd meta stream. Only the leader serves coordination RPCs.
+    let leader = std::sync::Arc::new(logdb_broker::leader::LeaderElection::new(
+        config.broker_id.clone(),
+        config.bind_addr.clone(),
+        forwarder
+            .channel()
+            .clone(),
+        None, // use default lease (10 s)
+    ));
+    leader.start();
+
+    let svc = BrokerServiceImpl::new(
+        registry,
+        Some(forwarder),
+        Some(persistence),
+        Some(leader),
+    );
     if config.session_timeout_ms > 0 {
         let svc_arc = std::sync::Arc::new(svc.clone());
         svc_arc.start_liveness_check(config.session_timeout_ms);

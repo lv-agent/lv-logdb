@@ -8,6 +8,10 @@ use std::path::PathBuf;
 pub struct BrokerConfig {
     /// Address the broker gRPC server binds (e.g. "127.0.0.1:9091").
     pub bind_addr: String,
+    /// Unique id for this broker instance (used in leader election, cr-037 E).
+    /// Default: "broker-1". Set to distinct values per instance for HA.
+    #[serde(default = "default_broker_id")]
+    pub broker_id: String,
     /// logdbd address the broker Tails from / Appends to (symmetric gateway).
     pub logdbd_addr: String,
     /// Number of shards in the logdbd stream(s). Must match logdbd's `shards`
@@ -32,10 +36,15 @@ pub struct BrokerConfig {
     pub data_dir: Option<PathBuf>,
 }
 
+fn default_broker_id() -> String {
+    "broker-1".into()
+}
+
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:9091".into(),
+            broker_id: default_broker_id(),
             logdbd_addr: "http://127.0.0.1:9090".into(),
             num_shards: 1,
             metrics_addr: None,

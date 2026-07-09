@@ -85,6 +85,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    // TODO(test): verify Subscribe in multi-shard mode doesn't cross streams
+    // or deliver records from wrong shards.  Tail has shard_ids filter; the
+    // subscribe replay path (scan_stream_replay) does NOT — it returns every
+    // record in the stream regardless of shard.  This is fine for the current
+    // single-consumer-per-subscribe model, but if Subscribe ever gained shard
+    // filtering it would need `scan_stream_filtered` mirroring the Tail.
     fn make_record(stream_id: u64, seq: u64, event_type: &str) -> DecodedRecord {
         DecodedRecord {
             namespace_id: 1,

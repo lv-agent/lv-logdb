@@ -73,16 +73,24 @@ async fn start_logdbd(shards: usize) -> (std::net::SocketAddr, tempfile::TempDir
 }
 
 async fn start_broker(logdbd_addr: String, num_shards: u32) -> std::net::SocketAddr {
-    start_broker_with_ha(logdbd_addr, num_shards, None).await
+    start_broker_with_ha(logdbd_addr, num_shards, None, 0, None).await.0
 }
 
-/// Like [`start_broker`] but optionally enables per-group leader election.
-/// `broker_id` + `addr` are used in leader claims via the meta stream.
+/// Result of [`start_broker_with_ha`]: the bound address + (if HA enabled) a
+/// handle to stop the leader election (simulates a crash in failover tests).
+type HaBroker = (std::net::SocketAddr, Option<Arc<LeaderElection>>);
+
+/// Like [`start_broker`] but optionally enables per-group leader election
+/// (`broker_id`) and/or session eviction (`session_timeout_ms` > 0).
+/// `lease_ms` overrides the leader lease timeout (default 10 s; use a short
+/// value for failover tests).
 async fn start_broker_with_ha(
     logdbd_addr: String,
     num_shards: u32,
     broker_id: Option<&str>,
-) -> std::net::SocketAddr {
+    session_timeout_ms: u64,
+    lease_ms: Option<u64>,
+) -> HaBroker {
     let forwarder = Forwarder::connect(logdbd_addr.clone()).await.unwrap();
     let persistence = Persistence::connect(logdbd_addr).await.unwrap();
     persistence.ensure_meta_stream().await.unwrap();
@@ -96,21 +104,20 @@ async fn start_broker_with_ha(
     let leader = broker_id.map(|id| {
         let le = Arc::new(LeaderElection::new(
             id.into(),
-            // We don't know the address yet (listener binds 0), so use a
-            // placeholder — the NOT_LEADER address is heuristically the
-            // same host with the ephemeral port, but for tests it doesn't
-            // matter because both brokers are on the same host and the
-            // client just tries both.  A real deployment passes the
-            // configured bind_addr.
             "127.0.0.1:0".into(),
             forwarder.channel(),
-            None,
+            lease_ms,
         ));
         le.start();
         le
     });
+    let leader2 = leader.clone();
 
     let svc = BrokerServiceImpl::new(registry, Some(forwarder), Some(persistence), leader);
+    if session_timeout_ms > 0 {
+        let svc_arc = Arc::new(svc.clone());
+        svc_arc.start_liveness_check(session_timeout_ms);
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -121,7 +128,7 @@ async fn start_broker_with_ha(
             .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    addr
+    (addr, leader2)
 }
 
 async fn drain_consume(
@@ -953,11 +960,11 @@ async fn per_group_leader_election_different_groups() {
     let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
 
     // Start two HA brokers sharing the same logdbd.
-    let addr_a = start_broker_with_ha(
-        format!("http://{logdbd_addr}"), shards, Some("broker-a"),
+    let (addr_a, _la) = start_broker_with_ha(
+        format!("http://{logdbd_addr}"), shards, Some("broker-a"), 0, None,
     ).await;
-    let addr_b = start_broker_with_ha(
-        format!("http://{logdbd_addr}"), shards, Some("broker-b"),
+    let (addr_b, _lb) = start_broker_with_ha(
+        format!("http://{logdbd_addr}"), shards, Some("broker-b"), 0, None,
     ).await;
     let url_a = format!("http://{addr_a}");
     let url_b = format!("http://{addr_b}");
@@ -1018,4 +1025,140 @@ async fn per_group_leader_election_different_groups() {
         })
         .await;
     assert!(c1.is_ok(), "consume must work on the group's leader");
+}
+
+#[tokio::test]
+async fn heartbeat_timeout_evicts_stale_consumer() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let timeout_ms = 2000u64;
+    let (broker_addr, _) = start_broker_with_ha(
+        format!("http://{logdbd_addr}"), shards, None, timeout_ms, None,
+    ).await;
+    let url = format!("http://{broker_addr}");
+    let mut raw = BrokerServiceClient::connect(url.clone())
+        .await
+        .unwrap();
+
+    // c1 joins the group but does NOT open a consume session.  It just holds
+    // a membership slot — this verifies eviction removes both the session AND
+    // the group membership (via registry.leave).
+    //
+    // Actually, evict_stale only works on ACTIVE sessions.  We open a Consume
+    // stream for c1 (creating a session) but never heartbeat it.  After
+    // timeout_ms, the liveness check evicts c1: removes from sessions AND
+    // calls registry.leave → removes from group membership → rebalances.
+    let j1 = raw
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let _c1_stream = raw
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+            generation: j1.generation,
+        })
+        .await
+        .unwrap();
+    // c1 never heartbeats.  Wait for eviction.
+    tokio::time::sleep(Duration::from_millis(timeout_ms + 1000)).await;
+
+    // c2 joins — c1 should be evicted, so c2 is the sole member and gets
+    // all shards.
+    let j2 = raw
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c2".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut s2 = j2.assigned_shards.clone();
+    s2.sort();
+    assert_eq!(
+        s2, vec![0, 1, 2, 3],
+        "c2 must get all shards after c1 is evicted (c1 never heartbeated)"
+    );
+}
+
+#[tokio::test]
+async fn ha_failover_standby_takes_over_after_leader_crash() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let url_d = format!("http://{logdbd_addr}");
+    let lease_ms = 1500u64; // short for the test
+
+    // Start two HA brokers.
+    let (addr_a, leader_a) = start_broker_with_ha(
+        url_d.clone(), shards, Some("broker-a"), 0, Some(lease_ms),
+    ).await;
+    let (addr_b, _leader_b) = start_broker_with_ha(
+        url_d.clone(), shards, Some("broker-b"), 0, Some(lease_ms),
+    ).await;
+    let url_a = format!("http://{addr_a}");
+    let url_b = format!("http://{addr_b}");
+
+    // Give the background scan time to settle.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // c1 joins g1 on broker A — A becomes the leader for g1.
+    let mut client_a = BrokerServiceClient::connect(url_a.clone())
+        .await
+        .unwrap();
+    let _j1 = client_a
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g1".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap();
+
+    // "Kill" broker A by stopping its leader election loop.  Its last
+    // heartbeat was at lease/3 ≈ 500 ms ago.  After lease_ms (1500 ms)
+    // of silence, broker B should detect staleness and claim g1.
+    leader_a.unwrap().stop();
+    tokio::time::sleep(Duration::from_millis(lease_ms + 1000)).await;
+
+    // c1 (or a new consumer) now joins g1 on broker B.  B should have
+    // claimed g1 by now and accept the join.
+    let mut client_b = BrokerServiceClient::connect(url_b.clone())
+        .await
+        .unwrap();
+    let j2 = client_b
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g1".into(),
+            consumer_id: "c2".into(),
+        })
+        .await;
+    assert!(
+        j2.is_ok(),
+        "after A's crash, B must claim g1 and accept JoinGroup: {:?}",
+        j2.err()
+    );
+
+    // Verify consume works on B after failover.
+    let c2 = client_b
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g1".into(),
+            consumer_id: "c2".into(),
+            generation: j2.unwrap().into_inner().generation,
+        })
+        .await;
+    assert!(c2.is_ok(), "consume must work on the new leader after failover");
 }

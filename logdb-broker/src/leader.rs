@@ -80,6 +80,11 @@ impl LeaderElection {
         }
     }
 
+    /// Stop the background election loop (simulates a broker crash in tests).
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Release);
+    }
+
     /// Launch the background election loop.
     pub fn start(self: &Arc<Self>) {
         self.running.store(true, Ordering::Release);

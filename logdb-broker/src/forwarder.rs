@@ -78,6 +78,13 @@ pub async fn forward_stream<S>(
 /// Holds a connection to logdbd; each [`Forwarder::forward`] call opens a fresh
 /// Tail scoped to one consumer's assigned shards and pumps it through
 /// [`forward_stream`].
+//
+// TODO(resilience): add e2e test for logdbd disconnection/reconnection.
+// The forwarder uses a single tonic Channel — if logdbd becomes unreachable
+// the Tail RPC fails with UNAVAILABLE, the forward task exits and
+// deregisters the session.  The consumer must re-join and re-consume
+// (resuming from committed offsets).  This path is not yet covered by an
+// automated test because it requires a killable logdbd harness.
 #[derive(Clone)]
 pub struct Forwarder {
     channel: tonic::transport::Channel,

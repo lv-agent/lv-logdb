@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 
 use logdb_broker_proto::pb::{
-    consume_response::Payload as ConsumePayload, ConsumeResponse, Record as BrokerRecord,
+    consume_response::{CaughtUp, Payload as ConsumePayload},
+    ConsumeResponse, Record as BrokerRecord,
 };
 use logdbd_proto::pb::{Record as LogdbdRecord, TailResponse};
 use tokio::sync::mpsc;
@@ -36,10 +37,12 @@ fn into_broker_record(r: LogdbdRecord, shard_id: u32) -> BrokerRecord {
 }
 
 /// Forward one shard's logdbd Tail stream onto a consumer's Consume channel,
-/// stamping `shard_id` on every record.
+/// stamping `shard_id` on every record.  Sends a single [`CaughtUp`] frame the
+/// first time the Tail returns a heartbeat — the consumer knows this shard has
+/// delivered everything currently durable and is now "live".
 ///
 /// - Each record becomes one `ConsumeResponse{record}` (broker schema, stamped).
-/// - Heartbeat responses (empty records) produce nothing.
+/// - The first empty (heartbeat) TailResponse produces one `CaughtUp{shard_id}`.
 /// - Stops cleanly when the consumer disconnects (send fails) or the Tail ends.
 /// - A Tail error is forwarded to the consumer, then forwarding stops.
 pub async fn forward_stream<S>(
@@ -49,9 +52,22 @@ pub async fn forward_stream<S>(
 ) where
     S: Stream<Item = Result<TailResponse, Status>> + Unpin,
 {
+    let mut caught_up_sent = false;
     while let Some(msg) = tail.next().await {
         match msg {
             Ok(resp) => {
+                if resp.records.is_empty() && !caught_up_sent {
+                    // First heartbeat after catching up: signal the consumer.
+                    caught_up_sent = true;
+                    let frame = ConsumeResponse {
+                        payload: Some(ConsumePayload::CaughtUp(CaughtUp {
+                            shard_id,
+                        })),
+                    };
+                    if tx.send(Ok(frame)).await.is_err() {
+                        return;
+                    }
+                }
                 for record in resp.records {
                     metrics::counter!("broker.records_forwarded").increment(1);
                     let frame = ConsumeResponse {
@@ -243,14 +259,14 @@ mod tests {
     fn record_seq(frame: &ConsumeResponse) -> u64 {
         match &frame.payload {
             Some(ConsumePayload::Record(r)) => r.seq,
-            _ => panic!("expected a record frame"),
+            _ => 0, // CaughtUp or other non-record frame — caller filters
         }
     }
 
     fn record_shard(frame: &ConsumeResponse) -> u32 {
         match &frame.payload {
             Some(ConsumePayload::Record(r)) => r.shard_id,
-            _ => panic!("expected a record frame"),
+            _ => 0,
         }
     }
 
@@ -259,16 +275,32 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let stream = tokio_stream::iter(vec![
             tail(vec![rec(1), rec(2)], false),
-            tail(vec![], true), // heartbeat — nothing forwarded
+            tail(vec![], true), // heartbeat → CaughtUp frame (once)
             tail(vec![rec(3)], false),
         ]);
         forward_stream(stream, 7, tx).await;
 
         let frames = drain_frames(&mut rx).await;
-        let seqs: Vec<u64> = frames.iter().map(record_seq).collect();
-        assert_eq!(seqs, vec![1, 2, 3]);
+        // One CaughtUp frame from the heartbeat, plus 3 records.
+        let caught: Vec<_> = frames
+            .iter()
+            .filter(|f| matches!(&f.payload, Some(ConsumePayload::CaughtUp(_))))
+            .collect();
+        assert_eq!(caught.len(), 1, "first heartbeat must produce one CaughtUp frame");
+        assert!(
+            matches!(&caught[0].payload, Some(ConsumePayload::CaughtUp(c)) if c.shard_id == 7)
+        );
+        let record_seqs: Vec<u64> =
+            frames.iter().filter_map(|f| {
+                if matches!(&f.payload, Some(ConsumePayload::Record(_))) {
+                    Some(record_seq(f))
+                } else { None }
+            }).collect();
+        assert_eq!(record_seqs, vec![1, 2, 3]);
         for f in &frames {
-            assert_eq!(record_shard(f), 7, "every record must carry the stamped shard_id");
+            if matches!(&f.payload, Some(ConsumePayload::Record(_))) {
+                assert_eq!(record_shard(f), 7);
+            }
         }
     }
 

@@ -137,7 +137,15 @@ message ConsumeResponse {
     Record record = 1;
     RebalanceSignal rebalance = 2;
     Assignment assignment = 3;
+    // Sent once per shard when the forwarder has delivered everything
+    // currently durable. The consumer knows it is "caught up" when it has
+    // received this for every assigned shard.
+    CaughtUp caught_up = 4;
   }
+
+message CaughtUp {
+  uint32 shard_id = 1;
+}
 }
 
 // "Pause: a rebalance is in progress at `generation`." The broker is about to

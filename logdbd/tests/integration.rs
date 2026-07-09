@@ -1767,6 +1767,7 @@ async fn subscribe_receives_matching_event_types() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -1876,6 +1877,7 @@ async fn subscribe_multi_consumer_same_group() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2019,6 +2021,7 @@ async fn subscribe_reconnect_replays_from_offset() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2110,6 +2113,7 @@ async fn subscribe_replays_missed_records_from_offset() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2240,6 +2244,7 @@ async fn subscribe_concurrent_stress() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2365,6 +2370,7 @@ async fn subscribe_100_concurrent_subscribers_stress() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2491,6 +2497,7 @@ async fn subscribe_500_subs_replay_stress() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+        Arc::new(tokio::sync::Notify::new()),
     ));
     subscribe_publisher.clone().start();
 
@@ -2999,4 +3006,68 @@ async fn batch_append_enforces_byte_quota() {
         tonic::Code::ResourceExhausted,
         "over-byte-quota batch must return ResourceExhausted, got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn subscribe_delivers_all_records_in_multi_shard_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 512;
+    db_config.shards = 4;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let num_shards = 4usize;
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, num_shards));
+    let catalog = test_catalog(&data_dir);
+    let hub = Arc::new(logdbd::subscribe::SubscribeHub::new());
+    let subscribe_publisher =
+        Arc::new(logdbd::publisher::SubscribePublisher::new(
+            Arc::clone(&storage), Arc::clone(&hub),
+            Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+    subscribe_publisher.clone().start();
+    let log_svc = LogDbServiceImpl::new(
+        Arc::clone(&storage), catalog,
+        Arc::new(ConsumerTracker::new(None)), Arc::clone(&hub),
+        "sub-multi".into(), "primary".into(),
+    );
+    let svc = LogDbServiceServer::new(log_svc);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder().add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener)).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr)).await.unwrap();
+
+    let total = 16u32;
+    for i in 0..total {
+        let key = format!("key-{i:0>3}");
+        client.append(pb::AppendRequest {
+            namespace: "test".into(), stream: "main".into(),
+            event_type: "tool.call".into(), content: key.as_bytes().to_vec(),
+            shard_key: Some(key), ..Default::default()
+        }).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut sub = client.subscribe(pb::SubscribeRequest {
+        namespace: "test".into(), stream: "main".into(),
+        event_types: vec!["tool.call".into()],
+        consumer_group: "g".into(), consumer_id: "c1".into(),
+    }).await.unwrap().into_inner();
+    let mut count = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::time::Instant::now() >= deadline { break; }
+        if let Ok(Ok(Some(_rec))) = tokio::time::timeout(Duration::from_millis(200), sub.message()).await {
+            count += 1;
+        }
+    }
+    assert_eq!(count, total, "Subscribe must deliver all {} records across all shards", total);
 }

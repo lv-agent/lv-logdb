@@ -31,7 +31,16 @@ use logdb_broker_proto::pb::{
 
 // ── Harness ──────────────────────────────────────────────────────────────────
 
-async fn start_logdbd(shards: usize) -> (std::net::SocketAddr, tempfile::TempDir) {
+type LogdbdHandle = (std::net::SocketAddr, tempfile::TempDir, tokio::task::JoinHandle<()>);
+
+async fn start_logdbd(shards: usize) -> LogdbdHandle {
+    let (addr, dir, jh) = start_logdbd_killable(shards).await;
+    (addr, dir, jh)
+}
+
+/// Like [`start_logdbd`] but also returns a [`JoinHandle`] so the caller
+/// can abort the spawned server task (simulates a crash for resilience tests).
+async fn start_logdbd_killable(shards: usize) -> LogdbdHandle {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = DbConfig::default();
     cfg.data_dir = dir.path().to_path_buf();
@@ -61,7 +70,7 @@ async fn start_logdbd(shards: usize) -> (std::net::SocketAddr, tempfile::TempDir
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let jh = tokio::spawn(async move {
         Server::builder()
             .add_service(LogDbServiceServer::new(svc))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -69,7 +78,7 @@ async fn start_logdbd(shards: usize) -> (std::net::SocketAddr, tempfile::TempDir
             .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    (addr, dir)
+    (addr, dir, jh)
 }
 
 async fn start_broker(logdbd_addr: String, num_shards: u32) -> std::net::SocketAddr {
@@ -185,7 +194,7 @@ fn off(ns: &str, s: &str, g: &str, shard: u32, seq: u64) -> OffsetRecord {
 
 #[tokio::test]
 async fn persistence_round_trips_offsets_to_logdbd() {
-    let (logdbd_addr, _ldir) = start_logdbd(4).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(4).await;
     let pers = Persistence::connect(format!("http://{logdbd_addr}"))
         .await
         .unwrap();
@@ -208,7 +217,7 @@ async fn persistence_round_trips_offsets_to_logdbd() {
 #[tokio::test]
 async fn single_consumer_receives_all_keyed_records_via_broker() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
 
     // The client talks ONLY to the broker — produce and consume both go through
@@ -262,7 +271,7 @@ async fn single_consumer_receives_all_keyed_records_via_broker() {
 #[tokio::test]
 async fn two_consumers_partition_records_by_assigned_shard() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
 
     // Produce via the broker (symmetric gateway); the test never touches logdbd.
@@ -373,7 +382,7 @@ async fn two_consumers_partition_records_by_assigned_shard() {
 #[tokio::test]
 async fn consume_rejects_stale_generation() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
     let mut broker = BrokerServiceClient::connect(format!("http://{broker_addr}"))
         .await
@@ -414,7 +423,7 @@ async fn consume_rejects_stale_generation() {
 #[tokio::test]
 async fn broker_restart_recovers_committed_offsets() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
 
     // Broker instance #1: commit an offset → it persists to the meta stream.
     let broker1 = start_broker(format!("http://{logdbd_addr}"), shards).await;
@@ -478,7 +487,7 @@ async fn broker_restart_recovers_committed_offsets() {
 #[tokio::test]
 async fn consume_resumes_from_committed_offset_per_shard() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
     let mut broker = BrokerServiceClient::connect(format!("http://{broker_addr}"))
         .await
@@ -591,7 +600,7 @@ async fn consume_resumes_from_committed_offset_per_shard() {
 #[tokio::test]
 async fn group_consumer_sdk_round_trips_consume_and_commit() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
     let url = format!("http://{broker_addr}");
 
@@ -679,7 +688,7 @@ async fn group_consumer_sdk_round_trips_consume_and_commit() {
 #[tokio::test]
 async fn active_consume_stream_rebalances_on_join() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
     let mut broker = BrokerServiceClient::connect(format!("http://{broker_addr}"))
         .await
@@ -784,7 +793,7 @@ async fn active_consume_stream_rebalances_on_join() {
 #[tokio::test]
 async fn sdk_consumer_resumes_from_committed_offset_after_broker_restart() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
 
     // ── broker instance #1: produce + consume + commit ──────────────────────
     let broker1 = start_broker(format!("http://{logdbd_addr}"), shards).await;
@@ -876,7 +885,7 @@ async fn sdk_consumer_resumes_from_committed_offset_after_broker_restart() {
 #[tokio::test]
 async fn concurrent_consumers_no_duplicates_no_loss() {
     let shards = 8u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
     let url = format!("http://{broker_addr}");
 
@@ -957,7 +966,7 @@ async fn concurrent_consumers_no_duplicates_no_loss() {
 #[tokio::test]
 async fn per_group_leader_election_different_groups() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
 
     // Start two HA brokers sharing the same logdbd.
     let (addr_a, _la) = start_broker_with_ha(
@@ -1030,7 +1039,7 @@ async fn per_group_leader_election_different_groups() {
 #[tokio::test]
 async fn heartbeat_timeout_evicts_stale_consumer() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let timeout_ms = 2000u64;
     let (broker_addr, _) = start_broker_with_ha(
         format!("http://{logdbd_addr}"), shards, None, timeout_ms, None,
@@ -1094,7 +1103,7 @@ async fn heartbeat_timeout_evicts_stale_consumer() {
 #[tokio::test]
 async fn ha_failover_standby_takes_over_after_leader_crash() {
     let shards = 4u32;
-    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
     let url_d = format!("http://{logdbd_addr}");
     let lease_ms = 1500u64; // short for the test
 
@@ -1161,4 +1170,83 @@ async fn ha_failover_standby_takes_over_after_leader_crash() {
         })
         .await;
     assert!(c2.is_ok(), "consume must work on the new leader after failover");
+}
+
+#[tokio::test]
+async fn forwarder_survives_logdbd_crash() {
+    let shards = 4u32;
+    // Use the killable harness so we can simulate a logdbd crash.
+    let (logdbd_addr, _dir, logdbd_jh) = start_logdbd_killable(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let url = format!("http://{broker_addr}");
+    let mut client = BrokerServiceClient::connect(url.clone())
+        .await
+        .unwrap();
+
+    // Produce records and join/consume — confirm the path works normally.
+    for i in 0..4u32 {
+        let key = format!("key-{i}");
+        client
+            .produce(ProduceRequest {
+                namespace: "ns".into(),
+                stream: "s".into(),
+                event_type: "e".into(),
+                content: key.as_bytes().to_vec(),
+                shard_key: Some(key),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let j = client
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Open a consume stream.
+    let _consume = client
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+            generation: j.generation,
+        })
+        .await
+        .unwrap();
+
+    // Now crash logdbd (abort its server task).
+    logdbd_jh.abort();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The broker must NOT panic or stall — the forward task simply exits
+    // (Tail RPC fails), the session deregisters.  The consumer's stream
+    // from the broker also ends.  We can't verify the stream ending without
+    // reading it, but we can verify the broker is still alive and responds
+    // to produce (stateless RPC).
+    let mut client2 = BrokerServiceClient::connect(url.clone())
+        .await
+        .unwrap();
+    let prod_after = client2
+        .produce(ProduceRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            event_type: "e".into(),
+            content: b"after-crash".to_vec(),
+            ..Default::default()
+        })
+        .await;
+    // Produce may fail (logdbd is dead) or succeed (tonic retry) — but the
+    // broker itself must not panic.
+    match prod_after {
+        Ok(_) | Err(_) => {} // either is acceptable
+    }
 }

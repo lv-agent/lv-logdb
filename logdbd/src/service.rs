@@ -923,10 +923,13 @@ impl LogDbService for LogDbServiceImpl {
         tokio::spawn(async move {
             // Phase 1: replay missed records directly from the log segment at the
             // durable cursor — the segment is the source of truth (cr-027 phase 4).
-            let durable = storage.durable_gid();
+            // Replay from the manifest's visible (durable) extent — each shard's
+            // manifest already self-bounds by durable, so we can scan to MAX
+            // without a global gid cap (cr-037: the min-durable-local-seq cap was
+            // wrong for shards > 1, just like the Tail bug).
             if let Err(e) = scan_stream_replay(
                 &storage,
-                durable,
+                u64::MAX,
                 stream_id,
                 last_committed,
                 &event_types,

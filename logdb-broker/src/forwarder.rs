@@ -120,7 +120,7 @@ impl Forwarder {
                         namespace: ns,
                         stream: st,
                         from_seq,
-                        batch_size: 100,
+                        batch_size: 500,
                         consumer_group: String::new(),
                         consumer_id: String::new(),
                         shard_ids: vec![shard],
@@ -153,6 +153,35 @@ impl Forwarder {
             self.channel.clone(),
         );
         Ok(client.append(req).await?.into_inner())
+    }
+
+    /// Discover logdbd's shard count by querying its Status RPC. If the
+    /// server doesn't report `num_shards` (pre-cr-037), returns 0.
+    pub async fn query_num_shards(&self) -> Result<u32, Status> {
+        let mut client = logdbd_proto::pb::log_db_service_client::LogDbServiceClient::new(
+            self.channel.clone(),
+        );
+        let status = client
+            .status(logdbd_proto::pb::StatusRequest {})
+            .await?
+            .into_inner();
+        Ok(status.num_shards)
+    }
+
+    /// Forward a batch produce to logdbd.BatchAppend (one gRPC call for the
+    /// whole batch — much faster than N individual Appends).
+    pub async fn append_batch(
+        &self,
+        reqs: Vec<logdbd_proto::pb::AppendRequest>,
+    ) -> Result<Vec<logdbd_proto::pb::AppendResponse>, Status> {
+        let mut client = logdbd_proto::pb::log_db_service_client::LogDbServiceClient::new(
+            self.channel.clone(),
+        );
+        let resp = client
+            .batch_append(logdbd_proto::pb::BatchAppendRequest { requests: reqs })
+            .await?
+            .into_inner();
+        Ok(resp.records)
     }
 }
 
@@ -278,4 +307,5 @@ mod tests {
         assert_eq!(record_seqs, vec![1], "only the pre-error record forwards");
         assert!(got_err, "the Tail error must be forwarded to the consumer");
     }
+
 }

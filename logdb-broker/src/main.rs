@@ -79,6 +79,22 @@ async fn run(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let forwarder = Forwarder::connect(logdbd_addr.clone())
         .await
         .map_err(|e| format!("failed to connect to logdbd at {logdbd_addr}: {e}"))?;
+
+    // Auto-discover num_shards from logdbd (cr-037 F). Fall back to config
+    // if the server is older or the query fails.
+    let num_shards = match forwarder.query_num_shards().await {
+        Ok(n) if n > 0 => {
+            tracing::info!(discovered = n, config = config.num_shards, "using logdbd's num_shards");
+            n
+        }
+        Ok(_) | Err(_) => {
+            tracing::info!(
+                num_shards = config.num_shards,
+                "num_shards from config (logdbd pre-cr-037 or unreachable)"
+            );
+            config.num_shards
+        }
+    };
     let persistence = Persistence::connect(logdbd_addr.clone())
         .await
         .map_err(|e| format!("failed to connect persistence to logdbd at {logdbd_addr}: {e}"))?;
@@ -86,13 +102,23 @@ async fn run(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     let registry = Arc::new(CoordinatorRegistry::new(num_shards));
     // Recover committed offsets BEFORE serving so consumers resume correctly.
-    let recovered = persistence.scan_offsets().await?;
-    for rec in recovered {
+    // `load_recovered_offsets` handles both offset snapshots (compaction) and
+    // per-commit deltas, producing the final max-per-shard state.
+    let recovered = persistence.load_recovered_offsets().await?;
+    for rec in &recovered {
         registry.commit_offset(&rec.ns, &rec.stream, &rec.group, rec.shard, rec.seq);
     }
     tracing::info!("recovered committed offsets from logdbd meta stream");
+    // Compact so the next startup scans fewer individual events.
+    if let Err(e) = persistence.compact_offsets(&recovered).await {
+        tracing::warn!(error = %e, "failed to compact offset meta stream");
+    }
 
     let svc = BrokerServiceImpl::new(registry, Some(forwarder), Some(persistence));
+    if config.session_timeout_ms > 0 {
+        let svc_arc = std::sync::Arc::new(svc.clone());
+        svc_arc.start_liveness_check(config.session_timeout_ms);
+    }
 
     tracing::info!(
         bind = %addr,

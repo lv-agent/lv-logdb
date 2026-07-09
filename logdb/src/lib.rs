@@ -916,6 +916,23 @@ impl LogDb {
         reader::ScanIter::build(manifests, self.inner.encryption_keys.clone(), from_id, to_id)
     }
 
+    /// Scan a single shard in `[from_id, to_id)`. Used for incremental
+    /// per-shard recovery (e.g. seq-map checkpoint replay).
+    pub fn scan_shard(
+        &self,
+        shard_id: usize,
+        from_id: u64,
+        to_id: u64,
+    ) -> Result<ScanIter, ReadError> {
+        let manifest = Arc::clone(&self.inner.manifests[shard_id]);
+        reader::ScanIter::build_single(
+            manifest,
+            self.inner.encryption_keys.clone(),
+            from_id,
+            to_id,
+        )
+    }
+
     /// Mark `sequence` as the WAL checkpoint.
     ///
     /// Records with sequence < checkpoint are safe to delete. Old segments

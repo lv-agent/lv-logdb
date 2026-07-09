@@ -162,6 +162,7 @@ message StatusResponse {
   uint64 wal_bytes_total = 4;
   string node_id = 5;
   string role = 6;
+  uint32 num_shards = 7;  // so the broker can discover it at startup (cr-037)
 }
 
 // ─── VerifyChain ─────────────────────────────────────────────────────────

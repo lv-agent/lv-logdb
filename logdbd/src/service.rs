@@ -549,13 +549,18 @@ impl LogDbService for LogDbServiceImpl {
             let mut last_seq = from_seq;
             loop {
                 let durable = storage.durable_gid();
-                // Scan up to the manifest's visible (durable) extent. Reads are
-                // durable-bounded per shard by the manifest (reader doc), so a
-                // global cap is unnecessary — and `durable_gid()` (the min durable
-                // local seq) would be WRONG as a global gid cap under shards>1
-                // (it would only catch the lowest-gid shard-0 records). `durable`
-                // is still reported to the client in heartbeats below.
-                let all = match storage.scan(0, u64::MAX) {
+                // Stream- + shard-scoped durable read via seq_map index (cr-037
+                // perf): jump straight to this stream's records instead of
+                // decoding every record across every stream (the old full-scan
+                // path). `scan_stream_filtered` uses read_batch which is per-
+                // shard durable-gated, so the `durable` min-cursor is only
+                // reported in heartbeats — it no longer caps the scan.
+                let all = match storage.scan_stream_filtered(
+                    stream_id,
+                    last_seq,
+                    &shard_ids,
+                    batch_size as usize * 4,
+                ) {
                     Ok(v) => v,
                     Err(_) => {
                         let _ = tx.send(Err(Status::internal("scan error"))).await;
@@ -564,15 +569,14 @@ impl LogDbService for LogDbServiceImpl {
                 };
                 let new_records: Vec<_> = all
                     .into_iter()
-                    .filter(|r| {
-                        r.stream_id == stream_id
-                            && r.seq >= last_seq
-                            && tombstones.is_live(stream_id, r.seq)
-                            && (shard_ids.is_empty() || shard_ids.contains(&r.shard_id))
-                    })
+                    .filter(|r| tombstones.is_live(stream_id, r.seq))
                     .take(batch_size as usize)
                     .collect();
 
+                // TODO(perf): long-poll instead of fixed 100ms sleep. Tail should
+                // block on a "new durable record" signal (e.g. a condvar / pub-sub
+                // from the Committer) with a timeout, so low-volume streams get
+                // sub-millisecond wake-up instead of always waiting the full interval.
                 if new_records.is_empty() {
                     // Send heartbeat
                     if tx
@@ -586,6 +590,10 @@ impl LogDbService for LogDbServiceImpl {
                     {
                         return;
                     }
+                    // TODO(perf): replace this fixed 100ms poll with long-poll.
+                    // Block on a per-stream durable-advance signal (e.g. an
+                    // AtomicU64 + condvar set by the Committer after advancing
+                    // durable_cursor) so new records wake the Tail immediately.
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -786,6 +794,7 @@ impl LogDbService for LogDbServiceImpl {
             wal_bytes_total: 0,
             node_id: self.hostname.clone(),
             role: self.role.clone(),
+            num_shards: self.storage.num_shards() as u32,
         }))
     }
 

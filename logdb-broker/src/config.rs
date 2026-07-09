@@ -12,12 +12,20 @@ pub struct BrokerConfig {
     pub logdbd_addr: String,
     /// Number of shards in the logdbd stream(s). Must match logdbd's `shards`
     /// config — the broker assigns these shards round-robin across consumers.
-    /// (A future phase replaces this with a logdbd RPC; see cr-037 待解决 #2.)
+    //
+    // TODO(discovery): auto-discover num_shards from logdbd instead of
+    // requiring the operator to keep them in sync.  Options: (a) expose
+    // num_shards on a logdbd RPC (Status / Watermark), (b) broker queries
+    // logdbd at startup, (c) broker infers from the first append response.
     pub num_shards: u32,
     /// Optional Prometheus `/metrics` endpoint (e.g. "127.0.0.1:9100"). Absent
     /// ⇒ metrics counters are emitted to the facade but not scraped.
     #[serde(default)]
     pub metrics_addr: Option<String>,
+    /// Consumer session timeout in milliseconds. A consumer that misses this
+    /// many ms of heartbeats is evicted (0 or absent ⇒ no eviction).
+    #[serde(default)]
+    pub session_timeout_ms: u64,
     /// Optional path to persist coordination state (Phase 6; currently offsets
     /// are event-sourced into logdbd's meta stream regardless of this field).
     #[serde(default)]
@@ -31,6 +39,7 @@ impl Default for BrokerConfig {
             logdbd_addr: "http://127.0.0.1:9090".into(),
             num_shards: 1,
             metrics_addr: None,
+            session_timeout_ms: 0,
             data_dir: None,
         }
     }

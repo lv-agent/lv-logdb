@@ -203,6 +203,20 @@ impl ScanIter {
             },
         })
     }
+
+    /// Build a scan iterator for a single shard (no k-way merge). Used by
+    /// [`LogDb::scan_shard`] for checkpoint-based incremental recovery.
+    pub(crate) fn build_single(
+        manifest: Arc<Mutex<SegmentManifest>>,
+        key: Option<Arc<KeyRing>>,
+        from_id: u64,
+        to_id: u64,
+    ) -> Result<Self, ReadError> {
+        let scanner = ShardScanner::new(manifest, key, from_id, to_id)?;
+        Ok(ScanIter {
+            inner: Box::new(scanner),
+        })
+    }
 }
 
 impl Iterator for ScanIter {

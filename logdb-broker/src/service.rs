@@ -10,10 +10,10 @@ use std::sync::Arc;
 use logdb_broker_proto::pb::broker_service_server::BrokerService;
 use logdb_broker_proto::pb::consume_response::Payload as ConsumePayload;
 use logdb_broker_proto::pb::{
-    Assignment, CommitShardOffsetRequest, CommitShardOffsetResponse, ConsumeRequest,
-    ConsumeResponse, JoinGroupRequest, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse,
-    MemberInfo, ListMembersRequest, ListMembersResponse, ProduceRequest, ProduceResponse,
-    RebalanceSignal,
+    Assignment, BatchProduceRequest, BatchProduceResponse, CommitShardOffsetRequest, CommitShardOffsetResponse,
+    ConsumeRequest, ConsumeResponse, HeartbeatRequest, HeartbeatResponse, JoinGroupRequest,
+    JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, MemberInfo, ListMembersRequest,
+    ListMembersResponse, ProduceRequest, ProduceResponse, RebalanceSignal,
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -31,6 +31,17 @@ use crate::sessions::{SessionHandle, Sessions};
 /// `sessions` tracks open Consume streams so a membership change (rebalance)
 /// can swap each consumer's forward task. A deployed broker supplies
 /// forwarder+persistence (see `main.rs`).
+//
+// TODO(ha): session timeout / heartbeat eviction.  Currently a dead
+// consumer keeps its shards until another join/leave triggers a
+// rebalance (no liveness detection).  Add a periodic heartbeat RPC and
+// evict consumers whose heartbeat gap exceeds `session_timeout_ms`.
+// This is a prerequisite for multi-broker HA (cr-026).
+//
+// TODO(ha): multi-broker HA + leader election.  Single-broker means a
+// restart has a downtime window.  Pulsar/Kafka use multiple brokers +
+// ZooKeeper-coordinated leader election for each topic partition.  For
+// logdb-broker this pairs with cr-026 (ownership ring).
 #[derive(Clone)]
 pub struct BrokerServiceImpl {
     registry: Arc<CoordinatorRegistry>,
@@ -221,6 +232,36 @@ impl BrokerService for BrokerServiceImpl {
         }))
     }
 
+    async fn batch_produce(
+        &self,
+        req: Request<BatchProduceRequest>,
+    ) -> Result<Response<BatchProduceResponse>, Status> {
+        let r = req.into_inner();
+        let forwarder = self.forwarder.clone().ok_or_else(|| {
+            Status::unimplemented("batch produce disabled (no logdbd configured)")
+        })?;
+        let append_reqs: Vec<logdbd_proto::pb::AppendRequest> = r
+            .requests
+            .into_iter()
+            .map(|p| logdbd_proto::pb::AppendRequest {
+                namespace: p.namespace,
+                stream: p.stream,
+                event_type: p.event_type,
+                timestamp_ns: p.timestamp_ns,
+                content_type: p.content_type,
+                metadata: p.metadata,
+                content: p.content,
+                shard_key: p.shard_key,
+            })
+            .collect();
+        let resps = forwarder.append_batch(append_reqs).await?;
+        let records: Vec<ProduceResponse> = resps
+            .into_iter()
+            .map(|a| ProduceResponse { gid: a.gid, seq: a.seq })
+            .collect();
+        Ok(Response::new(BatchProduceResponse { records }))
+    }
+
     async fn commit_shard_offset(
         &self,
         req: Request<CommitShardOffsetRequest>,
@@ -247,6 +288,35 @@ impl BrokerService for BrokerServiceImpl {
             }
         }
         Ok(Response::new(CommitShardOffsetResponse { advanced }))
+    }
+
+    async fn heartbeat(
+        &self,
+        req: Request<HeartbeatRequest>,
+    ) -> Result<Response<HeartbeatResponse>, Status> {
+        let r = req.into_inner();
+        let key = GroupKey::new(&r.namespace, &r.stream, &r.group);
+        let sessions = self.sessions.get_group(&key);
+        let mut found = false;
+        for (cid, h) in &sessions {
+            if cid == &r.consumer_id {
+                h.touch();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(Status::not_found("consumer session not found; call Consume first"));
+        }
+        let current_gen = self
+            .registry
+            .group_snapshot(&r.namespace, &r.stream, &r.group)
+            .map(|s| s.generation)
+            .unwrap_or(0);
+        Ok(Response::new(HeartbeatResponse {
+            generation: current_gen,
+            rebalance: current_gen != r.generation,
+        }))
     }
 }
 
@@ -312,16 +382,24 @@ impl BrokerServiceImpl {
             return;
         };
         metrics::counter!("broker.rebalances").increment(1);
+
+        // Sticky: only swap forward tasks for consumers whose shard set
+        // actually changed (the rest keep running uninterrupted).
+        let changed = self.registry.last_changed(namespace, stream, group);
         tracing::info!(
             ns = namespace,
             stream = stream,
             group = group,
             generation = snap.generation,
             sessions = sessions.len(),
-            "rebalancing open consume streams"
+            changed = changed.len(),
+            "rebalancing open consume streams (sticky)"
         );
 
         for (consumer_id, session) in sessions {
+            if !changed.contains(&consumer_id) {
+                continue; // unchanged — forward task keeps running
+            }
             // New shard assignment for this consumer (empty if it now has none).
             let new_shards = snap
                 .members
@@ -366,5 +444,36 @@ impl BrokerServiceImpl {
                 );
             }
         }
+    }
+
+    /// Evict consumers whose heartbeat gap exceeds `timeout_ms`. For each
+    /// stale consumer: abort its forward, remove from sessions + registry,
+    /// then rebalance its group so remaining members pick up the freed shards.
+    pub async fn evict_stale(&self, timeout_ms: u64) {
+        let stale = self.sessions.stale_consumers(timeout_ms);
+        for (key, consumer_id) in stale {
+            self.sessions.remove(&key, &consumer_id);
+            self.registry.leave(&key.namespace, &key.stream, &key.group, &consumer_id);
+            tracing::warn!(
+                ns = %key.namespace, stream = %key.stream, group = %key.group,
+                consumer = %consumer_id, timeout_ms,
+                "evicting stale consumer"
+            );
+            self.rebalance_group(&key.namespace, &key.stream, &key.group).await;
+        }
+    }
+
+    /// Launch a background task that periodically evicts stale consumers.
+    /// Call once after server startup. Pass `session_timeout_ms`: consumers
+    /// missing heartbeats for longer than this are evicted.
+    pub fn start_liveness_check(self: &std::sync::Arc<Self>, session_timeout_ms: u64) {
+        let svc = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_millis(session_timeout_ms.max(1000) / 3);
+            loop {
+                tokio::time::sleep(interval).await;
+                svc.evict_stale(session_timeout_ms).await;
+            }
+        });
     }
 }

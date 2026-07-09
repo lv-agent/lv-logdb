@@ -19,11 +19,21 @@ use tonic::Status;
 
 use crate::coordinator::GroupKey;
 
+/// Monotonic-ish milliseconds since epoch (used for heartbeat liveness).
+fn now_ms() -> u64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// One open consumer session: the shared record/signal channel + the swappable
 /// forward task that pumps records onto it.
 pub struct SessionHandle {
     pub tx: mpsc::Sender<Result<ConsumeResponse, Status>>,
     forward: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    last_heartbeat: std::sync::atomic::AtomicU64,
 }
 
 impl SessionHandle {
@@ -31,7 +41,22 @@ impl SessionHandle {
         Arc::new(Self {
             tx,
             forward: Mutex::new(None),
+            last_heartbeat: std::sync::atomic::AtomicU64::new(now_ms()),
         })
+    }
+
+    /// Record a heartbeat — the consumer is still alive.
+    pub fn touch(&self) {
+        self.last_heartbeat
+            .store(now_ms(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Milliseconds since the last heartbeat.
+    pub fn ms_since_last_heartbeat(&self) -> u64 {
+        let seen = self
+            .last_heartbeat
+            .load(std::sync::atomic::Ordering::Acquire);
+        now_ms().saturating_sub(seen)
     }
 
     /// Install a forward task, aborting any previous one. Called on consume
@@ -103,6 +128,21 @@ impl Sessions {
         g.get(key)
             .map(|m| m.iter().map(|(id, h)| (id.clone(), Arc::clone(h))).collect())
             .unwrap_or_default()
+    }
+
+    /// Return all `(GroupKey, consumer_id)` for sessions whose last heartbeat
+    /// exceeds `timeout_ms`. The caller should evict them and trigger rebalance.
+    pub fn stale_consumers(&self, timeout_ms: u64) -> Vec<(GroupKey, String)> {
+        let g = self.by_group.read().expect("sessions lock poisoned");
+        let mut out = Vec::new();
+        for (key, members) in g.iter() {
+            for (cid, h) in members {
+                if h.ms_since_last_heartbeat() > timeout_ms {
+                    out.push((key.clone(), cid.clone()));
+                }
+            }
+        }
+        out
     }
 }
 

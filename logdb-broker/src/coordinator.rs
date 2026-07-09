@@ -37,6 +37,10 @@ pub struct JoinResult {
 }
 
 /// One consumer group's mutable coordination state.
+///
+/// Sticky cooperative rebalance (cr-037 perf): consumers keep their shards
+/// across rebalances unless ownership actually changes (member joins/leaves).
+/// Only the affected consumers have their forward tasks restarted.
 #[derive(Debug)]
 pub struct GroupState {
     generation: u32,
@@ -48,6 +52,9 @@ pub struct GroupState {
     /// consumer, so it survives rebalances and (persisted) broker restarts.
     /// Membership is transient — NOT persisted; consumers rejoin after restart.
     shard_offsets: HashMap<u32, u64>,
+    /// Consumer_ids whose assignment changed in the last rebalance. The
+    /// orchestrator only swaps forward tasks for these members.
+    last_changed: std::collections::HashSet<String>,
     num_shards: u32,
 }
 
@@ -59,6 +66,7 @@ impl GroupState {
             members: Vec::new(),
             assignments: HashMap::new(),
             shard_offsets: HashMap::new(),
+            last_changed: std::collections::HashSet::new(),
             num_shards,
         }
     }
@@ -85,11 +93,18 @@ impl GroupState {
 
     /// Join (or rejoin) a consumer. A new member triggers a rebalance (generation
     /// bump); a returning member is a no-op that returns its current assignment.
+    /// Uses sticky assignment beyond the first member.
     pub fn join(&mut self, consumer_id: &str) -> JoinResult {
         if !self.members.contains(&consumer_id.to_string()) {
+            let first = self.members.is_empty();
             self.members.push(consumer_id.to_string());
             self.generation = self.generation.saturating_add(1);
-            self.recompute();
+            if first {
+                self.recompute_round_robin();
+                self.last_changed = self.members.iter().cloned().collect();
+            } else {
+                self.last_changed = self.recompute_sticky();
+            }
         }
         JoinResult {
             generation: self.generation,
@@ -108,16 +123,21 @@ impl GroupState {
             self.members.remove(pos);
             self.assignments.remove(consumer_id);
             self.generation = self.generation.saturating_add(1);
-            self.recompute();
+            self.last_changed = self.recompute_sticky();
             true
         } else {
             false
         }
     }
 
-    /// Recompute round-robin assignments from `members` + `num_shards`.
-    /// `shard i → members[i % n]`; surplus members (n > num_shards) get none.
-    fn recompute(&mut self) {
+    /// Consumer_ids whose shard set changed in the last rebalance (the
+    /// orchestrator only needs to swap forward tasks for these members).
+    pub fn last_changed(&self) -> &std::collections::HashSet<String> {
+        &self.last_changed
+    }
+
+    /// Recompute round-robin assignments (non-sticky). Used on first join.
+    fn recompute_round_robin(&mut self) {
         self.assignments.clear();
         let n = self.members.len();
         if n == 0 {
@@ -130,6 +150,106 @@ impl GroupState {
                 .or_default()
                 .push(shard);
         }
+    }
+
+    /// Sticky rebalance: keep existing shard assignments wherever possible, only
+    /// move what is necessary for fairness. Returns the set of consumer_ids
+    /// whose shard set actually changed — the orchestrator only needs to swap
+    /// the forward task for those members (the rest stay put).
+    fn recompute_sticky(&mut self) -> std::collections::HashSet<String> {
+        let old = std::mem::take(&mut self.assignments);
+        let n = self.members.len();
+        if n == 0 {
+            return old.keys().cloned().collect(); // all departed
+        }
+
+        // 1. Start from old assignments for members still present.
+        for id in &self.members {
+            self.assignments
+                .entry(id.clone())
+                .or_default()
+                .extend(old.get(id).cloned().unwrap_or_default());
+        }
+
+        // 2. Collect shards not assigned to any current member (from departures).
+        let mut free: Vec<u32> = (0..self.num_shards)
+            .filter(|s| {
+                !self
+                    .assignments
+                    .values()
+                    .any(|v| v.contains(s))
+            })
+            .collect();
+
+        // 3. Fair share: each member gets at least `floor(num_shards / n)`,
+        //    first `num_shards % n` get one extra.
+        let target_base = self.num_shards / n as u32;
+        let extra = (self.num_shards as usize) % n;
+
+        // 4. Shed excess shards: prefer shedding "foreign" shards
+        //    (where shard % n != member index) first — they naturally
+        //    belong to other members in round-robin. Only shed "ours"
+        //    if we are still over target after foreign ones are gone.
+        for (idx, id) in self.members.iter().enumerate() {
+            let target = target_base + if idx < extra { 1 } else { 0 };
+            let shards = self.assignments.get_mut(id).unwrap();
+            let mut to_shed = Vec::new();
+            let surplus = (shards.len() as u32).saturating_sub(target);
+            // Foreign-first: shed shards where shard % n != index.
+            shards.retain(|s| {
+                if to_shed.len() as u32 >= surplus {
+                    return true;
+                }
+                let is_ours = (*s as usize) % n == idx;
+                if is_ours {
+                    true
+                } else {
+                    to_shed.push(*s);
+                    false
+                }
+            });
+            // If still over target, shed from the end (our own shards)
+            while shards.len() as u32 > target {
+                if let Some(s) = shards.pop() {
+                    to_shed.push(s);
+                }
+            }
+            free.extend(to_shed);
+        }
+
+        // 5. Fill under-assigned members from the free pool.
+        for (idx, id) in self.members.iter().enumerate() {
+            let target = target_base + if idx < extra { 1 } else { 0 };
+            let shards = self.assignments.get_mut(id).unwrap();
+            while (shards.len() as u32) < target {
+                if let Some(s) = free.pop() {
+                    shards.push(s);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 6. Sort for determinism.
+        for v in self.assignments.values_mut() {
+            v.sort_unstable();
+        }
+
+        // 7. Diff: which consumers had their shard set change?
+        let mut changed = std::collections::HashSet::new();
+        for id in &self.members {
+            let new = self.assignments.get(id).map(|v| v.as_slice());
+            let old_s = old.get(id).map(|v| v.as_slice());
+            if new != old_s {
+                changed.insert(id.clone());
+            }
+        }
+        for id in old.keys() {
+            if !self.members.contains(id) {
+                changed.insert(id.clone()); // departed
+            }
+        }
+        changed
     }
 
     /// Record that `shard` was processed up to `seq` (last-processed seq).
@@ -215,6 +335,22 @@ impl CoordinatorRegistry {
             Some(state) => state.leave(consumer_id),
             None => false,
         }
+    }
+
+    /// Consumer_ids whose assignment changed in the last rebalance.
+    /// Empty or absent if the group has never been changed.
+    pub fn last_changed(
+        &self,
+        namespace: &str,
+        stream: &str,
+        group: &str,
+    ) -> std::collections::HashSet<String> {
+        let key = GroupKey::new(namespace, stream, group);
+        let groups = self.groups.read().unwrap_or_else(PoisonError::into_inner);
+        groups
+            .get(&key)
+            .map(|s| s.last_changed().clone())
+            .unwrap_or_default()
     }
 
     /// Snapshot of `(ns, stream, group)`, or `None` if the group was never
@@ -313,10 +449,16 @@ mod tests {
         for id in ["c1", "c2", "c3", "c4"] {
             s.join(id);
         }
-        assert_eq!(shards_of(&s, "c1"), vec![0]);
-        assert_eq!(shards_of(&s, "c2"), vec![1]);
-        assert_eq!(shards_of(&s, "c3"), vec![2]);
-        assert_eq!(shards_of(&s, "c4"), vec![3]);
+        // Sticky may preserve old shard ownership, so the exact mapping
+        // differs from pure round-robin. But every member gets exactly 1
+        // shard, all 4 shards are covered, disjoint.
+        let mut seen = std::collections::HashSet::new();
+        for id in ["c1", "c2", "c3", "c4"] {
+            let got = shards_of(&s, id);
+            assert_eq!(got.len(), 1, "{id} must own exactly 1 shard");
+            assert!(seen.insert(got[0]), "shard {} assigned twice", got[0]);
+        }
+        assert_eq!(seen.len(), 4);
     }
 
     #[test]

@@ -36,6 +36,14 @@ service BrokerService {
   // backend, never directly addressed by clients.
   rpc Produce(ProduceRequest) returns (ProduceResponse);
 
+  // Publish a batch atomically. All records in the batch are committed
+  // together in logdbd (one gRPC call, not N). Prefer this for throughput.
+  rpc BatchProduce(BatchProduceRequest) returns (BatchProduceResponse);
+
+  // Liveness check — call every ~session_timeout/3. A consumer that misses
+  // several heartbeats is evicted from its groups, triggering a rebalance.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
   // Commit a per-shard processed offset for the group. Persisted to logdbd's
   // meta stream so consumers resume correctly after a broker restart (the
   // broker is otherwise in-memory). Membership is NOT persisted — consumers
@@ -165,6 +173,29 @@ message ProduceRequest {
 message ProduceResponse {
   uint64 gid = 1;
   uint64 seq = 2;
+}
+
+message BatchProduceRequest {
+  repeated ProduceRequest requests = 1;
+}
+
+message BatchProduceResponse {
+  repeated ProduceResponse records = 1;
+}
+
+// ─── Heartbeat (liveness detection) ─────────────────────────────────────────
+
+message HeartbeatRequest {
+  string namespace   = 1;
+  string stream      = 2;
+  string group       = 3;
+  string consumer_id = 4;
+  uint32 generation  = 5;  // consumer's current generation (informational)
+}
+
+message HeartbeatResponse {
+  uint32 generation   = 1;  // group's current generation
+  bool   rebalance    = 2;  // true if a rebalance happened (consumer should re-sync)
 }
 
 // ─── CommitShardOffset (durable per-shard progress) ──────────────────────────

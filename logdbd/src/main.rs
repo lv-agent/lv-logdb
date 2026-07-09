@@ -156,8 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .resolve_key_ring()
         .map_err(|e| format!("encryption config: {}", e))?;
 
-    let db = LogDb::open(db_config).map_err(|e| format!("logdb open: {}", e))?;
     let num_shards = config.logdb.shards;
+    let ckpt_path = data_dir.join("seq_map.ckpt");
+    let db_config_fallback = db_config.clone();
+    let db = LogDb::open(db_config)
+        .map_err(|e| format!("logdb open: {}", e))?;
 
     tracing::info!(
         listen = %listen,
@@ -174,8 +177,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Catalog — namespace & stream name → ID mapping
     let catalog = Arc::new(Catalog::open(&data_dir).map_err(|e| format!("catalog open: {}", e))?);
 
-    // Storage — wraps logdb with record encode/decode
-    let storage = Arc::new(Storage::new(db, num_shards));
+    // Storage — try seq-map checkpoint for fast startup, fall back to full rebuild.
+    let storage = match logdbd::storage::Storage::try_new_from_checkpoint(db, num_shards, &ckpt_path) {
+        Ok(s) => {
+            tracing::info!("storage loaded from seq-map checkpoint");
+            s
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "seq-map checkpoint load failed; rebuilding from full scan");
+            let db = LogDb::open(db_config_fallback)
+                .map_err(|e| format!("logdb reopen for full rebuild: {}", e))?;
+            logdbd::storage::Storage::new(db, num_shards)
+        }
+    };
+    let storage = Arc::new(storage);
 
     // Shared subscriber hub — SubscribePublisher pushes, Subscribe RPC reads
     let subscribe_hub = Arc::new(logdbd::subscribe::SubscribeHub::new());

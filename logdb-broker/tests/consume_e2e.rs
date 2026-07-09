@@ -38,8 +38,17 @@ async fn start_logdbd(shards: usize) -> (std::net::SocketAddr, tempfile::TempDir
     cfg.shards = shards;
     cfg.durability_mode = logdb::DurabilityMode::Sync;
     cfg.flush_timeout = Duration::from_secs(5);
+    let cfg_fb = cfg.clone();
+    let ckpt_path = dir.path().join("seq_map.ckpt");
     let db = LogDb::open(cfg).unwrap();
-    let storage = Arc::new(Storage::new(db, shards));
+    let storage = Arc::new(
+        logdbd::storage::Storage::try_new_from_checkpoint(db, shards, &ckpt_path)
+            .unwrap_or_else(|e| {
+                eprintln!("test logdbd: checkpoint load failed ({e}); full rebuild");
+                let db = LogDb::open(cfg_fb).unwrap();
+                logdbd::storage::Storage::new(db, shards)
+            }),
+    );
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
     let svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
@@ -68,9 +77,11 @@ async fn start_broker(logdbd_addr: String, num_shards: u32) -> std::net::SocketA
     persistence.ensure_meta_stream().await.unwrap();
     let registry = Arc::new(CoordinatorRegistry::new(num_shards));
     // Recover committed offsets (a fresh broker re-reads the meta stream).
-    for rec in persistence.scan_offsets().await.unwrap() {
+    let recovered = persistence.load_recovered_offsets().await.unwrap();
+    for rec in &recovered {
         registry.commit_offset(&rec.ns, &rec.stream, &rec.group, rec.shard, rec.seq);
     }
+    let _ = persistence.compact_offsets(&recovered).await;
     let svc = BrokerServiceImpl::new(registry, Some(forwarder), Some(persistence));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -825,4 +836,85 @@ async fn sdk_consumer_resumes_from_committed_offset_after_broker_restart() {
         "restarted broker must resume from committed offsets — nothing re-delivers"
     );
     consumer2.leave().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_consumers_no_duplicates_no_loss() {
+    let shards = 8u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let url = format!("http://{broker_addr}");
+
+    // Produce 10_000 key-routed records up front.
+    let mut producer = logdb_client::broker::BrokerProducer::connect(url.clone())
+        .await
+        .unwrap();
+    for i in 0..10_000u32 {
+        let key = format!("key-{i:0>5}");
+        producer
+            .produce("ns", "s", "e", key.as_bytes(), Some(&key))
+            .await
+            .unwrap();
+    }
+    // Give logdbd time to make them durable before consumers tail.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // 50 concurrent consumers. Each forwards received record content to a shared
+    // channel; the main task counts UNIQUE records and stops the moment all
+    // 10_000 have arrived — measuring real delivery latency, not a fixed drain
+    // window.
+    let n = 50u32;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(2048);
+    for cid in 0..n {
+        let u = url.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut con = logdb_client::broker::GroupConsumer::join(
+                u, "ns", "s", "g", format!("c-{cid}"),
+            )
+            .await
+            .unwrap();
+            // Consumers with no assigned shards (n > shards) get an error; skip.
+            let mut stream = match con.consume().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            // Drain until the channel closes (main drops rx after 10_000 unique).
+            while let Some(Ok(r)) = stream.next().await {
+                if tx
+                    .send(String::from_utf8_lossy(&r.content).into_owned())
+                    .await
+                    .is_err()
+                {
+                    return; // main is done
+                }
+            }
+        });
+    }
+    drop(tx); // close after all consumers spawned
+
+    let t_start = tokio::time::Instant::now();
+    let mut union = std::collections::HashSet::new();
+    let mut total_deliveries = 0usize;
+    let mut t_done = None;
+    while let Some(content) = rx.recv().await {
+        total_deliveries += 1;
+        if union.insert(content) && union.len() == 10_000 {
+            t_done = Some(tokio::time::Instant::now());
+            break; // all delivered — stop
+        }
+    }
+    drop(rx); // drops consumers (their tx.send fails → they exit)
+
+    let t_done = t_done.expect("all 10_000 records delivered");
+    let elapsed = t_done.duration_since(t_start);
+    assert_eq!(union.len(), 10_000, "all 10_000 records must be delivered");
+    assert_eq!(
+        total_deliveries, 10_000,
+        "exactly-once: total deliveries ({total_deliveries}) must equal unique (10_000)"
+    );
+    let throughput = 10_000.0 / elapsed.as_secs_f64();
+    eprintln!(
+        "concurrent_consumers: 10_000 records, {n} consumers, exactly-once, delivered in {elapsed:.2?} ({throughput:.0} rec/s)"
+    );
 }

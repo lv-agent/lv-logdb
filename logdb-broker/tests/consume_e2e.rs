@@ -1173,6 +1173,97 @@ async fn ha_failover_standby_takes_over_after_leader_crash() {
 }
 
 #[tokio::test]
+async fn produce_full_round_trips_all_fields() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let url = format!("http://{broker_addr}");
+
+    let mut prod = logdb_client::broker::BrokerProducer::connect(url.clone())
+        .await
+        .unwrap();
+
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("model".into(), "claude-opus-4".into());
+    meta.insert("turn_id".into(), "t-42".into());
+
+    let (gid, seq) = prod
+        .produce_full(
+            "ns", "s", "tool.call",
+            b"{\"arg\":1}",
+            Some("session-42"),
+            1_700_000_000_000_000,
+            "application/json",
+            &meta,
+        )
+        .await
+        .unwrap();
+    assert!(gid > 0);
+    assert_eq!(seq, 1);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Join + consume to read the record back and check every field.
+    let mut consumer =
+        logdb_client::broker::GroupConsumer::join(url, "ns", "s", "g", "c1")
+            .await
+            .unwrap();
+    let stream = consumer.consume().await.unwrap();
+    let mut pinned = stream;
+    let rec = tokio::time::timeout(
+        Duration::from_secs(2),
+        pinned.next(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(rec.event_type, "tool.call");
+    assert_eq!(rec.timestamp_ns, 1_700_000_000_000_000);
+    assert_eq!(rec.content_type, "application/json");
+    assert_eq!(rec.metadata.get("model").unwrap(), "claude-opus-4");
+    assert_eq!(rec.metadata.get("turn_id").unwrap(), "t-42");
+    assert_eq!(rec.content, b"{\"arg\":1}");
+    assert!((rec.shard_id as usize) < 4);
+
+    consumer.leave().await.unwrap();
+}
+
+#[tokio::test]
+async fn produce_lightweight_defaults_content_type_to_json() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir, _jh) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let url = format!("http://{broker_addr}");
+
+    let mut prod = logdb_client::broker::BrokerProducer::connect(url.clone())
+        .await
+        .unwrap();
+    // Lightweight produce() — no content_type passed, broker defaults to
+    // "application/json".
+    prod.produce("ns", "s", "evt", b"payload", Some("k"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut consumer =
+        logdb_client::broker::GroupConsumer::join(url, "ns", "s", "g", "c1")
+            .await
+            .unwrap();
+    let stream = consumer.consume().await.unwrap();
+    let mut pinned = stream;
+    let rec = tokio::time::timeout(Duration::from_secs(2), pinned.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.content_type, "application/json");
+    assert_eq!(rec.event_type, "evt");
+    consumer.leave().await.unwrap();
+}
+
+#[tokio::test]
 async fn forwarder_survives_logdbd_crash() {
     let shards = 4u32;
     // Use the killable harness so we can simulate a logdbd crash.

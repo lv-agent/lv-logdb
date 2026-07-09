@@ -1144,7 +1144,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "logdb"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "logdb-client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "logdb",
  "logdb-broker-proto",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "logdbd"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "crc32c",
  "fs2",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "logdbd-proto"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "prost",
  "tonic",

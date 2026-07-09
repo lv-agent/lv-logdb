@@ -1,6 +1,6 @@
 # Changelog — logdb-broker
 
-## [0.1.0] — unreleased (cr-037, branch `feat/cr-037-broker`)
+## [0.1.0] — 2026-07-09
 
 ### Added
 

@@ -1,14 +1,14 @@
 [package]
 name = "logdbd"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Clustered log service built on logdb"
 license = "Apache-2.0"
 
 [dependencies]
-logdb = { version = "0.5.0", path = "../logdb", features = ["compression", "encryption", "hash-chain", "metrics", "tracing"] }
-logdbd-proto = { version = "0.3.1", path = "../logdbd-proto" }
+logdb = { version = "0.6.0", path = "../logdb", features = ["compression", "encryption", "hash-chain", "metrics", "tracing"] }
+logdbd-proto = { version = "0.4.0", path = "../logdbd-proto" }
 tonic = { version = "0.12", features = ["tls"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

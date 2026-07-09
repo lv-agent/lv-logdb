@@ -12,7 +12,7 @@ default = ["clickhouse"]
 clickhouse = ["reqwest"]
 
 [dependencies]
-logdbd-proto = { version = "0.3.1", path = "../logdbd-proto" }
+logdbd-proto = { version = "0.4.0", path = "../logdbd-proto" }
 tonic = { version = "0.12", features = ["tls"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,7 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-logdbd = { version = "0.7.0", path = "../logdbd" }
+logdbd = { version = "0.8.0", path = "../logdbd" }
 tempfile = "3"
 tokio-stream = "0.1"
-logdb = { version = "0.5.0", path = "../logdb" }
+logdb = { version = "0.6.0", path = "../logdb" }

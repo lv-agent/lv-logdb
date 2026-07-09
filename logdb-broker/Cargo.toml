@@ -8,8 +8,8 @@ license = "Apache-2.0"
 repository = "https://github.com/lv-agent/lv-logdb"
 
 [dependencies]
-logdb-broker-proto = { path = "../logdb-broker-proto" }
-logdbd-proto = { path = "../logdbd-proto" }
+logdb-broker-proto = { version = "0.1.0", path = "../logdb-broker-proto" }
+logdbd-proto = { version = "0.4.0", path = "../logdbd-proto" }
 tonic = { version = "0.12", features = ["transport"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -23,9 +23,9 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false, feat
 
 [dev-dependencies]
 tempfile = "3"
-logdb = { path = "../logdb" }
-logdbd = { path = "../logdbd" }
-logdb-client = { path = "../logdb-client", features = ["broker"] }
+logdb = { version = "0.6.0", path = "../logdb" }
+logdbd = { version = "0.8.0", path = "../logdbd" }
+logdb-client = { version = "0.4.0", path = "../logdb-client", features = ["broker"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

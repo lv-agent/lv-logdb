@@ -1,6 +1,6 @@
 # Changelog — logdbd
 
-## [Unreleased]
+## [0.8.0] — 2026-07-09
 
 ### Added
 

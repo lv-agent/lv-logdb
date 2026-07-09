@@ -218,10 +218,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
+    // Shared notify for long-poll Tail (cr-037 A): the publisher wakes blocked
+    // Tail handlers when the durable cursor advances.
+    let tail_notify = Arc::new(tokio::sync::Notify::new());
     let subscribe_publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
         Arc::clone(&storage),
         Arc::clone(&subscribe_hub),
         Arc::clone(&tombstone_tracker),
+        Arc::clone(&tail_notify),
     ));
     subscribe_publisher.clone().start();
 
@@ -229,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let role_str = node.role.to_string();
     let quotas = config.limits.quotas.clone();
 
-    let log_svc = LogDbServiceImpl::with_quotas(
+    let mut log_svc = LogDbServiceImpl::with_quotas(
         Arc::clone(&storage),
         Arc::clone(&catalog),
         Arc::clone(&consumer_tracker),
@@ -240,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&quota_tracker),
         Arc::clone(&tombstone_tracker),
     );
+    log_svc.set_tail_notify(Arc::clone(&tail_notify));
     let repl_svc = ReplicationServiceImpl::new(
         Arc::clone(&storage),
         config.node.cluster_id.clone(),

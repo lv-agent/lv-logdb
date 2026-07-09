@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::catalog::Catalog;
@@ -137,6 +138,9 @@ pub struct LogDbServiceImpl {
     role: String,
     quota_tracker: Arc<crate::quota::QuotaTracker>,
     tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
+    /// Wakes blocked Tail handlers (cr-037 long-poll) when new durable data
+    /// is available. Shared with the SubscribePublisher via [`tail_notify`].
+    tail_notify: Arc<Notify>,
 }
 
 impl LogDbServiceImpl {
@@ -158,7 +162,18 @@ impl LogDbServiceImpl {
             role,
             quota_tracker: Arc::new(crate::quota::QuotaTracker::new()),
             tombstone_tracker: Arc::new(crate::tombstone::TombstoneTracker::new()),
+            tail_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Borrow the Notify shared with the subscribe publisher for long-poll Tail.
+    pub fn tail_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.tail_notify)
+    }
+
+    /// Replace the Notify (called once by main to share the publisher's Notify).
+    pub fn set_tail_notify(&mut self, n: Arc<Notify>) {
+        self.tail_notify = n;
     }
 
     /// Same as `new` but with stream quotas.
@@ -184,6 +199,7 @@ impl LogDbServiceImpl {
             role,
             quota_tracker,
             tombstone_tracker,
+            tail_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -544,6 +560,7 @@ impl LogDbService for LogDbServiceImpl {
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let tail_notify = Arc::clone(&self.tail_notify);
 
         tokio::spawn(async move {
             let mut last_seq = from_seq;
@@ -573,10 +590,6 @@ impl LogDbService for LogDbServiceImpl {
                     .take(batch_size as usize)
                     .collect();
 
-                // TODO(perf): long-poll instead of fixed 100ms sleep. Tail should
-                // block on a "new durable record" signal (e.g. a condvar / pub-sub
-                // from the Committer) with a timeout, so low-volume streams get
-                // sub-millisecond wake-up instead of always waiting the full interval.
                 if new_records.is_empty() {
                     // Send heartbeat
                     if tx
@@ -590,11 +603,16 @@ impl LogDbService for LogDbServiceImpl {
                     {
                         return;
                     }
-                    // TODO(perf): replace this fixed 100ms poll with long-poll.
-                    // Block on a per-stream durable-advance signal (e.g. an
-                    // AtomicU64 + condvar set by the Committer after advancing
-                    // durable_cursor) so new records wake the Tail immediately.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    // Wait for new durable data (long-poll, cr-037 A). The
+                    // SubscribePublisher calls notify_waiters() each poll cycle
+                    // (10 ms) when durable_gid advances. Timeout at 100 ms so
+                    // we still make progress even if the publisher is paused.
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        tail_notify.notified(),
+                    )
+                    .await
+                    .ok();
                     continue;
                 }
 

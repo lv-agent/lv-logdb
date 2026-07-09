@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 use crate::storage::Storage;
 use crate::subscribe::SubscribeHub;
 
@@ -13,7 +15,8 @@ use crate::subscribe::SubscribeHub;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Background publisher: chases `Storage::durable_gid()`, scans the new range,
-/// and fans each decoded record out to the `SubscribeHub` by `stream_id`.
+/// and fans each decoded record out to the `SubscribeHub` by `stream_id`. Also
+/// wakes blocked Tail tasks (long-poll, cr-037 A) when `durable_gid` advances.
 ///
 /// Latency is bounded by `POLL_INTERVAL` (≤10 ms). Non-blocking sends —
 /// records stay in the segment.
@@ -23,6 +26,8 @@ pub struct SubscribePublisher {
     tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
     last_gid: AtomicU64,
     running: AtomicBool,
+    /// Wakes blocked Tail handlers when new durable data is available.
+    tail_notify: Arc<Notify>,
 }
 
 impl SubscribePublisher {
@@ -30,6 +35,7 @@ impl SubscribePublisher {
         storage: Arc<Storage>,
         hub: Arc<SubscribeHub>,
         tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
+        tail_notify: Arc<Notify>,
     ) -> Self {
         Self {
             storage,
@@ -37,6 +43,7 @@ impl SubscribePublisher {
             tombstone_tracker,
             last_gid: AtomicU64::new(0),
             running: AtomicBool::new(false),
+            tail_notify,
         }
     }
 
@@ -73,6 +80,8 @@ impl SubscribePublisher {
                         }
                         // Half-open [last, durable): everything below durable is done.
                         self.last_gid.store(durable, Ordering::Release);
+                        // Wake blocked Tail handlers (cr-037 long-poll).
+                        self.tail_notify.notify_waiters();
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "subscribe publisher scan failed");
@@ -119,6 +128,7 @@ mod tests {
             Arc::clone(&storage),
             Arc::clone(&hub),
             Arc::new(crate::tombstone::TombstoneTracker::new()),
+                Arc::new(Notify::new()),
         ));
         publisher.clone().start();
 
@@ -167,6 +177,7 @@ mod tests {
             Arc::clone(&storage),
             Arc::clone(&hub),
             Arc::clone(&tombstones),
+                Arc::new(Notify::new()),
         ));
         publisher.clone().start();
 

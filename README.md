@@ -20,6 +20,8 @@ See [`logdbd/README.md`](logdbd/README.md) for configuration and operations.
 | [`logdbd`](logdbd/README.md) | `logdbd/` | Clustered gRPC log service. Namespace/stream, per-stream hash chain, primary-standby replication, TLS+auth, consumer groups. |
 | [`logdb-exporter`](logdb-exporter/README.md) | `logdb-exporter/` | CDC exporter: Scan + Tail → ClickHouse / stdout. |
 | [`logdb-client`](logdb-client/) | `logdb-client/` | Rust SDK: ergonomic async client for logdbd. |
+| [`logdb-broker`](logdb-broker/README.md) | `logdb-broker/` | Kafka-style consumer-group coordinator (symmetric gateway). Shard assignment, rebalance, durable per‑shard offsets, Prometheus metrics. |
+| [`logdb-broker-proto`](logdb-broker-proto/) | `logdb-broker-proto/` | Protobuf definitions for `logdb-broker` (standalone schema). |
 
 ## Quick Start
 

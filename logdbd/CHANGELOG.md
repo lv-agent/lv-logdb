@@ -1,5 +1,30 @@
 # Changelog — logdbd
 
+## [Unreleased]
+
+### Added
+
+- **Shard-aware Tail** (cr-037): `TailRequest.shard_ids` filters records to one or
+  more shards (empty ⇒ all, legacy behaviour). The logdb-broker uses this to
+  partition a consumer group's work so each consumer sees only its assigned
+  shards.
+- **Key-based append routing** (cr-037): `AppendRequest.shard_key` (optional) routes
+  the record deterministically by CRC32C — same key ⇒ same shard. Absent ⇒
+  legacy thread-affine routing.
+- **`DecodedRecord.shard_id`**: each decoded record now carries the shard it
+  landed on (decoded from the logdb gid at scan time). Readers can attribute
+  records to shards without re-parsing the gid.
+- **logdb-broker** — a symmetric-gateway consumer-group coordinator (sibling
+  crate). See its CHANGELOG for details.
+
+### Fixed
+
+- **Multi-shard Tail bounded by `durable_gid` returned incomplete** (cr-037
+  Phase 1): Tail's internal `scan(0, durable_gid)` used the min durable local
+  seq as a global gid cap. Under shards > 1 this returned only early shard‑0
+  records. The cap is removed (`scan(0, MAX)`) — each shard's manifest already
+  self-bounds by durable. No effect in the default `shards=1` config.
+
 ## [0.7.0] — 2026-07-08
 
 ### Added

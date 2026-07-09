@@ -132,6 +132,7 @@ mod tests {
                 &BTreeMap::new(),
                 1,
                 b"hello",
+                None,
             )
             .unwrap();
         storage.flush().unwrap();
@@ -179,6 +180,7 @@ mod tests {
                 &BTreeMap::new(),
                 1,
                 b"pre-delete",
+                None,
             )
             .unwrap();
         storage.flush().unwrap();
@@ -201,6 +203,7 @@ mod tests {
                 &BTreeMap::new(),
                 2,
                 &[],
+                None,
             )
             .unwrap();
         storage.flush().unwrap();

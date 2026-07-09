@@ -49,6 +49,12 @@ pub struct DecodedRecord {
     pub metadata: BTreeMap<String, String>,
     pub timestamp_ns: u64,
     pub user_content: Vec<u8>,
+    /// Shard this record's gid routes to. NOT part of the on-disk record format
+    /// (the gid lives in logdb's slot, not these bytes), so [`decode_record`]
+    /// cannot know it and defaults to 0. The storage layer sets it from the gid
+    /// via `logdb::decode_record_id(gid, shard_bits)`; code that decodes records
+    /// itself must populate it or treat 0 as "unset".
+    pub shard_id: u32,
 }
 
 // ── Encoding ──────────────────────────────────────────────────────────────────
@@ -184,6 +190,8 @@ pub fn decode_record(raw: &[u8]) -> Result<DecodedRecord, RecordError> {
         metadata,
         timestamp_ns,
         user_content,
+        // gid is not part of the record bytes; the storage layer fills this.
+        shard_id: 0,
     })
 }
 

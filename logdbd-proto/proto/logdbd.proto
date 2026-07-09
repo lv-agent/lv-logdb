@@ -54,6 +54,10 @@ message AppendRequest {
   string content_type = 5;
   map<string, string> metadata = 6;
   bytes  content      = 7;
+  // Optional key for deterministic shard routing (cr-037). Same key ⇒ same
+  // shard (CRC32C). Absent ⇒ legacy thread-affine routing. Used by the broker's
+  // producers so a consumer group can shard work by entity key.
+  optional string shard_key = 8;
 }
 
 message AppendResponse {
@@ -112,6 +116,10 @@ message TailRequest {
   uint32 batch_size      = 4;
   string consumer_group  = 5;  // consumer group name (for shared offset tracking)
   string consumer_id     = 6;  // unique consumer ID within the group
+  // Optional shard filter (cr-037): only deliver records whose gid decodes to
+  // one of these shard ids. Empty ⇒ all shards (legacy behavior). The broker
+  // sets this to a consumer's assigned shards so each record is delivered once.
+  repeated uint32 shard_ids = 7;
 }
 
 message TailResponse {

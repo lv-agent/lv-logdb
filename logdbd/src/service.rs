@@ -277,7 +277,16 @@ impl LogDbService for LogDbServiceImpl {
 
         let result = self
             .storage
-            .append(ns_id, stream_id, &r.event_type, ct, &meta, ts, &r.content)
+            .append(
+                ns_id,
+                stream_id,
+                &r.event_type,
+                ct,
+                &meta,
+                ts,
+                &r.content,
+                r.shard_key.as_deref(),
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
 
         // Incremental quota update — only on a successful append.
@@ -360,6 +369,7 @@ impl LogDbService for LogDbServiceImpl {
                     &meta,
                     ts,
                     &req.content,
+                    req.shard_key.as_deref(),
                 )
                 .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -510,6 +520,9 @@ impl LogDbService for LogDbServiceImpl {
         let stream = r.stream.clone();
         let group = r.consumer_group.clone();
         let cid = r.consumer_id.clone();
+        // Shard filter (cr-037): empty set ⇒ deliver all shards (legacy). The
+        // broker sets a consumer's assigned shards so each record is delivered once.
+        let shard_ids: std::collections::HashSet<u32> = r.shard_ids.iter().copied().collect();
 
         // Auto-resume from committed offset for consumer groups
         let from_seq = if r.from_seq == 0 && !group.is_empty() && !cid.is_empty() {
@@ -536,7 +549,13 @@ impl LogDbService for LogDbServiceImpl {
             let mut last_seq = from_seq;
             loop {
                 let durable = storage.durable_gid();
-                let all = match storage.scan(0, durable) {
+                // Scan up to the manifest's visible (durable) extent. Reads are
+                // durable-bounded per shard by the manifest (reader doc), so a
+                // global cap is unnecessary — and `durable_gid()` (the min durable
+                // local seq) would be WRONG as a global gid cap under shards>1
+                // (it would only catch the lowest-gid shard-0 records). `durable`
+                // is still reported to the client in heartbeats below.
+                let all = match storage.scan(0, u64::MAX) {
                     Ok(v) => v,
                     Err(_) => {
                         let _ = tx.send(Err(Status::internal("scan error"))).await;
@@ -549,6 +568,7 @@ impl LogDbService for LogDbServiceImpl {
                         r.stream_id == stream_id
                             && r.seq >= last_seq
                             && tombstones.is_live(stream_id, r.seq)
+                            && (shard_ids.is_empty() || shard_ids.contains(&r.shard_id))
                     })
                     .take(batch_size as usize)
                     .collect();
@@ -964,6 +984,7 @@ impl LogDbService for LogDbServiceImpl {
                 &std::collections::BTreeMap::new(),
                 0,
                 &[],
+                None,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -999,6 +1020,7 @@ mod mapping_tests {
             metadata,
             timestamp_ns: seq,
             user_content: format!("c-{}", seq).into_bytes(),
+            shard_id: 0,
         }
     }
 

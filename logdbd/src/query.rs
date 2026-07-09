@@ -247,6 +247,7 @@ mod tests {
             metadata,
             timestamp_ns: seq * 1_000_000_000,
             user_content: format!("c-{}", seq).into_bytes(),
+            shard_id: 0,
         }
     }
 

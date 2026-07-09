@@ -95,6 +95,7 @@ mod tests {
             metadata: BTreeMap::new(),
             timestamp_ns: seq * 1000,
             user_content: format!("r-{}", seq).into_bytes(),
+            shard_id: 0,
         }
     }
 

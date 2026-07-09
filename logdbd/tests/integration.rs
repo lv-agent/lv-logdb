@@ -77,6 +77,40 @@ async fn start_test_server() -> (SocketAddr, tempfile::TempDir) {
     (addr, dir)
 }
 
+/// Like [`start_test_server`] but with `shards` independent rings, so
+/// `shard_key` routing and `shard_ids` filtering are exercisable.
+async fn start_sharded_server(shards: usize) -> (SocketAddr, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db_config = DbConfig::default();
+    db_config.data_dir = dir.path().to_path_buf();
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.ring_size = 256;
+    db_config.shards = shards;
+    db_config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(db_config).unwrap();
+    let storage = Arc::new(Storage::new(db, shards));
+    let catalog = test_catalog(dir.path());
+    let svc = LogDbServiceImpl::new(
+        storage,
+        catalog,
+        Arc::new(ConsumerTracker::new(None)),
+        Arc::new(logdbd::subscribe::SubscribeHub::new()),
+        "shard-node".into(),
+        "primary".into(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(LogDbServiceServer::new(svc))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (addr, dir)
+}
+
 async fn start_node(role: &str, standby_addrs: Vec<String>) -> (SocketAddr, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let storage = Arc::new(test_storage(dir.path()));
@@ -421,6 +455,126 @@ async fn tail_streams_new_records() {
         }
     }
     assert_eq!(count, 5);
+}
+
+// ── Shard routing + filtering (cr-037) ───────────────────────────────────────
+
+/// Drain a tail stream for `window`, accumulating every delivered record's
+/// content. Robust to the durability race: doesn't break early on a heartbeat,
+/// just collects everything that arrives within the window.
+async fn drain_tail_contents(
+    stream: &mut tonic::codec::Streaming<pb::TailResponse>,
+    window: Duration,
+) -> std::collections::HashSet<String> {
+    let mut got = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout(Duration::from_millis(200), stream.message()).await {
+            Ok(Ok(Some(resp))) => {
+                for r in resp.records {
+                    got.insert(String::from_utf8_lossy(&r.content).into_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    got
+}
+
+#[tokio::test]
+async fn tail_shard_ids_filter_partitions_key_routed_records() {
+    let shards = 4u32;
+    let (addr, _dir) = start_sharded_server(shards as usize).await;
+    let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    // Append 16 records, each routed by a distinct shard_key (same key ⇒ same
+    // shard). Content carries the key so we can identify records on the wire
+    // (the Record proto exposes no shard_id).
+    let mut all_keys = std::collections::HashSet::new();
+    for i in 0..16u32 {
+        let key = format!("key-{i}");
+        client
+            .append(pb::AppendRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                event_type: "e".into(),
+                content: key.as_bytes().to_vec(),
+                shard_key: Some(key.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        all_keys.insert(key);
+    }
+    // Let the Committer advance the durable cursor before tailing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Tail each shard individually.
+    let mut per_shard: Vec<std::collections::HashSet<String>> = Vec::new();
+    for s in 0..shards {
+        let mut stream = client
+            .tail(pb::TailRequest {
+                namespace: "test".into(),
+                stream: "main".into(),
+                from_seq: 1,
+                batch_size: 100,
+                shard_ids: vec![s],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        per_shard.push(drain_tail_contents(&mut stream, Duration::from_millis(500)).await);
+    }
+
+    // Every record is delivered to exactly ONE shard-tail (disjoint partition),
+    // nothing is lost (union == all 16), and the keys actually spread (>1 shard).
+    let mut union = std::collections::HashSet::new();
+    let mut nonempty = 0;
+    for set in &per_shard {
+        if !set.is_empty() {
+            nonempty += 1;
+        }
+        for k in set {
+            assert!(
+                union.insert(k.clone()),
+                "record {k} delivered to more than one shard tail — filter not disjoint"
+            );
+        }
+    }
+    assert_eq!(
+        union.len(),
+        16,
+        "all 16 records must be delivered across the per-shard tails"
+    );
+    assert!(
+        nonempty >= 2,
+        "16 distinct keys over 4 shards must spread across >=2 shards, got {nonempty}"
+    );
+
+    // Legacy behavior preserved: empty shard_ids ⇒ all shards ⇒ all records.
+    let mut legacy = client
+        .tail(pb::TailRequest {
+            namespace: "test".into(),
+            stream: "main".into(),
+            from_seq: 1,
+            batch_size: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let legacy_set = drain_tail_contents(&mut legacy, Duration::from_millis(500)).await;
+    assert_eq!(
+        legacy_set.len(),
+        16,
+        "empty shard_ids must deliver all records (legacy behavior)"
+    );
 }
 
 // ── Replication tests ─────────────────────────────────────────────────────────
@@ -2354,6 +2508,7 @@ async fn subscribe_500_subs_replay_stress() {
                 &BTreeMap::new(),
                 i,
                 format!("r-{}", i).as_bytes(),
+                None,
             )
             .unwrap();
     }

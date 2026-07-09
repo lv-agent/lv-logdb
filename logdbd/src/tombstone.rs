@@ -90,6 +90,7 @@ mod tests {
             metadata: BTreeMap::new(),
             timestamp_ns: seq,
             user_content: format!("c-{}", seq).into_bytes(),
+            shard_id: 0,
         }
     }
 

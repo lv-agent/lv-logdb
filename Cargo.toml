@@ -1,13 +1,22 @@
 # lv-logdb — a cargo workspace
 #
 # Members:
-#   logdb   — the embedded append-only log database (the library crate)
-#   logdbd  — a clustered gRPC service built on logdb
+#   logdb             — the embedded append-only log database (the library crate)
+#   logdbd            — a clustered gRPC service built on logdb
+#   logdb-broker      — Kafka-style consumer-group coordinator for logdbd (cr-037)
 #
 # The fuzz targets (logdb/fuzz) are excluded from the workspace; they are
 # driven by `cargo +nightly fuzz` directly.
 
 [workspace]
 resolver = "2"
-members = ["logdb", "logdbd-proto", "logdbd", "logdb-exporter", "logdb-client"]
+members = [
+  "logdb",
+  "logdbd-proto",
+  "logdbd",
+  "logdb-exporter",
+  "logdb-client",
+  "logdb-broker-proto",
+  "logdb-broker",
+]
 exclude = ["logdb/fuzz"]

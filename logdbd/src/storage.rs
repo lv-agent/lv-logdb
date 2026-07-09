@@ -21,6 +21,8 @@ pub struct Storage {
     /// Replicated gid cursor (updated by replication module)
     replicated_seq: AtomicU64,
     num_shards: usize,
+    /// Shard bits used to decode gid → shard_id (derived from num_shards).
+    shard_bits: u32,
 }
 
 impl Storage {
@@ -34,6 +36,7 @@ impl Storage {
             next_seqs: RwLock::new(HashMap::new()),
             replicated_seq: AtomicU64::new(0),
             num_shards,
+            shard_bits: logdb::shard_bits(num_shards),
         };
         storage.rebuild_mapping();
         storage
@@ -89,6 +92,11 @@ impl Storage {
     }
 
     /// Append a record and return its (gid, stream_seq).
+    ///
+    /// `shard_key`: when `Some`, route deterministically by key (same key ⇒
+    /// same shard) via [`logdb::LogDb::append_with_key`]; when `None`, fall
+    /// back to legacy thread-affine routing. The broker (cr-037) sets a key so
+    /// a consumer group can shard work by entity.
     pub fn append(
         &self,
         namespace_id: u32,
@@ -98,6 +106,7 @@ impl Storage {
         metadata: &BTreeMap<String, String>,
         timestamp_ns: u64,
         user_content: &[u8],
+        shard_key: Option<&str>,
     ) -> Result<AppendResult, StorageError> {
         // Allocate next per-stream seq
         let seq = {
@@ -124,11 +133,17 @@ impl Storage {
         )
         .map_err(StorageError::Record)?;
 
-        // Append to logdb
-        let gid = self
-            .db
-            .append(&encoded)
-            .map_err(|e| StorageError::LogDb(format!("append: {:?}", e)))?;
+        // Append to logdb — key-routed when a shard_key is supplied.
+        let gid = match shard_key {
+            Some(key) => self
+                .db
+                .append_with_key(&encoded, key.as_bytes())
+                .map_err(|e| StorageError::LogDb(format!("append: {:?}", e)))?,
+            None => self
+                .db
+                .append(&encoded)
+                .map_err(|e| StorageError::LogDb(format!("append: {:?}", e)))?,
+        };
 
         // Store mapping
         {
@@ -177,7 +192,12 @@ impl Storage {
                     .map_err(|e| StorageError::LogDb(format!("read: {:?}", e)))?;
                 match raw {
                     None => Ok(None),
-                    Some(rec) => Ok(Some(record::decode_record(&rec.content)?)),
+                    Some(rec) => {
+                        let mut decoded = record::decode_record(&rec.content)?;
+                        decoded.shard_id =
+                            logdb::decode_record_id(gid, self.shard_bits).0 as u32;
+                        Ok(Some(decoded))
+                    }
                 }
             }
         }
@@ -192,7 +212,10 @@ impl Storage {
         let mut results = Vec::new();
         for r in iter {
             let rec = r.map_err(|e| StorageError::LogDb(format!("scan iter: {:?}", e)))?;
-            results.push(record::decode_record(&rec.content)?);
+            let gid = rec.id.sequence;
+            let mut decoded = record::decode_record(&rec.content)?;
+            decoded.shard_id = logdb::decode_record_id(gid, self.shard_bits).0 as u32;
+            results.push(decoded);
         }
         Ok(results)
     }
@@ -331,6 +354,18 @@ mod tests {
         (Storage::new(db, 1), dir)
     }
 
+    fn test_storage_sharded(shards: usize) -> (Storage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = logdb::Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.ring_size = 256;
+        config.durability_mode = logdb::DurabilityMode::Async; // avoid WSL2 fdatasync hang
+        config.flush_timeout = Duration::from_secs(5);
+        config.shards = shards;
+        let db = logdb::LogDb::open(config).unwrap();
+        (Storage::new(db, shards), dir)
+    }
+
     #[test]
     fn append_and_read_single_stream() {
         let (st, _dir) = test_storage();
@@ -338,7 +373,16 @@ mod tests {
         meta.insert("model".into(), "test".into());
 
         let r1 = st
-            .append(1, 42, "llm.call", "application/json", &meta, 1000, b"hello")
+            .append(
+                1,
+                42,
+                "llm.call",
+                "application/json",
+                &meta,
+                1000,
+                b"hello",
+                None,
+            )
             .unwrap();
         let r2 = st
             .append(
@@ -349,6 +393,7 @@ mod tests {
                 &BTreeMap::new(),
                 2000,
                 b"world",
+                None,
             )
             .unwrap();
 
@@ -389,6 +434,7 @@ mod tests {
                 &BTreeMap::new(),
                 i,
                 format!("r-{}", i).as_bytes(),
+                None,
             )
             .unwrap();
         }
@@ -405,5 +451,88 @@ mod tests {
         for (i, r) in results.iter().enumerate() {
             assert_eq!(r.seq, i as u64 + 1);
         }
+    }
+
+    #[test]
+    fn scan_populates_shard_id_from_gid_across_shards() {
+        let shards = 4;
+        let (st, _dir) = test_storage_sharded(shards);
+        let bits = logdb::shard_bits(shards);
+
+        // Append from 4 threads so thread-affine routing spreads records across
+        // shards (a single thread would hit one shard, masking a "forgot to set
+        // shard_id" bug if that shard happened to be 0).
+        let seq_to_expected: std::sync::RwLock<BTreeMap<u64, u32>> =
+            std::sync::RwLock::new(BTreeMap::new());
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                // Rebind to references so each `move` closure copies the ref
+                // (and the Copy u64 `t`) instead of moving the owned Storage.
+                let st = &st;
+                let seq_to_expected = &seq_to_expected;
+                s.spawn(move || {
+                    for i in 0..4u64 {
+                        let ar = st
+                            .append(
+                                1,
+                                1,
+                                "test",
+                                "text/plain",
+                                &BTreeMap::new(),
+                                t * 10 + i,
+                                format!("r-{t}-{i}").as_bytes(),
+                                None,
+                            )
+                            .unwrap();
+                        let expected = logdb::decode_record_id(ar.gid, bits).0 as u32;
+                        seq_to_expected
+                            .write()
+                            .unwrap()
+                            .insert(ar.stream_seq, expected);
+                    }
+                });
+            }
+        });
+
+        st.flush().unwrap();
+        for _ in 0..50 {
+            if st.durable_gid() >= 16 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let results = st.scan(0, u64::MAX).unwrap();
+        assert_eq!(results.len(), 16, "scan must see all 16 records");
+
+        // Every scanned record's shard_id must equal the shard decoded from its
+        // gid, and span more than one shard (proving real population, not a
+        // constant default).
+        let mut shards_seen = std::collections::HashSet::new();
+        for r in &results {
+            let expected = seq_to_expected
+                .read()
+                .unwrap()
+                .get(&r.seq)
+                .copied()
+                .unwrap_or(u32::MAX);
+            assert_eq!(
+                r.shard_id, expected,
+                "shard_id must match gid-decoded shard for seq {} (got {}, want {})",
+                r.seq, r.shard_id, expected
+            );
+            assert!(
+                (r.shard_id as usize) < shards,
+                "shard_id {} out of bounds for {} shards",
+                r.shard_id,
+                shards
+            );
+            shards_seen.insert(r.shard_id);
+        }
+        assert!(
+            shards_seen.len() > 1,
+            "4 threads over 4 shards should use >1 shard, got {:?}",
+            shards_seen
+        );
     }
 }

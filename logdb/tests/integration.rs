@@ -737,3 +737,90 @@ fn index_stride_is_configurable() {
         );
     }
 }
+
+// ── key-based shard routing (cr-037) ────────────────────────────────────────
+
+fn open_keyrouted_db(shards: usize) -> (tempfile::TempDir, LogDb) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.data_dir = dir.path().to_path_buf();
+    config.shards = shards;
+    config.ring_size = 256;
+    config.durability_mode = DurabilityMode::Async; // avoid WSL2 fdatasync hang
+    config.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(config).unwrap();
+    (dir, db)
+}
+
+#[test]
+fn append_with_key_routes_same_key_to_same_shard() {
+    let (_dir, db) = open_keyrouted_db(4);
+    let bits = 2u32; // ceil(log2(4))
+
+    let key = b"session-alpha";
+    let mut shard = None;
+    for _ in 0..5 {
+        let id = db.append_with_key(b"payload", key).unwrap();
+        let (s, _) = logdb::decode_record_id(id, bits);
+        match shard {
+            None => shard = Some(s),
+            Some(expected) => assert_eq!(
+                s, expected,
+                "same key must always route to the same shard"
+            ),
+        }
+    }
+    assert!(shard.unwrap() < 4);
+}
+
+#[test]
+fn append_with_key_distributes_distinct_keys() {
+    let (_dir, db) = open_keyrouted_db(4);
+    let bits = 2u32;
+
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..40u32 {
+        let id = db.append_with_key(b"payload", format!("key-{i}").as_bytes()).unwrap();
+        let (s, _) = logdb::decode_record_id(id, bits);
+        seen.insert(s);
+    }
+    assert!(
+        seen.len() > 1,
+        "40 distinct keys should spread across >1 shard, got {}",
+        seen.len()
+    );
+}
+
+#[test]
+fn append_with_key_record_is_readable_by_id() {
+    let (_dir, db) = open_keyrouted_db(4);
+
+    let id = db.append_with_key(b"readable-payload", b"key-r").unwrap();
+    db.flush().unwrap();
+    // Give the Committer time to make the slot readable.
+    for _ in 0..50 {
+        if db.read(id).unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let rec = db
+        .read(id)
+        .unwrap()
+        .expect("key-routed record must be readable");
+    assert_eq!(rec.id.sequence, id);
+    assert_eq!(rec.content, b"readable-payload");
+}
+
+#[test]
+fn append_with_key_single_shard_is_identity() {
+    let (_dir, db) = open_keyrouted_db(1);
+
+    // shards=1 ⇒ shard_bits=0 ⇒ every key maps to shard 0, decode is identity.
+    for key in [b"".as_slice(), b"a", b"some-session-key"] {
+        let id = db.append_with_key(b"payload", key).unwrap();
+        let (shard, local) = logdb::decode_record_id(id, 0);
+        assert_eq!(shard, 0);
+        assert_eq!(local, id, "shards=1: global id == local seq");
+    }
+}

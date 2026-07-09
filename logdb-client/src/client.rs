@@ -94,6 +94,7 @@ impl Client {
                 metadata: metadata.clone(),
                 timestamp_ns,
                 content: content.to_vec(),
+                ..Default::default()
             })
             .await?;
         Ok(resp.into_inner())
@@ -480,6 +481,7 @@ impl TailOptions {
                 batch_size: self.batch_size,
                 consumer_group: grp.clone(),
                 consumer_id: cid.clone(),
+                ..Default::default()
             })
             .await?;
         Ok(TailStream {

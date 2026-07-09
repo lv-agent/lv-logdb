@@ -1,0 +1,22 @@
+# logdb-broker sample configuration.
+#
+# Run:  LOGDB_BROKER_CONFIG=./logdb-broker/config.yaml cargo run -p logdb-broker
+# (or set the env to this path in the container — see Dockerfile).
+#
+# The broker is the symmetric gateway (cr-037): producers `Produce` and
+# consumers `Consume` BOTH talk only to the broker; it forwards appends to
+# logdbd and Tails logdbd per assigned shard. `num_shards` MUST match logdbd's
+# `shards` config (the broker assigns these round-robin across consumers).
+
+# gRPC port producers/consumers connect to.
+bind_addr: "0.0.0.0:9091"
+
+# logdbd storage backend (the broker appends + tails here; offsets are
+# event-sourced into its `logdb_broker/coord_state` meta stream).
+logdbd_addr: "http://logdbd:50051"
+
+# Must equal logdbd's `shards`.
+num_shards: 4
+
+# Optional Prometheus scrape endpoint (/metrics). Drop this line to disable.
+metrics_addr: "0.0.0.0:9100"

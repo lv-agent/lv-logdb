@@ -1166,10 +1166,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "logdb-broker"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "logdb",
+ "logdb-broker-proto",
+ "logdb-client",
+ "logdbd",
+ "logdbd-proto",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "logdb-broker-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "logdb-client"
 version = "0.3.1"
 dependencies = [
  "logdb",
+ "logdb-broker-proto",
  "logdbd",
  "logdbd-proto",
  "tempfile",

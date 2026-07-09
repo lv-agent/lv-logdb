@@ -170,16 +170,42 @@ impl ShardMap {
         })
     }
 
-    /// Claim a sequence number from the selected shard.
+    /// Select a shard deterministically from a caller-supplied key.
+    ///
+    /// Same key ⇒ same shard, across calls, threads, and process restarts
+    /// (the hash is unseeded). This is the Kafka/Kinesis partitioning model:
+    /// route by entity key (session id, user id, …) so all records for one
+    /// entity land on one shard and stay ordered. Uses CRC32C (already a logdb
+    /// dependency) — deterministic, fast, well-distributed for 1..=256 shards.
+    pub fn select_shard_by_key(&self, key: &[u8]) -> usize {
+        crc32c::crc32c(key) as usize % self.num_shards()
+    }
+
+    /// Claim a sequence number from a caller-specified shard.
+    ///
+    /// Returns `(global_record_id, shard_id, local_seq)`. Used by
+    /// [`LogDb::append_with_key`] after key-based shard selection. Bounds:
+    /// `shard_id` must be `< num_shards()` (panics otherwise, matching
+    /// [`ring`](Self::ring)'s indexing).
+    #[inline]
+    pub fn claim_on_shard(
+        &self,
+        shard_id: usize,
+        policy: QueueFullPolicy,
+    ) -> Result<(u64, usize, u64), AppendError> {
+        let ring = &self.rings[shard_id];
+        let local_seq = ring.claim(policy)?;
+        let global_id = encode_record_id(shard_id, local_seq, self.shard_bits);
+        Ok((global_id, shard_id, local_seq))
+    }
+
+    /// Claim a sequence number from the thread-affine-selected shard.
     ///
     /// Returns `(global_record_id, shard_id, local_seq)`.
     #[inline]
     pub fn claim(&self, policy: QueueFullPolicy) -> Result<(u64, usize, u64), AppendError> {
         let shard_id = self.select_shard();
-        let ring = &self.rings[shard_id];
-        let local_seq = ring.claim(policy)?;
-        let global_id = encode_record_id(shard_id, local_seq, self.shard_bits);
-        Ok((global_id, shard_id, local_seq))
+        self.claim_on_shard(shard_id, policy)
     }
 
     /// Atomically reserve `n` consecutive sequences on the selected shard for a
@@ -380,5 +406,68 @@ mod tests {
         // Not all threads should go to the same shard
         let unique: HashSet<usize> = shard_ids.iter().copied().collect();
         assert!(unique.len() > 1, "threads should distribute across shards");
+    }
+
+    // ── key-based routing (cr-037) ───────────────────────────────────────────
+
+    #[test]
+    fn select_shard_by_key_is_deterministic() {
+        let sm = ShardMap::new(8, 8192, false, 0);
+        let key = b"session-42";
+        let s = sm.select_shard_by_key(key);
+        for _ in 0..50 {
+            assert_eq!(
+                sm.select_shard_by_key(key),
+                s,
+                "same key must always map to the same shard"
+            );
+        }
+    }
+
+    #[test]
+    fn select_shard_by_key_within_bounds() {
+        let sm = ShardMap::new(16, 8192, false, 0);
+        for i in 0..1000u32 {
+            let s = sm.select_shard_by_key(&i.to_le_bytes());
+            assert!(s < 16, "shard {s} out of bounds for num_shards=16");
+        }
+    }
+
+    #[test]
+    fn select_shard_by_key_distributes() {
+        use std::collections::HashSet;
+        let sm = ShardMap::new(8, 8192, false, 0);
+        let mut unique = HashSet::new();
+        for i in 0..1000u32 {
+            unique.insert(sm.select_shard_by_key(format!("key-{i}").as_bytes()));
+        }
+        // 1000 distinct keys over 8 shards should exercise all of them.
+        assert_eq!(
+            unique.len(),
+            8,
+            "poor distribution: only {} of 8 shards used",
+            unique.len()
+        );
+    }
+
+    #[test]
+    fn select_shard_by_key_single_shard() {
+        let sm = ShardMap::new(1, 8192, false, 0);
+        for key in [b"".as_slice(), b"a", b"some-long-session-key"] {
+            assert_eq!(sm.select_shard_by_key(key), 0);
+        }
+    }
+
+    #[test]
+    fn claim_on_shard_uses_specified_shard() {
+        let sm = ShardMap::new(4, 8192, false, 0);
+        for target in 0..4 {
+            let (global_id, shard_id, local_seq) =
+                sm.claim_on_shard(target, QueueFullPolicy::Block).unwrap();
+            assert_eq!(shard_id, target, "claim_on_shard returned the wrong shard");
+            let (decoded_shard, decoded_seq) = decode_record_id(global_id, sm.shard_bits());
+            assert_eq!(decoded_shard, target);
+            assert_eq!(decoded_seq, local_seq);
+        }
     }
 }

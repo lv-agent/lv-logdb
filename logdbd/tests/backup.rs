@@ -33,7 +33,7 @@ fn write_records(data_dir: &Path) -> Vec<Vec<u8>> {
     for i in 0..5u32 {
         let content = format!("record-{i}").into_bytes();
         storage
-            .append(1, 1, "evt", "application/json", &meta, i as u64, &content)
+            .append(1, 1, "evt", "application/json", &meta, i as u64, &content, None)
             .unwrap();
         contents.push(content);
     }

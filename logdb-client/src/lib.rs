@@ -18,6 +18,9 @@
 mod client;
 mod record;
 
+#[cfg(feature = "broker")]
+pub mod broker;
+
 pub use client::{Client, ClientBuilder, TailOptions};
 pub use record::RecordExt;
 

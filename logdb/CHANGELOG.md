@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Key-based shard routing** (cr-037): `ShardMap::select_shard_by_key(key)` routes
+  records by deterministic CRC32C hash — same key ⇒ same shard (Kafka/Kinesis
+  partitioning model). `LogDb::append_with_key(content, shard_key)` adds a
+  caller-controlled shard route; the existing thread-affine `append` is
+  unchanged. `ShardMap::claim_on_shard(shard_id, policy)` lets the caller CAS-
+  claim a specific shard (used by `append_with_key` and the logdb-broker).
+
 ## [0.5.0] — 2026-07-08
 
 ### Added

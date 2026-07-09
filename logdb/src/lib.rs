@@ -543,8 +543,32 @@ impl LogDb {
         Ok(first_id)
     }
 
-    /// Append a record to the log. Returns the global record_id.
+    /// Append a record to the log, routed by thread affinity.
+    /// Returns the global record_id.
     pub fn append(&self, content: &[u8]) -> Result<u64, AppendError> {
+        let shard_id = self.inner.shards.select_shard();
+        self.append_routed(content, shard_id)
+    }
+
+    /// Append a record to the log, routed by a caller-supplied key.
+    ///
+    /// Same `shard_key` ⇒ same shard (deterministic CRC32C routing via
+    /// [`ShardMap::select_shard_by_key`]), so all records for one entity
+    /// (session/user id) land on one shard and stay ordered. This is the
+    /// partitioning model the logdb-broker (cr-037) builds consumer-group work
+    /// distribution on. Returns the global record_id.
+    pub fn append_with_key(&self, content: &[u8], shard_key: &[u8]) -> Result<u64, AppendError> {
+        let shard_id = self.inner.shards.select_shard_by_key(shard_key);
+        self.append_routed(content, shard_id)
+    }
+
+    /// Shared append path: validate, claim a slot on `shard_id`, write, publish.
+    ///
+    /// `shard_id` must be `< num_shards()` (enforced by
+    /// [`ShardMap::claim_on_shard`]). The two public entry points
+    /// ([`append`](Self::append) via thread affinity, [`append_with_key`](Self::append_with_key)
+    /// via key) only differ in how `shard_id` is chosen.
+    fn append_routed(&self, content: &[u8], shard_id: usize) -> Result<u64, AppendError> {
         let inner = &self.inner;
 
         // Health check (self-healing)
@@ -569,9 +593,10 @@ impl LogDb {
         }
         let _guard = scopeguard::guard((), |_| inner.shutdown.leave());
 
-        // CAS claim via shard map (v1.1 multi-shard)
-        let (global_id, shard_id, local_seq) =
-            inner.shards.claim(inner.config.queue_full_policy)?;
+        // CAS claim on the selected shard.
+        let (global_id, _, local_seq) = inner
+            .shards
+            .claim_on_shard(shard_id, inner.config.queue_full_policy)?;
 
         // Write slot (safety: claim guarantees exclusive access). Slot is indexed
         // by LOCAL seq; record_id stores the GLOBAL id so read-back by global id

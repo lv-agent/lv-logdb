@@ -1,0 +1,828 @@
+//! Phase 3 end-to-end: broker forwards logdbd records to consumers, partitioned
+//! by assigned shard. The broker is in the data path: producer → logdbd,
+//! logdbd →(Tail)→ broker →(Consume)→ consumer.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::StreamExt;
+use tonic::transport::Server;
+
+use logdb::{Config as DbConfig, LogDb};
+use logdbd::catalog::Catalog;
+use logdbd::consumer::ConsumerTracker;
+use logdbd::service::LogDbServiceImpl;
+use logdbd::storage::Storage;
+use logdbd::subscribe::SubscribeHub;
+use logdbd_proto::pb::log_db_service_server::LogDbServiceServer;
+
+use logdb_broker::coordinator::CoordinatorRegistry;
+use logdb_broker::forwarder::Forwarder;
+use logdb_broker::persistence::{OffsetRecord, Persistence};
+use logdb_broker::service::BrokerServiceImpl;
+use logdb_broker_proto::pb::broker_service_client::BrokerServiceClient;
+use logdb_broker_proto::pb::broker_service_server::BrokerServiceServer;
+use logdb_broker_proto::pb::{
+    consume_response::Payload, CommitShardOffsetRequest, ConsumeRequest, JoinGroupRequest,
+    ProduceRequest,
+};
+
+// ── Harness ──────────────────────────────────────────────────────────────────
+
+async fn start_logdbd(shards: usize) -> (std::net::SocketAddr, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = DbConfig::default();
+    cfg.data_dir = dir.path().to_path_buf();
+    cfg.ring_size = 256;
+    cfg.shards = shards;
+    cfg.durability_mode = logdb::DurabilityMode::Sync;
+    cfg.flush_timeout = Duration::from_secs(5);
+    let db = LogDb::open(cfg).unwrap();
+    let storage = Arc::new(Storage::new(db, shards));
+    let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
+    let svc = LogDbServiceImpl::new(
+        Arc::clone(&storage),
+        catalog,
+        Arc::new(ConsumerTracker::new(None)),
+        Arc::new(SubscribeHub::new()),
+        "logdbd-node".into(),
+        "primary".into(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(LogDbServiceServer::new(svc))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    (addr, dir)
+}
+
+async fn start_broker(logdbd_addr: String, num_shards: u32) -> std::net::SocketAddr {
+    let forwarder = Forwarder::connect(logdbd_addr.clone()).await.unwrap();
+    let persistence = Persistence::connect(logdbd_addr).await.unwrap();
+    persistence.ensure_meta_stream().await.unwrap();
+    let registry = Arc::new(CoordinatorRegistry::new(num_shards));
+    // Recover committed offsets (a fresh broker re-reads the meta stream).
+    for rec in persistence.scan_offsets().await.unwrap() {
+        registry.commit_offset(&rec.ns, &rec.stream, &rec.group, rec.shard, rec.seq);
+    }
+    let svc = BrokerServiceImpl::new(registry, Some(forwarder), Some(persistence));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(BrokerServiceServer::new(svc))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+async fn drain_consume(
+    stream: &mut tonic::codec::Streaming<logdb_broker_proto::pb::ConsumeResponse>,
+    window: Duration,
+) -> std::collections::HashSet<String> {
+    let mut got = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(Ok(Some(resp))) = tokio::time::timeout(Duration::from_millis(200), stream.message()).await {
+            if let Some(Payload::Record(r)) = resp.payload {
+                got.insert(String::from_utf8_lossy(&r.content).into_owned());
+            }
+        }
+    }
+    got
+}
+
+/// Like [`drain_consume`] but returns `(shard_id, seq)` per record (for offset
+/// tests that need to attribute records to shards).
+async fn drain_consume_shards(
+    stream: &mut tonic::codec::Streaming<logdb_broker_proto::pb::ConsumeResponse>,
+    window: Duration,
+) -> Vec<(u32, u64)> {
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(Ok(Some(resp))) = tokio::time::timeout(Duration::from_millis(200), stream.message()).await {
+            if let Some(Payload::Record(r)) = resp.payload {
+                got.push((r.shard_id, r.seq));
+            }
+        }
+    }
+    got
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+fn off(ns: &str, s: &str, g: &str, shard: u32, seq: u64) -> OffsetRecord {
+    OffsetRecord {
+        ns: ns.into(),
+        stream: s.into(),
+        group: g.into(),
+        shard,
+        seq,
+    }
+}
+
+#[tokio::test]
+async fn persistence_round_trips_offsets_to_logdbd() {
+    let (logdbd_addr, _ldir) = start_logdbd(4).await;
+    let pers = Persistence::connect(format!("http://{logdbd_addr}"))
+        .await
+        .unwrap();
+    pers.ensure_meta_stream().await.unwrap();
+    pers.append_offset(off("ns", "s", "g", 1, 5)).await.unwrap();
+    pers.append_offset(off("ns", "s", "g", 1, 8)).await.unwrap();
+    pers.append_offset(off("ns", "s", "g", 2, 3)).await.unwrap();
+
+    // Give logdbd a moment to make the appends durable/scannable.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let recs = pers.scan_offsets().await.unwrap();
+    let pairs: std::collections::HashSet<(u32, u64)> =
+        recs.iter().map(|r| (r.shard, r.seq)).collect();
+    assert!(pairs.contains(&(1, 5)), "shard1 seq5 must be replayable");
+    assert!(pairs.contains(&(1, 8)), "shard1 seq8 must be replayable");
+    assert!(pairs.contains(&(2, 3)), "shard2 seq3 must be replayable");
+}
+
+#[tokio::test]
+async fn single_consumer_receives_all_keyed_records_via_broker() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+
+    // The client talks ONLY to the broker — produce and consume both go through
+    // it (symmetric gateway, Pulsar model A). logdbd is the unseen backend.
+    let mut broker = BrokerServiceClient::connect(format!("http://{broker_addr}"))
+        .await
+        .unwrap();
+    for i in 0..8u32 {
+        let key = format!("key-{i}");
+        broker
+            .produce(ProduceRequest {
+                namespace: "ns".into(),
+                stream: "s".into(),
+                event_type: "e".into(),
+                content: key.as_bytes().to_vec(),
+                shard_key: Some(key.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Sole consumer owns all shards; its join generation is current.
+    let r = broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut consume = broker
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+            generation: r.generation,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let got = drain_consume(&mut consume, Duration::from_millis(500)).await;
+    assert_eq!(got.len(), 8, "sole consumer must receive all 8 records via broker");
+}
+
+#[tokio::test]
+async fn two_consumers_partition_records_by_assigned_shard() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+
+    // Produce via the broker (symmetric gateway); the test never touches logdbd.
+    let mut broker = BrokerServiceClient::connect(format!("http://{broker_addr}"))
+        .await
+        .unwrap();
+    let mut all = std::collections::HashSet::new();
+    for i in 0..16u32 {
+        let key = format!("key-{i}");
+        broker
+            .produce(ProduceRequest {
+                namespace: "ns".into(),
+                stream: "s".into(),
+                event_type: "e".into(),
+                content: key.as_bytes().to_vec(),
+                shard_key: Some(key.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        all.insert(key);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Join both. c1's join-time generation (1) goes stale when c2 joins (→2);
+    // Phase 3 has no rebalance-push, so each consumer re-joins (a no-op that
+    // returns the CURRENT generation + assignment) before consuming. Phase 5
+    // replaces this with the rebalance protocol on the Consume stream.
+    broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap();
+    broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c2".into(),
+        })
+        .await
+        .unwrap();
+    let c1 = broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let c2 = broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c2".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(c1.generation, c2.generation, "both synced to current generation");
+
+    let mut consume_a = broker
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+            generation: c1.generation,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut consume_b = broker
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c2".into(),
+            generation: c2.generation,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let got_a = drain_consume(&mut consume_a, Duration::from_millis(600)).await;
+    let got_b = drain_consume(&mut consume_b, Duration::from_millis(600)).await;
+
+    // Disjoint: no record delivered to both.
+    for k in &got_a {
+        assert!(!got_b.contains(k), "record {k} delivered to both consumers");
+    }
+    // Complete: together they cover all 16.
+    let mut union = got_a.clone();
+    union.extend(got_b.iter().cloned());
+    assert_eq!(union.len(), 16, "two consumers together must cover all 16 records");
+    assert_eq!(union, all);
+    // Real split: neither consumer starved.
+    assert!(!got_a.is_empty() && !got_b.is_empty(), "records must split across both");
+}
+
+#[tokio::test]
+async fn consume_rejects_stale_generation() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let mut broker = BrokerServiceClient::connect(format!("http://{broker_addr}"))
+        .await
+        .unwrap();
+    broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap();
+    broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c2".into(),
+        })
+        .await
+        .unwrap(); // generation now 2
+
+    // c1's stale generation 1 must be rejected (FailedPrecondition).
+    let err = broker
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+            generation: 1,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn broker_restart_recovers_committed_offsets() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+
+    // Broker instance #1: commit an offset → it persists to the meta stream.
+    let broker1 = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let mut c1 = BrokerServiceClient::connect(format!("http://{broker1}"))
+        .await
+        .unwrap();
+    let r = c1
+        .commit_shard_offset(CommitShardOffsetRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            shard_id: 2,
+            committed_seq: 5,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(r.advanced, "first commit of seq 5 must advance");
+    // give the meta-stream append a moment to become durable/scannable
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // "Restart": a fresh broker instance (#2) recovers from the same logdbd.
+    // (broker1's task is simply abandoned — its in-memory state is gone.)
+    let broker2 = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let mut c2 = BrokerServiceClient::connect(format!("http://{broker2}"))
+        .await
+        .unwrap();
+
+    // A stale commit (seq 3 < recovered 5) must NOT advance → proves recovery.
+    let stale = c2
+        .commit_shard_offset(CommitShardOffsetRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            shard_id: 2,
+            committed_seq: 3,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !stale.advanced,
+        "recovered offset (5) must reject the stale commit (3)"
+    );
+
+    // A higher commit (7 > 5) advances and re-persists.
+    let higher = c2
+        .commit_shard_offset(CommitShardOffsetRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            shard_id: 2,
+            committed_seq: 7,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(higher.advanced, "seq 7 must advance past recovered 5");
+}
+
+#[tokio::test]
+async fn consume_resumes_from_committed_offset_per_shard() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let mut broker = BrokerServiceClient::connect(format!("http://{broker_addr}"))
+        .await
+        .unwrap();
+
+    // Produce 12 key-routed records.
+    for i in 0..12u32 {
+        let key = format!("key-{i}");
+        broker
+            .produce(ProduceRequest {
+                namespace: "ns".into(),
+                stream: "s".into(),
+                event_type: "e".into(),
+                content: key.as_bytes().to_vec(),
+                shard_key: Some(key),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Sole consumer owns all shards; consume everything (records carry shard_id).
+    let j = broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut consume = broker
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+            generation: j.generation,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let recs = drain_consume_shards(&mut consume, Duration::from_millis(600)).await;
+    assert_eq!(recs.len(), 12, "must receive all 12 records");
+    assert!(
+        recs.iter().all(|(s, _)| *s < shards),
+        "every record must carry a stamped shard_id < {shards}"
+    );
+
+    // Commit each shard's max seq.
+    drop(consume);
+    let mut max: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for (shard, seq) in &recs {
+        let m = max.entry(*shard).or_insert(0);
+        if *seq > *m {
+            *m = *seq;
+        }
+    }
+    for (shard, seq) in &max {
+        broker
+            .commit_shard_offset(CommitShardOffsetRequest {
+                namespace: "ns".into(),
+                stream: "s".into(),
+                group: "g".into(),
+                shard_id: *shard,
+                committed_seq: *seq,
+            })
+            .await
+            .unwrap();
+    }
+
+    // Re-consume: with every shard caught up to its max, nothing re-delivers.
+    let mut consume2 = broker
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "c1".into(),
+            generation: j.generation,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let recs2 = drain_consume_shards(&mut consume2, Duration::from_millis(500)).await;
+    assert!(
+        recs2.is_empty(),
+        "after committing each shard's max seq, re-consume must deliver nothing (got {:?})",
+        recs2
+    );
+
+    // Produce one more record; re-consume must deliver ONLY it.
+    broker
+        .produce(ProduceRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            event_type: "e".into(),
+            content: b"key-new".to_vec(),
+            shard_key: Some("key-new".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let recs3 = drain_consume_shards(&mut consume2, Duration::from_millis(500)).await;
+    assert_eq!(recs3.len(), 1, "only the newly produced record delivers");
+}
+
+#[tokio::test]
+async fn group_consumer_sdk_round_trips_consume_and_commit() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let url = format!("http://{broker_addr}");
+
+    // Produce via the broker SDK (BrokerProducer → broker → logdbd).
+    let mut producer = logdb_client::broker::BrokerProducer::connect(url.clone())
+        .await
+        .unwrap();
+    let mut keys = Vec::new();
+    for i in 0..8u32 {
+        let key = format!("key-{i}");
+        producer
+            .produce("ns", "s", "e", key.as_bytes(), Some(&key))
+            .await
+            .unwrap();
+        keys.push(key);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Consume via the broker SDK (GroupConsumer → broker → logdbd).
+    let mut consumer =
+        logdb_client::broker::GroupConsumer::join(url.clone(), "ns", "s", "g", "c1")
+            .await
+            .unwrap();
+    assert!(!consumer.assigned_shards().is_empty());
+    let stream = consumer.consume().await.unwrap();
+
+    // Drain the SDK record stream.
+    let mut got: Vec<(u32, u64, String)> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    let mut stream = stream;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(Some(Ok(r))) = tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
+            got.push((
+                r.shard_id,
+                r.seq,
+                String::from_utf8_lossy(&r.content).into_owned(),
+            ));
+        }
+    }
+    assert_eq!(got.len(), 8, "SDK consumer must receive all 8 records");
+    assert!(
+        got.iter().all(|(s, _, _)| *s < shards),
+        "records carry stamped shard_id < {shards}"
+    );
+    let got_keys: std::collections::HashSet<String> = got.iter().map(|(_, _, k)| k.clone()).collect();
+    assert_eq!(got_keys.len(), 8);
+
+    // Commit each shard's max seq, then re-consume → nothing (caught up).
+    drop(stream);
+    let mut max: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for (shard, seq, _) in &got {
+        let m = max.entry(*shard).or_insert(0);
+        if *seq > *m {
+            *m = *seq;
+        }
+    }
+    for (shard, seq) in &max {
+        assert!(
+            consumer.commit_shard(*shard, *seq).await.unwrap(),
+            "commit must advance"
+        );
+    }
+    let stream2 = consumer.consume().await.unwrap();
+    let mut got2 = 0;
+    let deadline2 = tokio::time::Instant::now() + Duration::from_millis(400);
+    let mut stream2 = stream2;
+    loop {
+        if tokio::time::Instant::now() >= deadline2 {
+            break;
+        }
+        if let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_millis(200), stream2.next()).await
+        {
+            got2 += 1;
+        }
+    }
+    assert_eq!(got2, 0, "after committing all shards, re-consume delivers nothing");
+
+    // Leave cleanly.
+    consumer.leave().await.unwrap();
+}
+
+#[tokio::test]
+async fn active_consume_stream_rebalances_on_join() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+    let broker_addr = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let mut broker = BrokerServiceClient::connect(format!("http://{broker_addr}"))
+        .await
+        .unwrap();
+
+    // Produce 16 key-routed records (spread across shards).
+    for i in 0..16u32 {
+        let key = format!("key-{i}");
+        broker
+            .produce(ProduceRequest {
+                namespace: "ns".into(),
+                stream: "s".into(),
+                event_type: "e".into(),
+                content: key.as_bytes().to_vec(),
+                shard_key: Some(key),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Consumer A joins (sole member → owns all 4 shards) and starts consuming.
+    let a = broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "a".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut stream_a = broker
+        .consume(ConsumeRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "a".into(),
+            generation: a.generation,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Drain A's initial delivery (all shards).
+    let _ = drain_consume_shards(&mut stream_a, Duration::from_millis(300)).await;
+
+    // B joins → generation bumps to 2, A's assignment becomes {0,2} (round-robin
+    // split). The join triggers a stop-the-world rebalance pushed onto A's OPEN
+    // stream: RebalanceSignal then Assignment.
+    let b = broker
+        .join_group(JoinGroupRequest {
+            namespace: "ns".into(),
+            stream: "s".into(),
+            group: "g".into(),
+            consumer_id: "b".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(b.generation, 2);
+
+    // Drain A's stream for the rebalance frames + post-rebalance records.
+    let mut saw_rebalance = false;
+    let mut assignment_shards: Option<Vec<u32>> = None;
+    let mut post_records: Vec<u32> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+    let mut past_assignment = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(Some(resp))) = tokio::time::timeout(Duration::from_millis(200), stream_a.message()).await {
+            match resp.payload {
+                Some(Payload::Rebalance(_)) => saw_rebalance = true,
+                Some(Payload::Assignment(a_msg)) => {
+                    assert_eq!(a_msg.generation, 2, "assignment carries the new generation");
+                    let mut s = a_msg.shards.clone();
+                    s.sort();
+                    assert_eq!(s, vec![0, 2], "A's new assignment is the round-robin half {{0,2}}");
+                    assignment_shards = Some(a_msg.shards.clone());
+                    past_assignment = true;
+                }
+                Some(Payload::Record(r)) if past_assignment => post_records.push(r.shard_id),
+                _ => {}
+            }
+        }
+    }
+
+    assert!(saw_rebalance, "A's open stream must receive a RebalanceSignal");
+    let assigned = assignment_shards.expect("A's open stream must receive an Assignment");
+    assert!(
+        !post_records.is_empty(),
+        "A must receive records after the rebalance (forward task restarted)"
+    );
+    assert!(
+        post_records.iter().all(|s| assigned.contains(s)),
+        "post-rebalance records must be from A's NEW shards {:?}, got {:?}",
+        assigned,
+        post_records
+    );
+}
+
+#[tokio::test]
+async fn sdk_consumer_resumes_from_committed_offset_after_broker_restart() {
+    let shards = 4u32;
+    let (logdbd_addr, _ldir) = start_logdbd(shards as usize).await;
+
+    // ── broker instance #1: produce + consume + commit ──────────────────────
+    let broker1 = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let url1 = format!("http://{broker1}");
+
+    let mut producer =
+        logdb_client::broker::BrokerProducer::connect(url1.clone())
+            .await
+            .unwrap();
+    for i in 0..8u32 {
+        let key = format!("key-{i}");
+        producer
+            .produce("ns", "s", "e", key.as_bytes(), Some(&key))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut consumer1 =
+        logdb_client::broker::GroupConsumer::join(url1, "ns", "s", "g", "c1")
+            .await
+            .unwrap();
+    let mut stream1 = consumer1.consume().await.unwrap();
+
+    // Drain all records; collect the max seq per shard for the commit.
+    let mut rec_count = 0u64;
+    let mut max: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(Some(Ok(r))) =
+            tokio::time::timeout(Duration::from_millis(200), stream1.next()).await
+        {
+            rec_count += 1;
+            let m = max.entry(r.shard_id).or_insert(0);
+            if r.seq > *m {
+                *m = r.seq;
+            }
+        }
+    }
+    assert_eq!(rec_count, 8, "must receive all 8 records");
+    drop(stream1);
+
+    // Commit every shard's max seq.
+    for (shard, seq) in &max {
+        assert!(
+            consumer1.commit_shard(*shard, *seq).await.unwrap(),
+            "commit shard {shard} seq {seq}"
+        );
+    }
+    // Do NOT call leave — the broker crashes (abandoned), simulating a restart.
+    drop(consumer1);
+
+    // ── broker instance #2 (simulated restart): offsets recovered ──────────
+    tokio::time::sleep(Duration::from_millis(200)).await; // let meta-stream commits go durable
+    let broker2 = start_broker(format!("http://{logdbd_addr}"), shards).await;
+    let url2 = format!("http://{broker2}");
+
+    // Fresh GroupConsumer connecting to the restarted broker. Membership was
+    // transient (not persisted), so we join fresh. Offsets ARE recovered
+    // from the meta stream — re-consume must deliver zero records.
+    let mut consumer2 =
+        logdb_client::broker::GroupConsumer::join(url2.clone(), "ns", "s", "g", "c1")
+            .await
+            .unwrap();
+    let stream2 = consumer2.consume().await.unwrap();
+    let mut got = 0u64;
+    let deadline2 = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut pinned = stream2;
+    loop {
+        if tokio::time::Instant::now() >= deadline2 {
+            break;
+        }
+        if let Ok(Some(Ok(_))) =
+            tokio::time::timeout(Duration::from_millis(200), pinned.next()).await
+        {
+            got += 1;
+        }
+    }
+    assert_eq!(
+        got, 0,
+        "restarted broker must resume from committed offsets — nothing re-delivers"
+    );
+    consumer2.leave().await.unwrap();
+}

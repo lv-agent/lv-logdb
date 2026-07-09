@@ -11,6 +11,14 @@ repository = "https://github.com/lv-agent/lv-logdb"
 logdbd-proto = { version = "0.3.1", path = "../logdbd-proto" }
 tonic = { version = "0.12", features = ["tls"] }
 tokio = { version = "1", features = ["full"] }
+# Optional broker SDK (cr-037): enable with the `broker` feature. Keeps the
+# default publishable (logdb-broker-proto isn't published yet).
+logdb-broker-proto = { version = "0.1.0", path = "../logdb-broker-proto", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
+[features]
+default = []
+broker = ["dep:logdb-broker-proto", "dep:tokio-stream"]
 
 [dev-dependencies]
 logdbd = { version = "0.7.0", path = "../logdbd" }

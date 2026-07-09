@@ -33,7 +33,7 @@ assert_eq!(record.content, b"hello");
 - **WAL checkpoint**：持久化到 `checkpoint.dat`，崩溃后自动恢复
 - **原子批量写入**：`append_batch()` 整批写入一个帧，要么全在要么全不在
 - **崩溃恢复**：torn write 检测 + 截断 + 哈希链验证
-- **分片**：多 Ring 支持高核心数线性扩展
+- **分片**：多 Ring 支持高核心数线性扩展。`select_shard_by_key(key)` 按 key 确定性路由（CRC32C），同 key → 同 shard（Kafka/Kinesis 分区模式）。`append_with_key(content, key)` 配合 [logdb-broker](../logdb-broker/README_CN.md) 实现 consumer group 工作分发
 - **远程推送**（`remote-push` feature）：异步推送持久化记录到远端，不反压本地写入
 - **段预分配**：80% 容量时提前创建下一个 segment，滚动零阻塞
 

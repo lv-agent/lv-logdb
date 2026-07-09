@@ -151,6 +151,32 @@ let mut client = ClientBuilder::new("logdbd.example.com:50051")
 // subscribe requires Subscriber, create/delete stream requires Admin.
 ```
 
+## Broker SDK (cr-037)
+
+Enable the `broker` feature for consumer-group coordination via [logdb-broker](../logdb-broker/README.md):
+
+```toml
+[dependencies]
+logdb-client = { version = "0.4", features = ["broker"] }
+```
+
+```rust
+use logdb_client::broker::{BrokerProducer, GroupConsumer};
+
+// Producer (symmetric gateway — talks only to the broker)
+let mut p = BrokerProducer::connect("http://broker:9091").await?;
+p.produce("ns", "s", "evt", b"payload", Some("session-42")).await?;
+
+// Consumer
+let mut c = GroupConsumer::join("http://broker:9091", "ns", "s", "g", "c1").await?;
+let mut stream = c.consume().await?;
+let rec = stream.next().await.unwrap()?;
+c.commit_shard(rec.shard_id, rec.seq).await?;
+c.leave().await?;
+```
+
+See [`logdb-broker/README.md`](../logdb-broker/README.md) for the full architecture.
+
 ## License
 
 Apache-2.0

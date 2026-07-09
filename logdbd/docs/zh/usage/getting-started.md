@@ -244,8 +244,26 @@ sink:
 logdb-exporter exporter.yaml
 ```
 
+## 与 logdb-broker 配合（consumer group 协调）
+
+logdbd 自身提供 shard-aware Tail（`TailRequest.shard_ids`）和 key 路由 Append（`AppendRequest.shard_key`）。配合 [logdb-broker](../../../logdb-broker/README_CN.md) 可以实现 Kafka 风格的 consumer group：
+
+- Broker 将 shard 分配给 consumer group 成员
+- Producer 通过 broker 的 `Produce` RPC 写入（带 `shard_key`）
+- Consumer 通过 broker 的 `Consume` RPC 消费（broker 按分配的 shard Tail logdbd 并转发记录）
+- Offset 持久化到 logdbd meta stream，broker 重启后不丢进度
+- 多 broker 实例支持 per-group leader election（高可用）
+
+```yaml
+# logdb-broker config.yaml — 指向同一个 logdbd
+bind_addr: "0.0.0.0:9091"
+logdbd_addr: "http://logdbd:50051"
+num_shards: 4
+```
+
 ## 下一步
 
 - [配置参考](configuration.md) — 完整配置项说明
 - [开发指南](../dev/building.md) — 编译、测试、贡献
 - [logdb-client SDK](../../../logdb-client/) — Rust SDK API 文档
+- [logdb-broker](../../../logdb-broker/README_CN.md) — Consumer group 协调器

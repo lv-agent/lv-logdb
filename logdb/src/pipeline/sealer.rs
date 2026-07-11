@@ -21,8 +21,10 @@
 //! This module is only available when the `hash-chain` feature is enabled.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use crate::pipeline::committer::WakePair;
 use crate::pipeline::signal::ShutdownState;
 use crate::pipeline::trigger::{Backoff, WaitStrategy};
 use crate::ring::Ring;
@@ -38,6 +40,7 @@ pub fn run_sealer(
     mut next_seq: u64,
     shutdown: Arc<ShutdownState>,
     wait: WaitStrategy,
+    wake: WakePair,
 ) {
     let mut backoff = Backoff::new(wait);
 
@@ -61,7 +64,18 @@ pub fn run_sealer(
                 if shutdown.should_stop(next_seq) {
                     return;
                 }
-                backoff.step();
+                // Block until producer signals, with safety timeout.
+                let &(ref lock, ref cvar) = &*wake;
+                let mut guard = lock.lock().unwrap();
+                if !*guard {
+                    let (g, _) = cvar
+                        .wait_timeout(guard, Duration::from_millis(200))
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard = g;
+                }
+                *guard = false;
+                drop(guard);
+                backoff.reset();
             }
         }
     }
@@ -260,7 +274,10 @@ mod tests {
         let s = Arc::clone(&shutdown);
 
         let handle = std::thread::spawn(move || {
-            run_sealer(r, hash_init, [0u8; 32], 0, s, wait);
+            run_sealer(
+                r, hash_init, [0u8; 32], 0, s, wait,
+                Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+            );
         });
 
         std::thread::sleep(std::time::Duration::from_millis(100));

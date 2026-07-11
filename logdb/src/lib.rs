@@ -273,6 +273,8 @@ struct LogDbInner {
     checkpoint_sequence: Arc<AtomicU64>,
     /// Per-shard cached segment listings (one per shard dir).
     manifests: Vec<Arc<Mutex<reader::SegmentManifest>>>,
+    /// Wake committer/sealer threads when new records are published.
+    committer_wake: pipeline::committer::WakePair,
 }
 
 impl LogDb {
@@ -401,6 +403,11 @@ impl LogDb {
         };
         let wait = config.wait_strategy;
 
+        // Shared condvar wake: producer sets flag + notify_all when new records
+        // are published; committer + sealers block on wait_timeout when idle.
+        let committer_wake: pipeline::committer::WakePair =
+            Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
         // Spawn Committer — passes all rings + per-shard managers for multi-shard polling
         let committer_rings = shards.all_rings().to_vec();
         let committer_flush = Arc::clone(&flush);
@@ -408,6 +415,7 @@ impl LogDb {
         let committer_health = Arc::clone(&health);
         let checkpoint = Arc::new(AtomicU64::new(Self::load_checkpoint(&data_dir)));
         let committer_checkpoint = Arc::clone(&checkpoint);
+        let cw = committer_wake.clone();
         let committer_handle = std::thread::Builder::new()
             .name("logdb-committer".into())
             .spawn(move || {
@@ -421,6 +429,7 @@ impl LogDb {
                     committer_health,
                     committer_checkpoint,
                     wait,
+                    cw,
                 );
             })
             .map_err(OpenError::ThreadSpawn)?;
@@ -440,6 +449,7 @@ impl LogDb {
                 let lh = shard_last_hashes[s];
                 let iseq = initial_seqs[s];
                 let name = format!("logdb-sealer-{}", s);
+                let sw = committer_wake.clone();
                 sealer_handles.push(
                     std::thread::Builder::new()
                         .name(name)
@@ -451,6 +461,7 @@ impl LogDb {
                                 iseq,
                                 sealer_shutdown,
                                 wait,
+                                sw,
                             );
                         })
                         .map_err(OpenError::ThreadSpawn)?,
@@ -483,6 +494,7 @@ impl LogDb {
                 data_dir,
                 checkpoint_sequence: checkpoint,
                 manifests,
+                committer_wake,
             }),
         })
     }
@@ -609,6 +621,13 @@ impl LogDb {
 
         // Publish
         ring.slot(local_seq).publish(local_seq);
+
+        // Wake the committer and sealer threads (they block on condvar when idle).
+        {
+            let &(ref lock, ref cvar) = &*inner.committer_wake;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
 
         metric_counter!("logdb.appends", 1);
         Ok(global_id)

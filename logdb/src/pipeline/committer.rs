@@ -6,8 +6,8 @@
 //! maintains independent cursors; the `committed_cursor`/`durable_cursor` tracked
 //! here are the minimum across all shards (for flush/shutdown gating).
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::config::DurabilityMode;
 use crate::health::{HealthState, HEALTH_DISK_FULL, HEALTH_IO_ERROR};
@@ -19,6 +19,10 @@ use crate::storage::SegmentManager;
 use super::signal::FlushSignal;
 use super::signal::ShutdownState;
 use super::trigger::{Backoff, CommitTrigger, WaitStrategy};
+
+/// Shared condvar wake pair: producer sets flag + notify_all();
+/// committer / sealer threads block on wait_timeout() when idle.
+pub type WakePair = Arc<(Mutex<bool>, Condvar)>;
 
 /// Run the Committer loop over multiple shards.
 ///
@@ -35,6 +39,7 @@ pub fn run_committer(
     health: Arc<HealthState>,
     checkpoint: Arc<std::sync::atomic::AtomicU64>,
     wait: WaitStrategy,
+    wake: WakePair,
 ) {
     let num_shards = rings.len();
     let mut backoff = Backoff::new(wait);
@@ -87,7 +92,19 @@ pub fn run_committer(
             for m in seg_mgrs.iter_mut() {
                 m.drain_pending_fsyncs();
             }
-            backoff.step();
+            // Block until a producer signals, with a safety timeout so we
+            // never miss work (wake flag prevents lost signals).
+            let &(ref lock, ref cvar) = &*wake;
+            let mut guard = lock.lock().unwrap();
+            if !*guard {
+                let (g, _) = cvar
+                    .wait_timeout(guard, Duration::from_millis(200))
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = g;
+            }
+            *guard = false;
+            drop(guard);
+            backoff.reset();
             continue;
         }
 
@@ -349,6 +366,7 @@ mod tests {
                 health,
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 wait,
+                Arc::new((Mutex::new(false), Condvar::new())), // test wake pair
             );
         });
 
@@ -414,6 +432,7 @@ mod tests {
                 health,
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 wait,
+                Arc::new((Mutex::new(false), Condvar::new())),
             );
         });
 

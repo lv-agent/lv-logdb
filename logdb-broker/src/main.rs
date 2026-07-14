@@ -57,7 +57,23 @@ fn load_config() -> BrokerConfig {
 async fn run(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = config.bind_addr.parse()?;
     let num_shards = config.num_shards;
-    let logdbd_addr = config.logdbd_addr.clone();
+
+    // ── Embedded logdbd (single-process mode) ──────────────────────────────
+    // When enabled the broker starts its own in-process logdbd and connects to
+    // it — no external process needed.  Development / single-binary deploy.
+    let _embedded_guard: Option<EmbeddedLogdbd> = if config.embedded {
+        let g = start_embedded_logdbd(&config).await?;
+        tracing::info!(addr = %g.addr, "embedded logdbd started");
+        Some(g)
+    } else {
+        None
+    };
+    let logdbd_addr = if config.embedded {
+        let g = _embedded_guard.as_ref().unwrap();
+        format!("http://{}", g.addr)
+    } else {
+        config.logdbd_addr.clone()
+    };
 
     // Optional Prometheus /metrics endpoint.
     if let Some(metrics_addr) = &config.metrics_addr {
@@ -155,6 +171,64 @@ async fn run(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("logdb-broker stopped");
     Ok(())
+}
+
+// ── Embedded logdbd (single-process mode) ────────────────────────────────────
+
+struct EmbeddedLogdbd {
+    addr: SocketAddr,
+}
+
+/// Start an in-process logdbd.  Uses `config.data_dir` (default `./data`) for
+/// the log directory.  Returns the bound address for the Forwarder/Persistence.
+async fn start_embedded_logdbd(
+    config: &BrokerConfig,
+) -> Result<EmbeddedLogdbd, Box<dyn std::error::Error>> {
+    use logdbd::catalog::Catalog;
+    use logdbd::consumer::ConsumerTracker;
+    use logdbd::service::LogDbServiceImpl;
+    use logdbd::storage::Storage;
+    use logdbd::subscribe::SubscribeHub;
+    use logdbd_proto::pb::log_db_service_server::LogDbServiceServer;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+
+    let dbg_addr: SocketAddr = config.logdbd_addr.parse()?;
+    let data_dir = config
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    std::fs::create_dir_all(&data_dir)?;
+
+    let mut db_config = logdb::Config::default();
+    db_config.data_dir = data_dir.clone();
+    db_config.shards = config.num_shards as usize;
+    db_config.ring_size = 65536;
+    db_config.durability_mode = logdb::DurabilityMode::Sync;
+    db_config.flush_timeout = std::time::Duration::from_secs(5);
+    let db = logdb::LogDb::open(db_config)?;
+    let num_shards = config.num_shards as usize;
+    let storage = std::sync::Arc::new(Storage::new(db, num_shards));
+    let catalog = std::sync::Arc::new(Catalog::open(&data_dir)?);
+    let svc = LogDbServiceImpl::new(
+        std::sync::Arc::clone(&storage),
+        catalog,
+        std::sync::Arc::new(ConsumerTracker::new(None)),
+        std::sync::Arc::new(SubscribeHub::new()),
+        "embedded-logdbd".into(),
+        "primary".into(),
+    );
+    let listener = tokio::net::TcpListener::bind(dbg_addr).await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(LogDbServiceServer::new(svc))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    Ok(EmbeddedLogdbd { addr })
 }
 
 /// Resolves on SIGTERM (Unix) or Ctrl-C — whichever fires first.

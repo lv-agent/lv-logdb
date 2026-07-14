@@ -10,6 +10,8 @@ repository = "https://github.com/lv-agent/lv-logdb"
 [dependencies]
 logdb-broker-proto = { version = "0.1.0", path = "../logdb-broker-proto" }
 logdbd-proto = { version = "0.4.0", path = "../logdbd-proto" }
+logdbd = { path = "../logdbd" }  # for embedded logdbd mode
+logdb = { path = "../logdb" }    # for embedded logdbd mode
 tonic = { version = "0.12", features = ["transport"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -23,7 +25,6 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false, feat
 
 [dev-dependencies]
 tempfile = "3"
-logdb = { path = "../logdb" }
 logdbd = { path = "../logdbd" }
 logdb-client = { path = "../logdb-client", features = ["broker"] }
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -362,7 +362,7 @@ mod tests {
     fn progress_corruption_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(PROGRESS_FILE);
-        std::fs::write(&path, &[0xFFu8; 12]).unwrap();
+        std::fs::write(&path, [0xFFu8; 12]).unwrap();
         assert!(load_progress(dir.path()).is_none());
     }
 }

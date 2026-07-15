@@ -166,7 +166,7 @@ impl Default for Config {
             segment_size: 256 * 1024 * 1024, // 256MB
             ring_size: 8192,
             shards: 1,
-            max_content_size: 1 * 1024 * 1024, // 1MB
+            max_content_size: 1024 * 1024, // 1MB
             hash_enabled: false,
             compression_enabled: false,
             encryption_keys: None,
@@ -199,7 +199,7 @@ impl Config {
         if self.shards < 1 || self.shards > 256 {
             return Err(ConfigError::InvalidShardCount(self.shards));
         }
-        if self.segment_size < 1 * 1024 * 1024 {
+        if self.segment_size < 1024 * 1024 {
             return Err(ConfigError::SegmentTooSmall(self.segment_size));
         }
         if self.max_content_size > 64 * 1024 * 1024 {
@@ -332,7 +332,7 @@ mod tests {
         // v1.0 has no such constraint — this should validate fine.
         let mut c = Config::default();
         c.ring_size = 8192;
-        c.max_content_size = 1 * 1024 * 1024; // 1MB
+        c.max_content_size = 1024 * 1024; // 1MB
                                               // No arena_size field exists — constraint is gone.
         c.validate().unwrap();
     }

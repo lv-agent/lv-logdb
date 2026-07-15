@@ -65,7 +65,7 @@ pub fn run_sealer(
                     return;
                 }
                 // Block until producer signals, with safety timeout.
-                let &(ref lock, ref cvar) = &*wake;
+                let (lock, cvar) = &*wake;
                 let mut guard = lock.lock().unwrap();
                 if !*guard {
                     let (g, _) = cvar

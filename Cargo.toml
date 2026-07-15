@@ -20,3 +20,19 @@ members = [
   "logdb-broker",
 ]
 exclude = ["logdb/fuzz"]
+
+# Workspace-wide lint policy. A few clippy lints are allowed because they cut
+# against deliberate, pervasive style in this codebase and firing on every site
+# adds noise without value:
+#   - field_reassign_with_default: build structs field-by-field after
+#     `Default::default()` (config / proto request construction) — clearer than
+#     the struct-literal rewrite clippy suggests.
+#   - too_many_arguments: constructors/handlers that take many config params —
+#     a params struct would hurt readability here.
+#   - result_large_err: `Result<_, Status>` / `Result<_, StorageError>` carry a
+#     large error type by design (tonic::Status); already allowed per-item in
+#     places (e.g. forwarder.rs).
+[workspace.lints.clippy]
+field_reassign_with_default = "allow"
+too_many_arguments = "allow"
+result_large_err = "allow"

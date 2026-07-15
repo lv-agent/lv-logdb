@@ -656,7 +656,7 @@ fn substitute_env(raw: &str) -> Result<String, ConfigLoadError> {
                 || result
                     .as_bytes()
                     .last()
-                    .map_or(false, |&b| b == b' ' || b == b'\t'))
+                    .is_some_and(|&b| b == b' ' || b == b'\t'))
         {
             // Start of a YAML comment — pass through everything until EOL, no substitution
             in_comment = true;
@@ -836,7 +836,7 @@ pub fn validate_stream_name(name: &str) -> Result<(), String> {
 
 /// Validate an event_type (1-128, [a-z0-9_.-]).
 pub fn validate_event_type(name: &str) -> Result<(), String> {
-    if name.len() < 1 || name.len() > 128 {
+    if name.is_empty() || name.len() > 128 {
         return Err(format!(
             "event_type '{}' length {} not in [1, 128]",
             name,
@@ -856,7 +856,7 @@ pub fn validate_event_type(name: &str) -> Result<(), String> {
 
 /// Validate a metadata key (1-64, [a-z0-9_.-]).
 pub fn validate_metadata_key(key: &str) -> Result<(), String> {
-    if key.len() < 1 || key.len() > 64 {
+    if key.is_empty() || key.len() > 64 {
         return Err(format!(
             "metadata key '{}' length {} not in [1, 64]",
             key,
@@ -872,6 +872,28 @@ pub fn validate_metadata_key(key: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// Provide a Default for Config that passes validation
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            node: NodeConfig {
+                id: "logdbd".into(),
+                role: NodeRole::Primary,
+                cluster_id: "default".into(),
+                epoch: 1,
+            },
+            server: ServerConfig::default(),
+            logdb: LogDbConfig::default(),
+            storage: StorageConfig::default(),
+            audit: AuditConfig::default(),
+            limits: LimitsConfig::default(),
+            replication: ReplicationConfig::default(),
+            retention: RetentionConfig::default(),
+            observability: ObservabilityConfig::default(),
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1295,27 +1317,5 @@ logdb:
         };
         cfg.logdb.data_dir = PathBuf::from("/tmp/logdbd-test");
         assert!(cfg.validate().is_ok());
-    }
-}
-
-// Provide a Default for Config that passes validation
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            node: NodeConfig {
-                id: "logdbd".into(),
-                role: NodeRole::Primary,
-                cluster_id: "default".into(),
-                epoch: 1,
-            },
-            server: ServerConfig::default(),
-            logdb: LogDbConfig::default(),
-            storage: StorageConfig::default(),
-            audit: AuditConfig::default(),
-            limits: LimitsConfig::default(),
-            replication: ReplicationConfig::default(),
-            retention: RetentionConfig::default(),
-            observability: ObservabilityConfig::default(),
-        }
     }
 }

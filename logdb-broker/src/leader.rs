@@ -53,7 +53,7 @@ enum GroupState {
     /// We hold the lease for this group.
     Leader { epoch: u64 },
     /// Another broker is the leader.
-    Standby { leader: LeaderInfo, last_claim_ms: u64 },
+    Standby { leader: LeaderInfo },
 }
 
 /// Per-group leader election.  Tracks leadership for every group seen in
@@ -179,7 +179,6 @@ impl LeaderElection {
                         address: latest.address.clone(),
                         epoch: latest.epoch,
                     },
-                    last_claim_ms: latest.timestamp_ms,
                 });
             }
             // If the latest claim is stale (age > lease_ms), we leave this
@@ -189,7 +188,7 @@ impl LeaderElection {
         // Try to claim groups without a fresh leader.
         for key in by_group.keys() {
             if !new_state.contains_key(key) {
-                let epoch = 1u64; // will be bumped if we saw an existing claim
+                let _epoch = 1u64; // will be bumped if we saw an existing claim
                 // Find the highest epoch seen for this group.
                 if let Some(claims) = by_group.get(key) {
                     if let Some(max_epoch) = claims.iter().map(|c| c.epoch).max() {

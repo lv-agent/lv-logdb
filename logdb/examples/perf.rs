@@ -228,12 +228,9 @@ fn measure_full_pipeline(db: &LogDb, content: &[u8], label: &str, n: usize) {
     let start = Instant::now();
     for _ in 0..n {
         let t0 = Instant::now();
-        match db.append(content) {
-            Ok(_) => {
-                nanos.push(t0.elapsed().as_nanos() as u64);
-                ok_count += 1;
-            }
-            Err(_) => {}
+        if db.append(content).is_ok() {
+            nanos.push(t0.elapsed().as_nanos() as u64);
+            ok_count += 1;
         }
     }
     let elapsed = start.elapsed();
@@ -283,12 +280,9 @@ fn measure_ring_only(db: &LogDb, content: &[u8], label: &str, n: usize) {
     let start = Instant::now();
     for _ in 0..n {
         let t0 = Instant::now();
-        match db.append(content) {
-            Ok(_) => {
-                nanos.push(t0.elapsed().as_nanos() as u64);
-                ok_count += 1;
-            }
-            Err(_) => {}
+        if db.append(content).is_ok() {
+            nanos.push(t0.elapsed().as_nanos() as u64);
+            ok_count += 1;
         }
     }
     let elapsed = start.elapsed();

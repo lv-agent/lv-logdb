@@ -75,3 +75,6 @@ required-features = ["encryption"]
 [[test]]
 name = "fuzz"
 required-features = ["testing"]
+
+[lints]
+workspace = true

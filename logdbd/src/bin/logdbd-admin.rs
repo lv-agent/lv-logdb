@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // would pass on an empty database.
             let key_ring = match flag(&args, "--config")? {
                 Some(cfg_path) => {
-                    let cfg = logdbd::config::Config::load(&cfg_path)
+                    let cfg = logdbd::config::Config::load(cfg_path)
                         .map_err(|e| format!("load --config {cfg_path}: {e}"))?;
                     cfg.storage
                         .encryption
@@ -147,15 +147,12 @@ async fn cmd_status(
     }
 
     // Also try to get namespace/stream info
-    match client.list_namespaces(ListNamespacesRequest {}).await {
-        Ok(ns) => {
-            let ns_list = ns.into_inner();
-            println!("Namespaces: {}", ns_list.namespaces.len());
-            for n in &ns_list.namespaces {
-                println!("  {:>4}  {}  ({} streams)", n.id, n.name, n.stream_count);
-            }
+    if let Ok(ns) = client.list_namespaces(ListNamespacesRequest {}).await {
+        let ns_list = ns.into_inner();
+        println!("Namespaces: {}", ns_list.namespaces.len());
+        for n in &ns_list.namespaces {
+            println!("  {:>4}  {}  ({} streams)", n.id, n.name, n.stream_count);
         }
-        Err(_) => {}
     }
     Ok(())
 }

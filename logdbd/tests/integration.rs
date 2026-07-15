@@ -181,7 +181,8 @@ async fn append_and_read_roundtrip() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.seq, 1);
-    assert!(resp.gid > 0 || resp.gid == 0); // gid is assigned (u64)
+    // (gid is a 0-indexed u64; no meaningful "is assigned" predicate exists
+    //  for it, so we rely on the seq check above.)
 
     // Wait for committer to make record durable
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -472,13 +473,10 @@ async fn drain_tail_contents(
         if tokio::time::Instant::now() >= deadline {
             break;
         }
-        match tokio::time::timeout(Duration::from_millis(200), stream.message()).await {
-            Ok(Ok(Some(resp))) => {
-                for r in resp.records {
-                    got.insert(String::from_utf8_lossy(&r.content).into_owned());
-                }
+        if let Ok(Ok(Some(resp))) = tokio::time::timeout(Duration::from_millis(200), stream.message()).await {
+            for r in resp.records {
+                got.insert(String::from_utf8_lossy(&r.content).into_owned());
             }
-            _ => {}
         }
     }
     got
@@ -874,7 +872,6 @@ async fn concurrent_appends_produce_gap_free_sequences() {
 
     let mut handles = Vec::new();
     for t in 0..4 {
-        let addr = addr.clone();
         handles.push(tokio::spawn(async move {
             let mut client = LogDbServiceClient::connect(format!("http://{}", addr))
                 .await
@@ -1260,7 +1257,7 @@ async fn out_of_retention_graceful() {
     db_config.durability_mode = logdb::DurabilityMode::Sync;
     db_config.ring_size = 256;
     db_config.shards = 1;
-    db_config.segment_size = 1 * 1024 * 1024; // 1 MiB minimum
+    db_config.segment_size = 1024 * 1024; // 1 MiB minimum
     db_config.flush_timeout = Duration::from_secs(5);
     let db = logdb::LogDb::open(db_config).unwrap();
     let storage = Arc::new(Storage::new(db, 1));
@@ -2271,7 +2268,6 @@ async fn subscribe_concurrent_stress() {
     // 5 concurrent subscribers
     let mut handles = Vec::new();
     for i in 0..5 {
-        let addr = addr.clone();
         handles.push(tokio::spawn(async move {
             let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
                 .await
@@ -2397,7 +2393,6 @@ async fn subscribe_100_concurrent_subscribers_stress() {
     // 100 subscribers
     let mut handles = Vec::new();
     for i in 0..100 {
-        let addr = addr.clone();
         handles.push(tokio::spawn(async move {
             let mut c = LogDbServiceClient::connect(format!("http://{}", addr))
                 .await
@@ -2554,7 +2549,6 @@ async fn subscribe_500_subs_replay_stress() {
     let t1 = Instant::now();
     let mut handles = Vec::new();
     for i in 0..200 {
-        let addr = addr.clone();
         handles.push(tokio::spawn(async move {
             // Retry on connection errors (tonic may refuse under high load)
             let mut c = None;

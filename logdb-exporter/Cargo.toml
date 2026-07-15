@@ -29,3 +29,6 @@ logdbd = { version = "0.8.0", path = "../logdbd" }
 tempfile = "3"
 tokio-stream = "0.1"
 logdb = { version = "0.6.0", path = "../logdb" }
+
+[lints]
+workspace = true

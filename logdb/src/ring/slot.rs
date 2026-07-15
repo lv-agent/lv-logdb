@@ -71,6 +71,7 @@ pub const INLINE_CAP: usize = 256;
 ///
 /// Small records use `Inline` (zero allocation, zero copy).
 /// Large records use `Spill` (heap allocation, noted as slow path).
+#[allow(clippy::large_enum_variant)] // Inline([u8; INLINE_CAP]) is the fast path by design; boxing it would defeat zero-alloc inline storage
 enum ContentStorage {
     /// Small record: content embedded directly in the slot.
     Inline([u8; INLINE_CAP]),

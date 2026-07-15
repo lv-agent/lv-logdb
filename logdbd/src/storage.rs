@@ -59,17 +59,15 @@ impl Storage {
             Ok(iter) => {
                 let mut map: HashMap<u64, BTreeMap<u64, u64>> = HashMap::new();
                 let mut nexts: HashMap<u64, u64> = HashMap::new();
-                for r in iter {
-                    if let Ok(rec) = r {
-                        if let Ok(decoded) = crate::record::decode_record(&rec.content) {
-                            let sid = decoded.stream_id;
-                            map.entry(sid)
-                                .or_insert_with(BTreeMap::new)
-                                .insert(decoded.seq, rec.id.sequence);
-                            let cur = nexts.entry(sid).or_insert(1);
-                            if decoded.seq >= *cur {
-                                *cur = decoded.seq + 1;
-                            }
+                for rec in iter.flatten() {
+                    if let Ok(decoded) = crate::record::decode_record(&rec.content) {
+                        let sid = decoded.stream_id;
+                        map.entry(sid)
+                            .or_default()
+                            .insert(decoded.seq, rec.id.sequence);
+                        let cur = nexts.entry(sid).or_insert(1);
+                        if decoded.seq >= *cur {
+                            *cur = decoded.seq + 1;
                         }
                     }
                 }
@@ -159,7 +157,7 @@ impl Storage {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.entry(stream_id)
-                .or_insert_with(BTreeMap::new)
+                .or_default()
                 .insert(seq, gid);
         }
 
@@ -230,6 +228,14 @@ impl Storage {
     /// Get durable cursor (gid space).
     pub fn durable_gid(&self) -> u64 {
         self.db.durable_cursor()
+    }
+
+    /// Per-shard durable cursors (one entry per shard, in shard order). Unlike
+    /// [`durable_gid`] (the min across shards), this reflects each shard's
+    /// individual flush progress — used to wake long-poll readers when any
+    /// single shard advances (the min can stall on a lagging shard).
+    pub fn durable_cursors(&self) -> Vec<u64> {
+        self.db.durable_cursors()
     }
 
     // ── seq-map checkpoint (fast startup) ────────────────────────────────────
@@ -353,8 +359,8 @@ impl Storage {
         };
 
         // Incremental per-shard scan for records after the checkpoint cursor.
-        for shard in 0..num_shards {
-            let from_gid = logdb::encode_record_id(shard, shard_cursors[shard], shard_bits);
+        for (shard, &cursor) in shard_cursors.iter().enumerate() {
+            let from_gid = logdb::encode_record_id(shard, cursor, shard_bits);
             let iter = match storage.db.scan_shard(shard, from_gid, u64::MAX) {
                 Ok(i) => i,
                 Err(e) => return Err(StorageError::LogDb(format!("incremental scan shard {shard}: {e:?}"))),
@@ -502,14 +508,14 @@ impl Storage {
             .map_err(|e| StorageError::LogDb(format!("replicate: {:?}", e)))?;
 
         // Decode header to rebuild seq→gid mapping
-        let decoded = record::decode_record(raw_content).map_err(|e| StorageError::Record(e))?;
+        let decoded = record::decode_record(raw_content).map_err(StorageError::Record)?;
 
         let mut map = self
             .seq_map
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(decoded.stream_id)
-            .or_insert_with(BTreeMap::new)
+            .or_default()
             .insert(decoded.seq, gid);
         // Update next_seq if needed
         let mut nexts = self
@@ -625,7 +631,7 @@ mod tests {
         st.flush().unwrap();
         // Wait for durable
         for _ in 0..50 {
-            if st.durable_gid() >= r2.gid + 1 {
+            if st.durable_gid() > r2.gid {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));

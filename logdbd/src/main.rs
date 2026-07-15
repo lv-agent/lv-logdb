@@ -32,7 +32,6 @@ use logdbd::pb::snapshot_service_server::SnapshotServiceServer;
 use logdbd::replication::{ReplicationServiceImpl, run_primary_sync};
 use logdbd::service::LogDbServiceImpl;
 use logdbd::snapshot::SnapshotServiceImpl;
-use logdbd::storage::Storage;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,8 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Security: refuse non-loopback without TLS+auth
     let tls_enabled = config.server.tls.mode != logdbd::config::TlsMode::Disabled;
     let auth_enabled = config.server.auth.token_file.is_some();
-    if !listen.ip().is_loopback() && (!tls_enabled || !auth_enabled) {
-        if std::env::var("LOGDBD_ALLOW_INSECURE").as_deref() != Ok("1") {
+    if !listen.ip().is_loopback() && (!tls_enabled || !auth_enabled)
+        && std::env::var("LOGDBD_ALLOW_INSECURE").as_deref() != Ok("1") {
             return Err(format!(
                 "refusing to start: non-loopback bind ({}) without TLS+auth. \
                  Configure server.tls and server.auth in the config file, or set \
@@ -73,7 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-    }
 
     // TLS
     let tls_config = load_server_tls(&config)?;
@@ -107,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let roles: Vec<logdbd::auth::Role> = tc
             .roles
             .iter()
-            .filter_map(|r| logdbd::auth::Role::from_str(r))
+            .filter_map(|r| logdbd::auth::Role::parse(r))
             .collect();
         if roles.is_empty() {
             return Err(format!("token '{}' has no valid roles", tc.token).into());

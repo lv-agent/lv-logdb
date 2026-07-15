@@ -205,9 +205,7 @@ impl Iterator for RecordIter {
     type Item = Result<Record, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.file.is_none() {
-            return None;
-        }
+        self.file.as_ref()?;
 
         if self.is_compressed || self.is_encrypted {
             // ── Frame mode ──

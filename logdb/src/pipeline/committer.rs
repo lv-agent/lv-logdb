@@ -94,7 +94,7 @@ pub fn run_committer(
             }
             // Block until a producer signals, with a safety timeout so we
             // never miss work (wake flag prevents lost signals).
-            let &(ref lock, ref cvar) = &*wake;
+            let (lock, cvar) = &*wake;
             let mut guard = lock.lock().unwrap();
             if !*guard {
                 let (g, _) = cvar
@@ -143,7 +143,7 @@ pub fn run_committer(
         // ── Commit decision ──────────────────────────────────────────
         let batch_count = avail.saturating_sub(committed[si]);
         let batch_bytes_estimate = batch_count.saturating_mul(256) as usize;
-        let time_due = pending_since.map_or(false, |t| t.elapsed() >= trigger.interval);
+        let time_due = pending_since.is_some_and(|t| t.elapsed() >= trigger.interval);
 
         let should_commit = has_any_uncommitted
             && avail > committed[si]

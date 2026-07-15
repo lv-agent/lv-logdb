@@ -239,7 +239,7 @@ pub async fn run_primary_sync(
 
 async fn connect_standby(addr: &str, tls_ca: Option<&[u8]>) -> Option<Channel> {
     if let Some(ca) = tls_ca {
-        let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca.to_vec()));
+        let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca));
         let uri: tonic::transport::Uri = match format!("https://{}", addr).parse() {
             Ok(u) => u,
             Err(e) => {

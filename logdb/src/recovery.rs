@@ -446,6 +446,7 @@ pub fn recover(
 ///
 /// `shard_bits` sets the id stride: within a shard, consecutive record ids
 /// differ by `1 << shard_bits`. For `shards == 1`, `shard_bits == 0` → stride 1.
+#[allow(clippy::type_complexity)] // returns a tuple of scalars; a named struct would be overkill here
 fn scan_last_segment(
     path: &Path,
     segment_id: u32,

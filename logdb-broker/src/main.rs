@@ -56,7 +56,7 @@ fn load_config() -> BrokerConfig {
 
 async fn run(config: BrokerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = config.bind_addr.parse()?;
-    let num_shards = config.num_shards;
+    let _num_shards = config.num_shards;
 
     // ── Embedded logdbd (single-process mode) ──────────────────────────────
     // When enabled the broker starts its own in-process logdbd and connects to

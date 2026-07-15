@@ -63,6 +63,12 @@ impl SubscribePublisher {
     }
 
     fn run(&self) {
+        // Last-seen per-shard durable cursors. The global durable_gid is the
+        // MIN across shards; in an imbalanced multi-shard workload a lagging
+        // shard stalls it, so waking Tails on the min alone would miss records
+        // that are already per-shard durable in other shards (Tails read
+        // per-shard via read_batch). Wake whenever ANY shard advances.
+        let mut last_per_shard = self.storage.durable_cursors();
         while self.running.load(Ordering::Acquire) {
             let durable = self.storage.durable_gid();
             let last = self.last_gid.load(Ordering::Acquire);
@@ -80,14 +86,21 @@ impl SubscribePublisher {
                         }
                         // Half-open [last, durable): everything below durable is done.
                         self.last_gid.store(durable, Ordering::Release);
-                        // Wake blocked Tail handlers (cr-037 long-poll) by
-                        // publishing the new durable gid on the watch channel.
-                        let _ = self.tail_notify.send(durable);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "subscribe publisher scan failed");
                     }
                 }
+            }
+            // Wake blocked Tail handlers when ANY per-shard durable cursor
+            // advanced. The watch value is a monotonic wake token (sum of
+            // per-shard cursors), not a literal gid — it strictly increases on
+            // any shard's progress so `watch` always notifies waiters.
+            let now = self.storage.durable_cursors();
+            if now != last_per_shard {
+                let wake_token: u64 = now.iter().copied().sum();
+                last_per_shard = now;
+                let _ = self.tail_notify.send(wake_token);
             }
             thread::sleep(POLL_INTERVAL);
         }

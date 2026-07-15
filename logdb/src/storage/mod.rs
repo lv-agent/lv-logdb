@@ -294,15 +294,13 @@ fn encrypt_if_enabled(_key: Option<&[u8; 32]>, plaintext: &[u8]) -> Result<Vec<u
         let cipher = Aes256Gcm::new(key);
         let mut nonce_bytes = [0u8; ENCRYPTION_NONCE_SIZE];
         getrandom::getrandom(&mut nonce_bytes).map_err(|e| {
-            SegmentError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            SegmentError::Io(std::io::Error::other(
                 format!("{:?}", e),
             ))
         })?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ct = cipher.encrypt(nonce, plaintext).map_err(|_| {
-            SegmentError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            SegmentError::Io(std::io::Error::other(
                 "encryption failed",
             ))
         })?;
@@ -508,7 +506,7 @@ impl SegmentManager {
                     #[cfg(feature = "compression")]
                     {
                         let compressed = zstd::encode_all(raw, 0).map_err(|e| {
-                            SegmentError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                            SegmentError::Io(std::io::Error::other(e))
                         })?;
                         encrypt_if_enabled(self.encryption_keys.as_ref().map(|kr| kr.active_slice()), &compressed)?
                     }
@@ -977,7 +975,7 @@ mod tests {
 
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024, // 1MB segment
+            1024 * 1024, // 1MB segment
             false,
             false,
             None,
@@ -1057,7 +1055,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024,
+            1024 * 1024,
             false,
             false,
             None,
@@ -1075,7 +1073,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024,
+            1024 * 1024,
             false,
             false,
             None,
@@ -1100,7 +1098,7 @@ mod tests {
 
         SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024,
+            1024 * 1024,
             false,
             false,
             None,
@@ -1119,7 +1117,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024,
+            1024 * 1024,
             false,
             false,
             None,
@@ -1180,7 +1178,7 @@ mod tests {
 
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024,
+            1024 * 1024,
             false,
             false,
             None,
@@ -1228,7 +1226,7 @@ mod tests {
 
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024,
+            1024 * 1024,
             false,
             false,
             None,
@@ -1272,7 +1270,7 @@ mod tests {
         }
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024,
+            1024 * 1024,
             false,
             false,
             None,
@@ -1318,7 +1316,7 @@ mod tests {
         }
         let mut mgr = SegmentManager::create(
             dir.path().to_path_buf(),
-            1 * 1024 * 1024,
+            1024 * 1024,
             false,
             false,
             None,

@@ -624,7 +624,7 @@ impl LogDb {
 
         // Wake the committer and sealer threads (they block on condvar when idle).
         {
-            let &(ref lock, ref cvar) = &*inner.committer_wake;
+            let (lock, cvar) = &*inner.committer_wake;
             *lock.lock().unwrap() = true;
             cvar.notify_all();
         }
@@ -867,6 +867,13 @@ impl LogDb {
         self.inner.shards.min_durable_cursor()
     }
 
+    /// Per-shard durable cursors (one per shard, in shard order). Unlike
+    /// [`durable_cursor`] (the min), this reflects each shard's individual
+    /// flush progress.
+    pub fn durable_cursors(&self) -> Vec<u64> {
+        self.inner.shards.durable_cursors()
+    }
+
     /// Current health state: `None` if healthy, `Some(code)` if degraded
     /// (e.g. `health::HEALTH_DISK_FULL` on ENOSPC). The state self-heals —
     /// `clear_if_recovered` is checked on each append, so a transient disk-full
@@ -1035,7 +1042,7 @@ impl LogDb {
             let first_local: u64 = if cp <= s as u64 {
                 0
             } else {
-                (cp - s as u64 + stride - 1) / stride // ceil((cp - s) / stride)
+                (cp - s as u64).div_ceil(stride) // ceil((cp - s) / stride)
             };
             count += durable_s.saturating_sub(first_local);
             let wm = (durable_s << bits) | s as u64; // first not-yet-durable gid of shard s
@@ -1191,7 +1198,7 @@ fn count_log_bytes(dir: &std::path::Path) -> u64 {
         for e in entries.flatten() {
             if e.file_name()
                 .to_str()
-                .map_or(false, |n| n.ends_with(".log"))
+                .is_some_and(|n| n.ends_with(".log"))
             {
                 if let Ok(meta) = e.metadata() {
                     total += meta.len();
@@ -1457,7 +1464,7 @@ mod tests {
         config.max_content_size = 100;
 
         let db = LogDb::open(config).unwrap();
-        let err = db.append(&vec![0u8; 200]).unwrap_err();
+        let err = db.append(&[0u8; 200]).unwrap_err();
         assert!(matches!(err, AppendError::ContentTooLarge { .. }));
     }
 
@@ -1612,10 +1619,8 @@ mod tests {
         let reader = reader::Reader::new(manifest, None);
         let mut out = Vec::new();
         if let Ok(iter) = reader.scan(0, u64::MAX) {
-            for r in iter {
-                if let Ok(rec) = r {
-                    out.push(rec.content);
-                }
+            for rec in iter.flatten() {
+                out.push(rec.content);
             }
         }
         out
@@ -1860,7 +1865,7 @@ mod tests {
         let mut config = Config::default();
         config.data_dir = dir.path().to_path_buf();
         config.shards = 1;
-        config.segment_size = 1 * 1024 * 1024; // 1MB minimum
+        config.segment_size = 1024 * 1024; // 1MB minimum
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(60);
@@ -1880,7 +1885,7 @@ mod tests {
             .filter(|e| {
                 e.file_name()
                     .to_str()
-                    .map_or(false, |n| n.ends_with(".log"))
+                    .is_some_and(|n| n.ends_with(".log"))
             })
             .count();
         assert!(
@@ -2470,7 +2475,7 @@ mod tests {
         let mut config = Config::default();
         config.data_dir = dir.path().to_path_buf();
         config.shards = 2;
-        config.segment_size = 1 * 1024 * 1024; // 1MB → rolls quickly with big payloads
+        config.segment_size = 1024 * 1024; // 1MB → rolls quickly with big payloads
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(60);
@@ -2616,7 +2621,7 @@ mod tests {
         let mut config = Config::default();
         config.data_dir = dir.path().to_path_buf();
         config.shards = 2;
-        config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
+        config.segment_size = 1024 * 1024; // 1MB → rolls with 64KB payloads
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(60);
@@ -2701,7 +2706,7 @@ mod tests {
         let mut config = Config::default();
         config.data_dir = dir.path().to_path_buf();
         config.shards = 2;
-        config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
+        config.segment_size = 1024 * 1024; // 1MB → rolls with 64KB payloads
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(60);
@@ -2740,7 +2745,7 @@ mod tests {
                         .filter(|e| {
                             e.file_name()
                                 .to_str()
-                                .map_or(false, |n| n.ends_with(".log"))
+                                .is_some_and(|n| n.ends_with(".log"))
                         })
                         .count()
                         >= 2
@@ -2767,7 +2772,7 @@ mod tests {
         let mut config = Config::default();
         config.data_dir = dir.path().to_path_buf();
         config.shards = 2;
-        config.segment_size = 1 * 1024 * 1024;
+        config.segment_size = 1024 * 1024;
         config.ring_size = 8192;
         config.durability_mode = DurabilityMode::Sync;
         config.flush_timeout = Duration::from_secs(60);
@@ -2805,7 +2810,7 @@ mod tests {
                 .filter(|e| {
                     e.file_name()
                         .to_str()
-                        .map_or(false, |n| n.ends_with(".log"))
+                        .is_some_and(|n| n.ends_with(".log"))
                 })
                 .filter_map(|e| e.metadata().ok())
                 .map(|m| m.len())
@@ -3232,7 +3237,7 @@ mod tests {
         let mut config = Config::default();
         config.data_dir = dir.path().to_path_buf();
         config.shards = 1;
-        config.segment_size = 1 * 1024 * 1024; // 1MB → rolls with 64KB payloads
+        config.segment_size = 1024 * 1024; // 1MB → rolls with 64KB payloads
         config.ring_size = 8192;
         config.compression_enabled = compressed;
         config.encryption_keys = key.map(KeyRing::single);
@@ -3273,7 +3278,7 @@ mod tests {
             .filter(|e| {
                 e.file_name()
                     .to_str()
-                    .map_or(false, |n| n.ends_with(".log"))
+                    .is_some_and(|n| n.ends_with(".log"))
             })
             .count();
         assert!(

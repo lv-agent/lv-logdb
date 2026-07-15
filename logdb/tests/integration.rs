@@ -177,7 +177,7 @@ fn content_too_large_rejected() {
     config.max_content_size = 100;
 
     let db = LogDb::open(config).unwrap();
-    let err = db.append(&vec![0u8; 200]).unwrap_err();
+    let err = db.append(&[0u8; 200]).unwrap_err();
     assert!(matches!(
         err,
         AppendError::ContentTooLarge {
@@ -340,7 +340,7 @@ fn flush_across_multiple_rolls_all_durable() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.data_dir = dir.path().to_path_buf();
-    config.segment_size = 1 * 1024 * 1024; // 1MB → a roll every ~1-2k records
+    config.segment_size = 1024 * 1024; // 1MB → a roll every ~1-2k records
     config.ring_size = 8192;
     config.durability_mode = DurabilityMode::Batch;
     config.flush_timeout = Duration::from_secs(30);

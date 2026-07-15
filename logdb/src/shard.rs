@@ -276,7 +276,7 @@ impl ShardMap {
 
 thread_local! {
     /// Cached shard index for this thread. usize::MAX = not initialized.
-    static THREAD_SHARD_KEY: RefCell<usize> = RefCell::new(usize::MAX);
+    static THREAD_SHARD_KEY: RefCell<usize> = const { RefCell::new(usize::MAX) };
 }
 
 /// Derive a shard index from the current thread's ID.

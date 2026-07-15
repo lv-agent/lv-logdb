@@ -100,13 +100,6 @@ fn main() {
         for _ in 0..num_threads {
             let c = content.clone();
             handles.push(std::thread::spawn(move || {
-                let _db = unsafe {
-                    // We need a db reference here. Since LogDb is Send+Sync,
-                    // we can share a raw pointer. But in practice we use the
-                    // same in-memory DB. Actually this needs Arc<LogDb>.
-                    // For this bench, let's create per-thread DBs.
-                    std::mem::transmute::<_, &LogDb>(&())
-                };
                 let mut lats = Vec::with_capacity(per_thread as usize);
                 for _ in 0..per_thread {
                     let t0 = Instant::now();

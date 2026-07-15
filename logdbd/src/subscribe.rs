@@ -23,6 +23,12 @@ pub struct SubscribeHub {
     senders: RwLock<HashMap<u64, broadcast::Sender<Arc<DecodedRecord>>>>,
 }
 
+impl Default for SubscribeHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SubscribeHub {
     pub fn new() -> Self {
         Self {

@@ -96,7 +96,7 @@ async fn exporter_scans_existing_records() {
 
     // Use exporter's source to scan
     let tls_config = logdb_exporter::config::TlsConfig::default();
-    let mut source = logdb_exporter::source::Source::connect(&[addr.clone()], tls_config)
+    let mut source = logdb_exporter::source::Source::connect(std::slice::from_ref(&addr), tls_config)
         .await
         .unwrap();
     let chunks = source.scan("test", "main", 0, 100).await.unwrap();

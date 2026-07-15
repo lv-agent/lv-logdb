@@ -197,7 +197,7 @@ mod tests {
         let p: Box<dyn KeyProvider> = Box::new(StaticProvider { key: [0x42; 32] });
         let ring = p.resolve().expect("static provider resolves");
         // The ring is real data the core can consume (single active key).
-        assert_eq!(format!("{ring:?}").contains("KeyRing"), true);
+        assert!(format!("{ring:?}").contains("KeyRing"));
     }
 
     #[test]

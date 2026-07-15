@@ -75,8 +75,8 @@ impl Catalog {
     /// Auto-creates namespace and stream if they don't exist.
     /// Persists catalog snapshot after each creation (P0-2 fix).
     pub fn resolve(&self, ns: &str, stream: &str) -> Result<(u32, u64), CatalogError> {
-        validate_namespace_name(ns).map_err(|e| CatalogError::InvalidName(e))?;
-        validate_stream_name(stream).map_err(|e| CatalogError::InvalidName(e))?;
+        validate_namespace_name(ns).map_err(CatalogError::InvalidName)?;
+        validate_stream_name(stream).map_err(CatalogError::InvalidName)?;
 
         let mut created = false;
 
@@ -270,23 +270,23 @@ impl Catalog {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
             let stream_map = self.streams.read().unwrap_or_else(PoisonError::into_inner);
-            let buf = Self::serialize(&ns_map, &stream_map)?;
-            buf
+            
+            Self::serialize(&ns_map, &stream_map)?
         }; // locks dropped
 
         // Blocking I/O without holding catalog locks
         let tmp = self.snapshot_path.with_extension("tmp");
-        let mut f = std::fs::File::create(&tmp).map_err(|e| CatalogError::Io(e))?;
-        f.write_all(&buf).map_err(|e| CatalogError::Io(e))?;
-        f.sync_all().map_err(|e| CatalogError::Io(e))?;
+        let mut f = std::fs::File::create(&tmp).map_err(CatalogError::Io)?;
+        f.write_all(&buf).map_err(CatalogError::Io)?;
+        f.sync_all().map_err(CatalogError::Io)?;
         drop(f);
-        std::fs::rename(&tmp, &self.snapshot_path).map_err(|e| CatalogError::Io(e))?;
+        std::fs::rename(&tmp, &self.snapshot_path).map_err(CatalogError::Io)?;
 
         Ok(())
     }
 
     fn load_snapshot(&mut self) -> Result<(), CatalogError> {
-        let data = std::fs::read(&self.snapshot_path).map_err(|e| CatalogError::Io(e))?;
+        let data = std::fs::read(&self.snapshot_path).map_err(CatalogError::Io)?;
 
         if data.len() < 10 {
             return Err(CatalogError::Corrupted("file too short".into()));
@@ -609,7 +609,7 @@ mod tests {
         let snap_path = dir.path().join("catalog.dat");
 
         // Write garbage
-        std::fs::write(&snap_path, &[0xFFu8; 16]).unwrap();
+        std::fs::write(&snap_path, [0xFFu8; 16]).unwrap();
 
         let err = Catalog::open(dir.path()).unwrap_err();
         assert!(matches!(err, CatalogError::Corrupted(_)));

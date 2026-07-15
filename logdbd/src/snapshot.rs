@@ -65,11 +65,11 @@ fn stream_segments(
         match entry {
             Ok(e) => {
                 let path = e.path();
-                if path.extension().map_or(false, |ext| ext == "log")
+                if path.extension().is_some_and(|ext| ext == "log")
                     && path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .map_or(false, |n| !n.contains("-active"))
+                        .is_some_and(|n| !n.contains("-active"))
                 {
                     files.push(path);
                 }
@@ -132,7 +132,7 @@ pub async fn receive_snapshot(
         // Open new file if needed
         if current_file
             .as_ref()
-            .map_or(true, |(n, _)| *n != chunk.file_name)
+            .is_none_or(|(n, _)| *n != chunk.file_name)
         {
             // Close previous file
             if let Some((_, f)) = current_file.take() {
@@ -175,7 +175,7 @@ fn install_snapshot(target_dir: &Path, tmp_dir: &Path, files: &[String]) -> Resu
     for entry in std::fs::read_dir(target_dir).map_err(|e| format!("read_dir: {}", e))? {
         let entry = entry.map_err(|e| format!("entry: {}", e))?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "log") {
+        if path.extension().is_some_and(|ext| ext == "log") {
             std::fs::remove_file(&path).map_err(|e| format!("remove {:?}: {}", path, e))?;
         }
     }

@@ -120,11 +120,9 @@ async fn scan_stream_replay(
             && rec.seq > last_committed
             && event_types.contains(&rec.event_type)
             && tombstones.is_live(stream_id, rec.seq)
-        {
-            if tx.send(Ok(decoded_to_pb(&rec))).await.is_err() {
+            && tx.send(Ok(decoded_to_pb(&rec))).await.is_err() {
                 return Ok(()); // client disconnected
             }
-        }
     }
     Ok(())
 }
@@ -302,7 +300,6 @@ async fn run_tail_loop(
 
     loop {
         let durable = storage.durable_gid();
-        // Stream- + shard-scoped durable read via the seq_map index (cr-037
         // perf): jump straight to this stream's records instead of decoding
         // every record across every stream. `scan_stream_filtered` uses
         // read_batch which is per-shard durable-gated.
@@ -791,9 +788,8 @@ impl LogDbService for LogDbServiceImpl {
         // Verify seq continuity (no gaps, no duplicates) and record decodes
         let first = records[0].seq;
         let last = records.last().unwrap().seq;
-        let mut expected = first;
-
-        for rec in &records {
+        for (i, rec) in records.iter().enumerate() {
+            let expected = first + i as u64;
             if rec.stream_id != stream_id {
                 return Ok(Response::new(pb::VerifyChainResponse {
                     ok: false,
@@ -817,7 +813,6 @@ impl LogDbService for LogDbServiceImpl {
                     ),
                 }));
             }
-            expected += 1;
         }
 
         // Note: content-level tamper detection is provided by logdb's per-shard
@@ -1252,10 +1247,7 @@ mod tail_loop_tests {
         let mut heartbeats = 0usize;
         let mut seqs = Vec::new();
         let deadline = Instant::now() + dur;
-        loop {
-            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
+        while let Some(rem) = deadline.checked_duration_since(Instant::now()) {
             if rem.is_zero() {
                 break;
             }

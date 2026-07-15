@@ -220,10 +220,7 @@ async fn consumer_group_commit_and_resume() {
 
     let mut first_seq = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    match tokio::time::timeout_at(deadline, stream.next()).await {
-        Ok(Ok(Some(rec))) => first_seq = Some(rec.seq),
-        _ => {}
-    }
+    if let Ok(Ok(Some(rec))) = tokio::time::timeout_at(deadline, stream.next()).await { first_seq = Some(rec.seq) }
     // With from_seq=0 and committed offset=3, auto-resume starts at 4
     assert_eq!(first_seq, Some(4));
 }

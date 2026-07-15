@@ -13,7 +13,6 @@ use logdb::{Config as DbConfig, LogDb};
 use logdbd::catalog::Catalog;
 use logdbd::consumer::ConsumerTracker;
 use logdbd::service::LogDbServiceImpl;
-use logdbd::storage::Storage;
 use logdbd::subscribe::SubscribeHub;
 use logdbd_proto::pb::log_db_service_server::LogDbServiceServer;
 
@@ -60,14 +59,27 @@ async fn start_logdbd_killable(shards: usize) -> LogdbdHandle {
             }),
     );
     let catalog = Arc::new(Catalog::open(dir.path()).unwrap());
-    let svc = LogDbServiceImpl::new(
+    let hub = Arc::new(SubscribeHub::new());
+    // Mirror production main.rs: start the durable-cursor publisher and share
+    // its wake channel with the service, so Tail long-polls wake on new writes
+    // (the event-driven Tail blocks on the wake instead of polling).
+    let tail_notify = tokio::sync::watch::channel(storage.durable_gid()).0;
+    let publisher = Arc::new(logdbd::publisher::SubscribePublisher::new(
+        Arc::clone(&storage),
+        Arc::clone(&hub),
+        Arc::new(logdbd::tombstone::TombstoneTracker::new()),
+        tail_notify.clone(),
+    ));
+    publisher.clone().start();
+    let mut svc = LogDbServiceImpl::new(
         Arc::clone(&storage),
         catalog,
         Arc::new(ConsumerTracker::new(None)),
-        Arc::new(SubscribeHub::new()),
+        hub,
         "logdbd-node".into(),
         "primary".into(),
     );
+    svc.set_tail_notify(tail_notify);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let jh = tokio::spawn(async move {

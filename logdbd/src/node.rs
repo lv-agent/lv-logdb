@@ -51,7 +51,7 @@ impl ProcessLock {
             return Ok(None);
         }
 
-        fs::create_dir_all(data_dir).map_err(|e| LockError::Io(e))?;
+        fs::create_dir_all(data_dir).map_err(LockError::Io)?;
 
         let lock_path = data_dir.join("active.lock");
         let file = fs::OpenOptions::new()
@@ -59,7 +59,7 @@ impl ProcessLock {
             .write(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|e| LockError::Io(e))?;
+            .map_err(LockError::Io)?;
 
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(Some(Self { _file: Some(file) })),

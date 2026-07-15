@@ -27,7 +27,9 @@ pub enum Role {
 }
 
 impl Role {
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse a role from its string name. Named `parse` (not `from_str`) to
+    /// avoid confusion with the `FromStr` trait.
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "admin" => Some(Self::Admin),
             "writer" => Some(Self::Writer),

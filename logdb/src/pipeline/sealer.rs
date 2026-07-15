@@ -21,7 +21,7 @@
 //! This module is only available when the `hash-chain` feature is enabled.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::pipeline::committer::WakePair;
@@ -163,6 +163,7 @@ pub fn verify_chain(
 mod tests {
     use super::*;
     use crate::config::QueueFullPolicy;
+    use std::sync::Mutex;
 
     #[test]
     fn blake3_keyed_deterministic() {

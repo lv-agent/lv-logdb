@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::Notify;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 
 use crate::catalog::Catalog;
@@ -140,7 +141,12 @@ pub struct LogDbServiceImpl {
     tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
     /// Wakes blocked Tail handlers (cr-037 long-poll) when new durable data
     /// is available. Shared with the SubscribePublisher via [`tail_notify`].
-    tail_notify: Arc<Notify>,
+    ///
+    /// A `watch::Sender<u64>` carrying the durable gid is used instead of a
+    /// `Notify`: `watch` stores the latest value, so a Tail handler that is
+    /// mid-scan when the publisher signals never loses the wake (a plain
+    /// `Notify::notify_waiters` only reaches already-registered waiters).
+    tail_notify: watch::Sender<u64>,
 }
 
 impl LogDbServiceImpl {
@@ -162,17 +168,18 @@ impl LogDbServiceImpl {
             role,
             quota_tracker: Arc::new(crate::quota::QuotaTracker::new()),
             tombstone_tracker: Arc::new(crate::tombstone::TombstoneTracker::new()),
-            tail_notify: Arc::new(Notify::new()),
+            tail_notify: watch::channel(0).0,
         }
     }
 
-    /// Borrow the Notify shared with the subscribe publisher for long-poll Tail.
-    pub fn tail_notify(&self) -> Arc<Notify> {
-        Arc::clone(&self.tail_notify)
+    /// Clone of the wake sender shared with the subscribe publisher for
+    /// long-poll Tail (`watch::Sender` is `Clone`).
+    pub fn tail_notify(&self) -> watch::Sender<u64> {
+        self.tail_notify.clone()
     }
 
-    /// Replace the Notify (called once by main to share the publisher's Notify).
-    pub fn set_tail_notify(&mut self, n: Arc<Notify>) {
+    /// Replace the wake sender (called once by main to share the publisher's).
+    pub fn set_tail_notify(&mut self, n: watch::Sender<u64>) {
         self.tail_notify = n;
     }
 
@@ -199,7 +206,7 @@ impl LogDbServiceImpl {
             role,
             quota_tracker,
             tombstone_tracker,
-            tail_notify: Arc::new(Notify::new()),
+            tail_notify: watch::channel(0).0,
         }
     }
 
@@ -257,6 +264,140 @@ impl LogDbServiceImpl {
         self.catalog
             .resolve(ns, stream)
             .map_err(|e| Status::invalid_argument(format!("invalid namespace/stream: {}", e)))
+    }
+}
+
+/// Long-poll Tail loop: stream live (non-tombstoned) records for `stream_id`
+/// from `from_seq` onwards onto `tx`, scoped to `shard_ids` (empty ⇒ all).
+/// Idles (long-poll) when caught up to the durable cursor.
+///
+/// `wake_rx` carries the durable gid and is advanced by the SubscribePublisher
+/// whenever new data becomes durable, so an idle Tail can block instead of
+/// polling — the read-path twin of the committer/sealer condvar wake
+/// (`a4b841b`). Extracted from the `tail` RPC so the idle/wake behaviour is
+/// unit-testable without gRPC/catalog scaffolding.
+async fn run_tail_loop(
+    storage: Arc<Storage>,
+    tombstones: Arc<crate::tombstone::TombstoneTracker>,
+    mut wake_rx: watch::Receiver<u64>,
+    stream_id: u64,
+    mut last_seq: u64,
+    shard_ids: std::collections::HashSet<u32>,
+    batch_size: u32,
+    tx: mpsc::Sender<Result<pb::TailResponse, Status>>,
+) {
+    // Liveness heartbeat interval for an idle (caught-up) Tail. Pre-fix this was
+    // effectively 100 ms per open stream — the read-path twin of the
+    // committer/sealer timer busy-loop fixed in `a4b841b`. The Tail is woken at
+    // once by the publisher when durable data arrives, so this only bounds how
+    // often an idle stream refreshes its durable_seq to the consumer and doubles
+    // as a lost-wakeup safety net.
+    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Send a heartbeat as soon as the Tail first goes idle (so a consumer learns
+    // it is caught up promptly), and again whenever it catches up after delivery.
+    let mut last_heartbeat = std::time::Instant::now()
+        .checked_sub(HEARTBEAT_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
+
+    loop {
+        let durable = storage.durable_gid();
+        // Stream- + shard-scoped durable read via the seq_map index (cr-037
+        // perf): jump straight to this stream's records instead of decoding
+        // every record across every stream. `scan_stream_filtered` uses
+        // read_batch which is per-shard durable-gated.
+        let all = match storage.scan_stream_filtered(
+            stream_id,
+            last_seq,
+            &shard_ids,
+            batch_size as usize * 4,
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = tx.send(Err(Status::internal("scan error"))).await;
+                return;
+            }
+        };
+        // Highest seq in the raw scan, captured before we consume `all`. Used to
+        // skip tombstoned records so they are not re-decoded every cycle.
+        let last_scanned_seq = all.last().map(|r| r.seq);
+        let new_records: Vec<_> = all
+            .into_iter()
+            .filter(|r| tombstones.is_live(stream_id, r.seq))
+            .take(batch_size as usize)
+            .collect();
+
+        if !new_records.is_empty() {
+            let records: Vec<pb::Record> = new_records
+                .iter()
+                .map(|r| pb::Record {
+                    namespace_id: r.namespace_id,
+                    stream_id: r.stream_id,
+                    seq: r.seq,
+                    event_type: r.event_type.clone(),
+                    timestamp_ns: r.timestamp_ns,
+                    content_type: r.content_type.clone(),
+                    metadata: to_hashmap(&r.metadata),
+                    content: r.user_content.clone(),
+                })
+                .collect();
+            // Advance past the last delivered record; since the filter drops
+            // tombstoned records in between, this also skips them.
+            last_seq = records.last().unwrap().seq + 1;
+            if tx
+                .send(Ok(pb::TailResponse {
+                    records,
+                    durable_seq: durable,
+                    heartbeat: false,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            // Next idle iteration should emit a heartbeat promptly so the
+            // consumer learns it has caught up (the broker's CaughtUp frame).
+            last_heartbeat = std::time::Instant::now()
+                .checked_sub(HEARTBEAT_INTERVAL)
+                .unwrap_or_else(std::time::Instant::now);
+            continue;
+        }
+
+        // Idle: no live records. If the scan returned tombstoned records (all
+        // filtered out), advance `last_seq` past them so they are not re-decoded
+        // every cycle — a per-stream livelock that burned real decode CPU.
+        if let Some(seq) = last_scanned_seq {
+            last_seq = seq + 1;
+        }
+
+        // Liveness heartbeat, but no faster than HEARTBEAT_INTERVAL.
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            last_heartbeat = std::time::Instant::now();
+            if tx
+                .send(Ok(pb::TailResponse {
+                    records: vec![],
+                    durable_seq: durable,
+                    heartbeat: true,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        // Block until the publisher signals new durable data, or until the
+        // heartbeat interval elapses (liveness + lost-wakeup safety). The
+        // `watch` channel stores the latest durable gid, so a wake that fired
+        // while we were scanning is not lost: `changed()` resolves immediately.
+        tokio::select! {
+            res = wake_rx.changed() => {
+                if res.is_err() {
+                    return; // sender dropped — logdbd shutting down
+                }
+            }
+            _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {}
+        }
     }
 }
 
@@ -559,92 +700,18 @@ impl LogDbService for LogDbServiceImpl {
             r.batch_size
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        let tail_notify = Arc::clone(&self.tail_notify);
+        let (tx, rx) = mpsc::channel(16);
 
-        tokio::spawn(async move {
-            let mut last_seq = from_seq;
-            loop {
-                let durable = storage.durable_gid();
-                // Stream- + shard-scoped durable read via seq_map index (cr-037
-                // perf): jump straight to this stream's records instead of
-                // decoding every record across every stream (the old full-scan
-                // path). `scan_stream_filtered` uses read_batch which is per-
-                // shard durable-gated, so the `durable` min-cursor is only
-                // reported in heartbeats — it no longer caps the scan.
-                let all = match storage.scan_stream_filtered(
-                    stream_id,
-                    last_seq,
-                    &shard_ids,
-                    batch_size as usize * 4,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let _ = tx.send(Err(Status::internal("scan error"))).await;
-                        return;
-                    }
-                };
-                let new_records: Vec<_> = all
-                    .into_iter()
-                    .filter(|r| tombstones.is_live(stream_id, r.seq))
-                    .take(batch_size as usize)
-                    .collect();
-
-                if new_records.is_empty() {
-                    // Send heartbeat
-                    if tx
-                        .send(Ok(pb::TailResponse {
-                            records: vec![],
-                            durable_seq: durable,
-                            heartbeat: true,
-                        }))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    // Wait for new durable data (long-poll, cr-037 A). The
-                    // SubscribePublisher calls notify_waiters() each poll cycle
-                    // (10 ms) when durable_gid advances. Timeout at 100 ms so
-                    // we still make progress even if the publisher is paused.
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
-                        tail_notify.notified(),
-                    )
-                    .await
-                    .ok();
-                    continue;
-                }
-
-                let records: Vec<pb::Record> = new_records
-                    .iter()
-                    .map(|r| pb::Record {
-                        namespace_id: r.namespace_id,
-                        stream_id: r.stream_id,
-                        seq: r.seq,
-                        event_type: r.event_type.clone(),
-                        timestamp_ns: r.timestamp_ns,
-                        content_type: r.content_type.clone(),
-                        metadata: to_hashmap(&r.metadata),
-                        content: r.user_content.clone(),
-                    })
-                    .collect();
-
-                last_seq = records.last().unwrap().seq + 1;
-
-                if tx
-                    .send(Ok(pb::TailResponse {
-                        records,
-                        durable_seq: durable,
-                        heartbeat: false,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
+        tokio::spawn(run_tail_loop(
+            storage,
+            tombstones,
+            self.tail_notify.subscribe(),
+            stream_id,
+            from_seq,
+            shard_ids,
+            batch_size,
+            tx,
+        ));
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
@@ -1138,5 +1205,168 @@ mod mapping_tests {
             }
             _ => panic!("expected DistinctValues"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tail_loop_tests {
+    use super::*;
+    use std::collections::{BTreeMap, HashSet};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::{mpsc, watch};
+
+    /// Fresh Storage over a temp dir, single shard (small ring).
+    fn test_storage() -> (Arc<Storage>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = logdb::Config::default();
+        config.data_dir = dir.path().to_path_buf();
+        config.ring_size = 256;
+        config.durability_mode = logdb::DurabilityMode::Sync;
+        config.flush_timeout = Duration::from_secs(5);
+        config.shards = 1;
+        let db = logdb::LogDb::open(config).unwrap();
+        (Arc::new(Storage::new(db, 1)), dir)
+    }
+
+    fn append_live(storage: &Storage, stream_id: u64, seq: u64) {
+        storage
+            .append(
+                1,
+                stream_id,
+                "e",
+                "text/plain",
+                &BTreeMap::new(),
+                seq,
+                b"x",
+                None,
+            )
+            .unwrap();
+    }
+
+    /// Drain `rx` until `dur` elapses; return (heartbeats, record_seqs).
+    async fn drain_for(
+        rx: &mut mpsc::Receiver<Result<pb::TailResponse, Status>>,
+        dur: Duration,
+    ) -> (usize, Vec<u64>) {
+        let mut heartbeats = 0usize;
+        let mut seqs = Vec::new();
+        let deadline = Instant::now() + dur;
+        loop {
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if rem.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(rem, rx.recv()).await {
+                Ok(Some(Ok(resp))) => {
+                    if resp.records.is_empty() {
+                        heartbeats += 1;
+                    } else {
+                        seqs.extend(resp.records.iter().map(|r| r.seq));
+                    }
+                }
+                _ => break, // channel closed / scan error / no more within window
+            }
+        }
+        (heartbeats, seqs)
+    }
+
+    /// An idle Tail (empty stream) must NOT flood heartbeats at 10 Hz. Pre-fix it
+    /// sent ~12 heartbeats in 1.2 s (100 ms busy-poll); post-fix ≤ 3 (event-driven
+    /// wake, liveness heartbeat only every few seconds).
+    #[tokio::test]
+    async fn idle_tail_does_not_busy_poll_heartbeats() {
+        let (storage, _dir) = test_storage();
+        let tombstones = Arc::new(crate::tombstone::TombstoneTracker::new());
+        let (_wake_tx, wake_rx) = watch::channel(storage.durable_gid());
+        let (tx, mut rx) = mpsc::channel(64);
+        let _task = tokio::spawn(run_tail_loop(
+            Arc::clone(&storage),
+            Arc::clone(&tombstones),
+            wake_rx,
+            7,
+            0,
+            HashSet::new(),
+            100,
+            tx,
+        ));
+
+        let (heartbeats, seqs) = drain_for(&mut rx, Duration::from_millis(1200)).await;
+        assert!(
+            heartbeats <= 3,
+            "idle Tail sent {heartbeats} heartbeats in 1.2s (expected <=3; pre-fix busy-poll sent ~12)"
+        );
+        assert!(seqs.is_empty(), "no records expected on an empty stream");
+    }
+
+    /// A stream whose tail records are all tombstoned must advance `last_seq`
+    /// past them and go idle — not re-decode the same dead records every cycle (a
+    /// per-stream livelock). Pre-fix: ~12 heartbeats in 1.2 s; post-fix: ≤ 3.
+    #[tokio::test]
+    async fn tombstoned_tail_advances_and_does_not_livelock() {
+        let (storage, _dir) = test_storage();
+        for seq in 1..=3u64 {
+            append_live(&storage, 7, seq);
+        }
+        storage.flush().unwrap();
+        let tombstones = Arc::new(crate::tombstone::TombstoneTracker::new());
+        tombstones.record(7, 3); // records 1..=3 now dead (is_live iff seq > cutoff)
+
+        let (_wake_tx, wake_rx) = watch::channel(storage.durable_gid());
+        let (tx, mut rx) = mpsc::channel(64);
+        let _task = tokio::spawn(run_tail_loop(
+            Arc::clone(&storage),
+            Arc::clone(&tombstones),
+            wake_rx,
+            7,
+            1, // resume before the tombstoned records
+            HashSet::new(),
+            100,
+            tx,
+        ));
+
+        let (heartbeats, seqs) = drain_for(&mut rx, Duration::from_millis(1200)).await;
+        assert!(
+            heartbeats <= 3,
+            "tombstoned Tail livelocked: {heartbeats} heartbeats in 1.2s (expected <=3)"
+        );
+        assert!(seqs.is_empty(), "tombstoned records must not be delivered");
+    }
+
+    /// Regression guard: with the busy-poll gone, a record appended while idle
+    /// must still be delivered promptly via the publisher wake (≤ 500 ms) — i.e.
+    /// the event-driven wake must not introduce a lost-wakeup latency regression.
+    #[tokio::test]
+    async fn delivers_new_record_promptly_when_idle() {
+        let (storage, _dir) = test_storage();
+        let tombstones = Arc::new(crate::tombstone::TombstoneTracker::new());
+        let (wake_tx, wake_rx) = watch::channel(storage.durable_gid());
+        let (tx, mut rx) = mpsc::channel(64);
+        let _task = tokio::spawn(run_tail_loop(
+            Arc::clone(&storage),
+            Arc::clone(&tombstones),
+            wake_rx,
+            7,
+            0,
+            HashSet::new(),
+            100,
+            tx,
+        ));
+
+        // Let the loop go idle (consume any initial heartbeat).
+        let _ = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+
+        // Append + flush + signal the wake (the publisher's role).
+        append_live(&storage, 7, 1);
+        storage.flush().unwrap();
+        wake_tx.send(storage.durable_gid()).unwrap();
+
+        let (_, seqs) = drain_for(&mut rx, Duration::from_millis(500)).await;
+        assert!(
+            seqs.contains(&1),
+            "new record not delivered promptly after wake: got {seqs:?}"
+        );
     }
 }

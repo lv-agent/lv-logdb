@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::storage::Storage;
 use crate::subscribe::SubscribeHub;
@@ -27,7 +27,7 @@ pub struct SubscribePublisher {
     last_gid: AtomicU64,
     running: AtomicBool,
     /// Wakes blocked Tail handlers when new durable data is available.
-    tail_notify: Arc<Notify>,
+    tail_notify: watch::Sender<u64>,
 }
 
 impl SubscribePublisher {
@@ -35,7 +35,7 @@ impl SubscribePublisher {
         storage: Arc<Storage>,
         hub: Arc<SubscribeHub>,
         tombstone_tracker: Arc<crate::tombstone::TombstoneTracker>,
-        tail_notify: Arc<Notify>,
+        tail_notify: watch::Sender<u64>,
     ) -> Self {
         Self {
             storage,
@@ -80,8 +80,9 @@ impl SubscribePublisher {
                         }
                         // Half-open [last, durable): everything below durable is done.
                         self.last_gid.store(durable, Ordering::Release);
-                        // Wake blocked Tail handlers (cr-037 long-poll).
-                        self.tail_notify.notify_waiters();
+                        // Wake blocked Tail handlers (cr-037 long-poll) by
+                        // publishing the new durable gid on the watch channel.
+                        let _ = self.tail_notify.send(durable);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "subscribe publisher scan failed");
@@ -128,7 +129,7 @@ mod tests {
             Arc::clone(&storage),
             Arc::clone(&hub),
             Arc::new(crate::tombstone::TombstoneTracker::new()),
-                Arc::new(Notify::new()),
+                tokio::sync::watch::channel(0).0,
         ));
         publisher.clone().start();
 
@@ -177,7 +178,7 @@ mod tests {
             Arc::clone(&storage),
             Arc::clone(&hub),
             Arc::clone(&tombstones),
-                Arc::new(Notify::new()),
+                tokio::sync::watch::channel(0).0,
         ));
         publisher.clone().start();
 

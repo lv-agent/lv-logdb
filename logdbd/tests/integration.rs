@@ -1767,7 +1767,7 @@ async fn subscribe_receives_matching_event_types() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
-        Arc::new(tokio::sync::Notify::new()),
+        tokio::sync::watch::channel(0).0,
     ));
     subscribe_publisher.clone().start();
 
@@ -1877,7 +1877,7 @@ async fn subscribe_multi_consumer_same_group() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
-        Arc::new(tokio::sync::Notify::new()),
+        tokio::sync::watch::channel(0).0,
     ));
     subscribe_publisher.clone().start();
 
@@ -2021,7 +2021,7 @@ async fn subscribe_reconnect_replays_from_offset() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
-        Arc::new(tokio::sync::Notify::new()),
+        tokio::sync::watch::channel(0).0,
     ));
     subscribe_publisher.clone().start();
 
@@ -2113,7 +2113,7 @@ async fn subscribe_replays_missed_records_from_offset() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
-        Arc::new(tokio::sync::Notify::new()),
+        tokio::sync::watch::channel(0).0,
     ));
     subscribe_publisher.clone().start();
 
@@ -2244,7 +2244,7 @@ async fn subscribe_concurrent_stress() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
-        Arc::new(tokio::sync::Notify::new()),
+        tokio::sync::watch::channel(0).0,
     ));
     subscribe_publisher.clone().start();
 
@@ -2370,7 +2370,7 @@ async fn subscribe_100_concurrent_subscribers_stress() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
-        Arc::new(tokio::sync::Notify::new()),
+        tokio::sync::watch::channel(0).0,
     ));
     subscribe_publisher.clone().start();
 
@@ -2497,7 +2497,7 @@ async fn subscribe_500_subs_replay_stress() {
         Arc::clone(&storage),
         Arc::clone(&hub),
         Arc::new(logdbd::tombstone::TombstoneTracker::new()),
-        Arc::new(tokio::sync::Notify::new()),
+        tokio::sync::watch::channel(0).0,
     ));
     subscribe_publisher.clone().start();
 
@@ -3027,7 +3027,7 @@ async fn subscribe_delivers_all_records_in_multi_shard_mode() {
         Arc::new(logdbd::publisher::SubscribePublisher::new(
             Arc::clone(&storage), Arc::clone(&hub),
             Arc::new(logdbd::tombstone::TombstoneTracker::new()),
-            Arc::new(tokio::sync::Notify::new()),
+            tokio::sync::watch::channel(0).0,
         ));
     subscribe_publisher.clone().start();
     let log_svc = LogDbServiceImpl::new(
